@@ -1,0 +1,60 @@
+[node]
+rpc_port = 8332
+rpc_host = "127.0.0.1"
+p2p_port = 8333
+db_path = "miner.db"
+wallet_file = "miner-wallet.dat"
+rpc_auth_token = "mysecrettoken"
+
+[p2p]
+max_message_size = 1048576 
+initial_score = 100
+ban_threshold = 0
+ban_duration_secs = 600 
+reconnect_delay_secs = 30
+protocol_version = 1
+
+# --- The rest of the config can be the same as synergeia.toml ---
+[consensus]
+bootstrap_nodes = [] # This is the first node, so it has no one to connect to
+target_block_time = 15
+adjustment_window = 100
+nakamoto_target_block_time = 600
+psi_slot_gap = 2
+gamma_recovery_threshold = 20
+mempool_threshold = 100
+witnessing_period = 5
+pos_precision = "accurate"
+coinbase_maturity = 100
+coinbase_reward = 5000000000
+fee_per_transaction = 1000
+max_target_bits = 0x1d00ffff
+genesis_timestamp = 1672531200
+genesis_bits = 0x1e0ffff0
+genesis_coinbase_data = "PoW + PoS < PoW * PoS"
+genesis_address = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+block_version = 1
+transaction_version = 1
+bootstrap_pos_block_threshold = 10
+total_supply = 1000000000
+beacon_target_multiplier = 100
+
+[fees]
+target_staking_ratio = 0.4
+min_burn_rate = 0.1
+max_burn_rate = 0.8
+
+[governance]
+proposal_duration_blocks = 100
+vote_threshold_percent = 51
+
+[progonos]
+btc_confirmations = 6
+btc_genesis_header = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c"
+
+[database]
+blocks_tree = "blocks"
+utxo_tree = "utxo"
+tip_key = "tip"
+total_work_key = "total_work"
+tx_index_tree = "tx_index"

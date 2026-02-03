@@ -1,0 +1,14 @@
+# Core requirement for the dashboard
+voila
+
+# Required by Jupyter to execute Python code in notebooks
+ipykernel
+
+# Required for the '%matplotlib widget' interactive backend
+ipympl
+
+# Other dependencies your simulation needs
+numpy
+matplotlib
+ipywidgets
+pandas
