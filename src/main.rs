@@ -1,0 +1,177 @@
+// src/main.rs
+
+// This file defines the Synergeia library and its modules.
+
+pub mod block;
+pub mod blockchain;
+pub mod btc_p2p;
+pub mod cli;
+pub mod config;
+pub mod consensus;
+pub mod crypto;
+pub mod fixed_point;
+pub mod governance;
+pub mod p2p;
+pub mod params;
+pub mod peer_manager;
+pub mod pos;
+pub mod progonos;
+pub mod rpc;
+pub mod script;
+pub mod stk_module; // Corrected: was staking
+pub mod transaction;
+pub mod wallet;
+pub mod engine;
+pub mod gov_module;
+pub mod spv;
+pub mod storage;
+pub mod client;
+pub mod difficulty;
+pub mod sync;
+pub mod runtime;
+
+
+use anyhow::Result;
+use clap::Parser;
+use cli::{Cli, Commands};
+use log::info;
+use p2p::P2PMessage;
+use btc_p2p::BtcP2PMessage;
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc, Mutex};
+// Added missing imports for engine initialization
+use crate::params::{ParamManager, ConsensusParams};
+use crate::stk_module::{StakingModule, BankModule};
+use crate::gov_module::GovernanceModule;
+use crate::storage::GovernanceStore;
+use crate::difficulty::DynamicDifficultyManager;
+use crate::engine::ConsensusEngine;
+
+
+const CHANNEL_CAPACITY: usize = 100;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::CreateWallet => {
+            let config_path = "synergeia.toml";
+            let config = config::load(config_path)?;
+            let wallet = wallet::Wallet::new();
+            wallet.save_to_file(&config.node)?;
+            println!("New wallet created and saved to {}", config.node.wallet_file);
+            println!("Address: {}", wallet.get_address());
+        }
+        // CORRECTED: Added `data_dir` to the pattern match.
+        Commands::StartNode { mode, config, data_dir, mine_to_address } => {
+            let loaded_config = config::load(&config)?;
+            
+            // --- Engine Dependencies Initialization ---
+            let param_manager = Arc::new(ParamManager::new());
+            let bank_module = Arc::new(BankModule {}); // Placeholder
+            let staking_module = Arc::new(StakingModule::new(bank_module));
+            let db_for_gov = Arc::new(sled::open(&data_dir)?);
+            let governance_store = GovernanceStore::new(db_for_gov);
+            let governance_module = Arc::new(GovernanceModule::new(param_manager.clone(), staking_module.clone(), governance_store));
+            let difficulty_manager = Arc::new(DynamicDifficultyManager::new(param_manager.clone()));
+
+            let consensus_engine = ConsensusEngine::new(
+                param_manager.clone(),
+                staking_module.clone(),
+                governance_module.clone(),
+                difficulty_manager.clone(),
+                ConsensusParams::new(),
+            );
+
+            // --- Blockchain and other modules ---
+            let fee_params = Arc::new(loaded_config.fees.clone());
+            let governance_params = Arc::new(loaded_config.governance.clone());
+            let db_config = Arc::new(loaded_config.database.clone());
+            let mut node_conf = loaded_config.node.clone();
+            node_conf.db_path = data_dir;
+            let node_config = Arc::new(node_conf);
+
+            let p2p_config = Arc::new(loaded_config.p2p.clone());
+            let progonos_config = Arc::new(loaded_config.progonos.clone());
+			let consensus_params = Arc::new(loaded_config.consensus.clone());
+
+            let bc = Arc::new(Mutex::new(blockchain::Blockchain::new(
+                &node_config.db_path,
+                consensus_params.clone(),
+                fee_params,
+                governance_params.clone(),
+                db_config,
+                consensus_engine, // Pass the engine
+            )?));
+
+            let spv_client = Arc::new(Mutex::new(progonos::SpvClient::new(&progonos_config)));
+            let peer_manager = Arc::new(Mutex::new(peer_manager::PeerManager::new(p2p_config.clone())));
+
+            let (p2p_tx, _p2p_rx) = mpsc::channel::<P2PMessage>(CHANNEL_CAPACITY);
+            let (broadcast_tx, _) = broadcast::channel::<P2PMessage>(CHANNEL_CAPACITY);
+            
+            let (_btc_p2p_tx, btc_p2p_rx) = mpsc::channel::<BtcP2PMessage>(CHANNEL_CAPACITY);
+            
+            let (to_consensus_tx, consensus_rx) = mpsc::channel(CHANNEL_CAPACITY);
+            let (shutdown_tx, _) = broadcast::channel(1);
+
+            let consensus_handle = tokio::spawn(consensus::start_consensus_loop(
+                bc.clone(),
+                mode,
+                mine_to_address,
+                consensus_rx,
+                broadcast_tx.clone(),
+                node_config.clone(),
+                shutdown_tx.subscribe(),
+            ));
+
+            let p2p_handle = tokio::spawn(p2p::start_server(
+                bc.clone(),
+                to_consensus_tx.clone(), // Clone for P2P
+                broadcast_tx.clone(),
+                peer_manager,
+                p2p_config.clone(),
+                node_config.clone(),
+                consensus_params.clone(), // Pass consensus params
+                shutdown_tx.subscribe(),
+            ));
+            
+            let rpc_handle = tokio::spawn(rpc::start_rpc_server(
+                bc.clone(),
+                spv_client.clone(),
+                p2p_tx,
+                governance_params.clone(),
+                progonos_config.clone(),
+                node_config.clone(),
+                node_config.rpc_port,
+                shutdown_tx.subscribe(),
+            ));
+            
+            let btc_p2p_handle = tokio::spawn(btc_p2p::start_btc_p2p_client(
+                spv_client.clone(),
+                progonos_config.clone(),
+                btc_p2p_rx,
+                shutdown_tx.subscribe(),
+            ));
+
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Shutdown signal received.");
+                    shutdown_tx.send(()).ok();
+                }
+                res = consensus_handle => res??,
+                res = p2p_handle => res??,
+                res = rpc_handle => res??,
+                res = btc_p2p_handle => res??,
+            }
+        }
+        _ => {
+            let config = config::load("synergeia.toml")?;
+            rpc::client::handle_cli_command(cli.command, &config).await?;
+        }
+    }
+
+    Ok(())
+}
