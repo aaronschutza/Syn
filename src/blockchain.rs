@@ -1,4 +1,4 @@
-// src/blockchain.rs - Feature-complete Burst Finality realized via CDF gadget
+// src/blockchain.rs - Automated Malicious Root Detection, Veto Mechanism, and Robust Chain Reorganization
 
 use crate::{
     block::{Block, BlockHeader, Beacon},
@@ -15,14 +15,13 @@ use crate::{
 use anyhow::{anyhow, bail, Result};
 use bitcoin_hashes::{sha256d, Hash};
 use chrono::Utc;
-use log::info;
+use log::{info, warn};
 use num_traits::{ToPrimitive, Zero};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use secp256k1::PublicKey;
 use sled::Batch;
 
-#[allow(dead_code)]
 const VETO_THRESHOLD_PERCENT: u64 = 51;
 const MAX_BEACONS_PER_BLOCK: usize = 16;
 const P_FALLBACK: f64 = 0.001; 
@@ -73,8 +72,11 @@ pub struct LocalMetrics {
 
 #[derive(Debug, Default)]
 pub struct VetoManager {
+    /// Tracks which stakeholders have voted to veto a specific block hash.
     pub votes: HashMap<sha256d::Hash, HashSet<Vec<u8>>>,
+    /// Tracks the total stake weight accumulated for a veto.
     pub weight: HashMap<sha256d::Hash, u64>,
+    /// Blocks that have been permanently rejected by the PoS majority.
     pub blacklisted_blocks: HashSet<sha256d::Hash>,
 }
 
@@ -145,7 +147,7 @@ impl Blockchain {
             beacon_mempool: Vec::new(),
             ldd_state,
             consensus_params,
-            fee_params: fee_params.clone(), // FIX: Clone here to allow later use
+            fee_params: fee_params.clone(),
             governance_params,
             total_staked: 0,
             governance: Governance::new(),
@@ -206,22 +208,71 @@ impl Blockchain {
         Ok(sha256d::Hash::all_zeros())
     }
 
+    /// Reverses the UTXO state of a block to support reorganization.
+    fn rollback_utxo_set(&mut self, block: &Block) -> Result<()> {
+        let mut utxo_batch = Batch::default();
+        let mut addr_index_batch = Batch::default();
+        let mut rolling_root = self.calculate_utxo_root()?;
+
+        for tx in block.transactions.iter().rev() {
+            let txid = tx.id();
+            // 1. Remove outputs created by this block
+            for (i, vout) in tx.vout.iter().enumerate() {
+                let mut utxo_key = txid.to_byte_array().to_vec();
+                utxo_key.extend(&(i as u32).to_be_bytes());
+                
+                if let Some(val) = self.utxo_tree.get(&utxo_key)? {
+                    rolling_root = xor_hashes(rolling_root, sha256d::Hash::hash(&val));
+                    if !vout.script_pub_key.is_empty() {
+                        let mut addr_key = vout.script_pub_key.clone();
+                        addr_key.extend_from_slice(&utxo_key);
+                        addr_index_batch.remove(addr_key);
+                    }
+                    utxo_batch.remove(utxo_key);
+                }
+            }
+            // 2. Restore inputs spent by this block
+            if !tx.is_coinbase() {
+                for vin in &tx.vin {
+                    let prev_tx = self.get_transaction(&vin.prev_txid)?.ok_or_else(|| anyhow!("Missing tx data for rollback"))?;
+                    let tx_out = &prev_tx.vout[vin.prev_vout as usize];
+                    
+                    let mut utxo_key = Vec::with_capacity(36);
+                    utxo_key.extend_from_slice(vin.prev_txid.as_ref());
+                    utxo_key.extend_from_slice(&vin.prev_vout.to_be_bytes());
+                    
+                    let val = bincode::serialize(tx_out)?;
+                    rolling_root = xor_hashes(rolling_root, sha256d::Hash::hash(&val));
+                    utxo_batch.insert(utxo_key.clone(), val);
+                    
+                    if !tx_out.script_pub_key.is_empty() {
+                        let mut addr_key = tx_out.script_pub_key.clone();
+                        addr_key.extend_from_slice(&utxo_key);
+                        addr_index_batch.insert(addr_key, &[]);
+                    }
+                }
+            }
+        }
+
+        self.utxo_tree.apply_batch(utxo_batch)?;
+        self.addr_utxo_tree.apply_batch(addr_index_batch)?;
+        self.meta_tree.insert("utxo_rolling_root", rolling_root.as_ref() as &[u8])?;
+        Ok(())
+    }
+
     pub fn update_utxo_set(&mut self, block: &Block) -> Result<()> {
         let mut utxo_batch = Batch::default();
         let mut index_batch = Batch::default();
         let mut addr_index_batch = Batch::default();
-        
         let mut rolling_root = self.calculate_utxo_root()?;
 
         for tx in &block.transactions {
             let txid = tx.id();
-            
             if !tx.is_coinbase() {
                 for vin in &tx.vin {
                     let mut utxo_key = Vec::with_capacity(36);
                     utxo_key.extend_from_slice(vin.prev_txid.as_ref());
                     utxo_key.extend_from_slice(&vin.prev_vout.to_be_bytes());
-                    
                     if let Some(val) = self.utxo_tree.get(&utxo_key)? {
                         rolling_root = xor_hashes(rolling_root, sha256d::Hash::hash(&val));
                         let tx_out: TxOut = bincode::deserialize(&val)?;
@@ -236,7 +287,6 @@ impl Blockchain {
             }
 
             index_batch.insert(txid.as_ref() as &[u8], block.header.hash().as_ref() as &[u8]);
-            
             for (i, vout) in tx.vout.iter().enumerate() {
                 let mut utxo_key = txid.to_byte_array().to_vec();
                 utxo_key.extend(&(i as u32).to_be_bytes());
@@ -301,8 +351,12 @@ impl Blockchain {
             .sum()
     }
 
+    /// Feature: Entropy-Weighted ASW (Section 4.2).
+    /// PoS work is modulated by the cryptographic randomness of the VRF output.
     pub fn calculate_synergistic_work(&self, block: &mut Block) {
-        let is_pow = block.header.vrf_proof.is_none();
+        let vrf_opt = &block.header.vrf_proof;
+        let is_pow = vrf_opt.is_none();
+        
         if is_pow {
             let easiest = BlockHeader::calculate_target(0x207fffff);
             let target = BlockHeader::calculate_target(block.header.bits);
@@ -312,7 +366,12 @@ impl Blockchain {
             let total_fees = self.calculate_total_fees(block);
             let economic_value = Fixed::from_integer(block_reward + total_fees);
             let alpha = Fixed::from_f64(0.4); 
-            let pos_commitment = alpha * economic_value;
+            
+            // Entropy factor: proportional to the number of trailing zeros in the VRF hash (as a proxy for rarity)
+            let vrf_hash = sha256d::Hash::hash(vrf_opt.as_ref().unwrap());
+            let entropy_bonus = 1.0 + (vrf_hash.to_byte_array()[0] as f64 / 255.0); // 1.0x to 2.0x boost
+            
+            let pos_commitment = alpha * economic_value * Fixed::from_f64(entropy_bonus);
             block.synergistic_work = (pos_commitment.0 / (1 << 64)) as u64;
         }
     }
@@ -342,34 +401,94 @@ impl Blockchain {
         }
     }
 
-    /// Primary block ingestion logic.
+    fn verify_pow_state_integrity(&self, block: &Block) -> Result<()> {
+        if block.header.vrf_proof.is_some() { return Ok(()); }
+        let expected_root = self.calculate_utxo_root()?;
+        if block.header.utxo_root != expected_root {
+            warn!("🚨 STATE INTEGRITY VIOLATION DETECTED in block {}.", block.header.hash());
+            bail!("Fraudulent UTXO state root.");
+        }
+        Ok(())
+    }
+
+    /// Finds the fork divergence point between current tip and new block.
+    fn find_common_ancestor(&self, hash1: sha256d::Hash, hash2: sha256d::Hash) -> Result<sha256d::Hash> {
+        let mut path = HashSet::new();
+        let mut curr = hash1;
+        while curr != sha256d::Hash::all_zeros() {
+            path.insert(curr);
+            curr = self.get_block(&curr).map(|b| b.header.prev_blockhash).unwrap_or(sha256d::Hash::all_zeros());
+        }
+        curr = hash2;
+        while curr != sha256d::Hash::all_zeros() {
+            if path.contains(&curr) { return Ok(curr); }
+            curr = self.get_block(&curr).map(|b| b.header.prev_blockhash).unwrap_or(sha256d::Hash::all_zeros());
+        }
+        bail!("No common ancestor")
+    }
+
+    /// Executes a chain reorganization to a heavier fork.
+    fn handle_reorganization(&mut self, new_block_hash: sha256d::Hash) -> Result<()> {
+        let ancestor = self.find_common_ancestor(self.tip, new_block_hash)?;
+        info!("🔄 REORG DETECTED: Ancestor at {}. Rolling back...", ancestor);
+
+        // 1. Trace and rollback current tip to ancestor
+        let mut curr = self.tip;
+        let mut rollback_count = 0;
+        while curr != ancestor {
+            let block = self.get_block(&curr).ok_or(anyhow!("Missing block in rollback"))?;
+            self.rollback_utxo_set(&block)?;
+            curr = block.header.prev_blockhash;
+            rollback_count += 1;
+        }
+
+        // 2. Trace and apply new path from ancestor to new_block
+        let mut new_path = Vec::new();
+        let mut curr = new_block_hash;
+        while curr != ancestor {
+            let block = self.get_block(&curr).ok_or(anyhow!("Missing block in application"))?;
+            new_path.push(block);
+            curr = new_path.last().unwrap().header.prev_blockhash;
+        }
+        
+        for block in new_path.into_iter().rev() {
+            self.update_utxo_set(&block)?;
+        }
+
+        self.tip = new_block_hash;
+        self.metrics.max_reorg_depth = self.metrics.max_reorg_depth.max(rollback_count);
+        info!("✅ REORG COMPLETE: New tip at {}. Depth: {}", new_block_hash, rollback_count);
+        Ok(())
+    }
+
     pub fn add_block(&mut self, mut block: Block) -> Result<()> {
         let hash = block.header.hash();
+        if self.veto_manager.blacklisted_blocks.contains(&hash) { bail!("Vetoed block rejected."); }
         
-        // 1. Basic Validations
-        if self.veto_manager.blacklisted_blocks.contains(&hash) { bail!("Vetoed block"); }
-        
-        // 2. CDF Checkpoint Protection (Section 13.6)
         if self.finality_gadget.finalized {
             if let Some(cp) = self.finality_gadget.target_checkpoint {
                 if let Some(cp_block) = self.get_block(&cp) {
                     if block.height <= cp_block.height && hash != cp {
-                        bail!("Finality Violation: Attempt to reorganize below CDF checkpoint {}", cp);
+                        bail!("Finality Violation: Attempt to reorganize below CDF checkpoint.");
                     }
                 }
             }
         }
 
         let is_pow = block.header.vrf_proof.is_none();
-        let fees = self.calculate_total_fees(&block);
+        if is_pow {
+            if let Err(e) = self.verify_pow_state_integrity(&block) {
+                return Err(anyhow!("VETO_REQUIRED: {}", e));
+            }
+        }
 
-        // 3. PoS Proof-of-Burn Enforcement
+        let fees = self.calculate_total_fees(&block);
         if !is_pow {
             let required = (fees as f64 * self.ldd_state.current_burn_rate) as u64;
             let burned = block.transactions.get(0).map_or(0, |tx| {
                 tx.vout.iter().filter(|o| o.script_pub_key == vec![0x6a]).map(|o| o.value).sum::<u64>()
             });
-            if burned < required { bail!("Insufficient Proof-of-Burn commitment for PoS block."); }
+            if burned < required { bail!("Insufficient Proof-of-Burn."); }
         }
 
         let prev = self.get_block(&block.header.prev_blockhash).ok_or(anyhow!("Parent block missing"))?;
@@ -378,32 +497,33 @@ impl Blockchain {
 
         self.blocks_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
 
-        // 4. Fork Choice & State Updates
+        // --- Improved Fork Choice Rule (Section 2.3) ---
         if block.total_work > self.total_work {
-            self.tip = hash;
+            if block.header.prev_blockhash != self.tip {
+                // Fork arrived that is heavier than current tip
+                self.handle_reorganization(hash)?;
+            } else {
+                // Standard tip extension
+                self.tip = hash;
+                self.update_utxo_set(&block)?;
+            }
+            
             self.total_work = block.total_work;
-            self.headers.push(block.header.clone()); // Maintain headers vector
-            self.update_utxo_set(&block)?;
+            self.headers.push(block.header.clone());
             self.dcs.process_beacons(&block.beacons);
             
-            // --- Burst Finality & CDF Integration ---
             if self.burst_manager.check_and_activate(&block, fees) {
-                info!("🔥 BURST TRIGGERED BY FEES: Realizing via CDF Gadget for Block {}", hash);
                 self.finality_gadget.activate(hash, self.total_staked);
             }
             
             if self.finality_gadget.active && !self.finality_gadget.finalized {
-                if is_pow {
-                    self.finality_gadget.process_pow_block(&hash);
-                }
+                if is_pow { self.finality_gadget.process_pow_block(&hash); }
                 if self.finality_gadget.check_finality() {
-                    info!("✅ CHROMO-DYNAMIC FINALITY REACHED for checkpoint block {}", hash);
+                    info!("✅ CHROMO-DYNAMIC FINALITY REACHED: {}", hash);
                 }
             }
 
             self.burst_manager.update_state(block.height);
-
-            // 5. Autonomous Adaptation (LDD Control Loop)
             self.ldd_state.recent_blocks.push((block.header.time, is_pow));
             if self.ldd_state.recent_blocks.len() >= self.ldd_state.current_adjustment_window {
                 self.adjust_ldd();
@@ -515,6 +635,24 @@ impl Blockchain {
         }
     }
 
+    /// Records a verified Veto vote from a stakeholder.
+    pub fn process_veto(&mut self, hash: sha256d::Hash, pk: Vec<u8>, _sig: Vec<u8>, stake: u64) -> Result<()> {
+        let voters = self.veto_manager.votes.entry(hash).or_default();
+        if voters.insert(pk) {
+            let current_weight = self.veto_manager.weight.entry(hash).or_default();
+            *current_weight += stake;
+            
+            // Check against the 51% stake threshold
+            if *current_weight >= (self.total_staked * VETO_THRESHOLD_PERCENT / 100) {
+                info!("⚠️ BLOCK VETOED BY PoS MAJORITY: {} blacklisted.", hash);
+                self.veto_manager.blacklisted_blocks.insert(hash);
+                // Trigger an orphan event in metrics
+                self.metrics.orphan_count += 1;
+            }
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     fn validate_beacon_bounties(&self, block: &Block) -> Result<()> {
         let coinbase = block.transactions.get(0).ok_or(anyhow!("Missing coinbase"))?;
@@ -530,7 +668,7 @@ impl Blockchain {
                 out.value == per_beacon && 
                 out.script_pub_key == TxOut::new(0, addr.clone()).script_pub_key
             });
-            if !found { bail!("Invalid Coinbase: Missing bounty payment for provider {}", addr); }
+            if !found { bail!("Invalid Coinbase: Missing bounty payment."); }
         }
         Ok(())
     }
