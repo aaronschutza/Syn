@@ -162,7 +162,14 @@ impl Transaction {
             let sighash = self.calculate_sighash(i, &prev_tx_out.script_pub_key, SigHashType::All);
             let digest = sighash.to_byte_array();
     
-            if !script::evaluate(&vin.script_sig, &prev_tx_out.script_pub_key, &digest) {
+            // FIX: Provide script context for the expanded interpreter
+            let context = script::ScriptContext {
+                lock_time: self.lock_time,
+                tx_version: self.version,
+                input_sequence: vin.sequence,
+            };
+
+            if !script::evaluate(&vin.script_sig, &prev_tx_out.script_pub_key, &digest, &context) {
                 bail!("Signature verification failed for input {}", i);
             }
         }
