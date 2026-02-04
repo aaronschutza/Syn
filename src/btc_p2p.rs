@@ -1,9 +1,9 @@
-// src/btc_p2p.rs - Bitcoin P2P Protocol Engine for Progonos Header Sync
+// src/btc_p2p.rs - Robust Bitcoin P2P Protocol Engine for Progonos Header Sync
 
 use crate::config::ProgonosConfig;
 use crate::progonos::SpvClient;
 use crate::client::SpvClientState;
-use anyhow::{Result, bail, anyhow};
+use anyhow::{Result, bail};
 use bitcoin::{
     p2p::message::{NetworkMessage, RawNetworkMessage},
     p2p::message_network::VersionMessage,
@@ -12,13 +12,22 @@ use bitcoin::{
 };
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::{self, deserialize_partial};
-use bitcoin_hashes::Hash; // FIX: Import Hash trait to bring all_zeros into scope
-use log::{info, error, debug, warn};
+use bitcoin_hashes::Hash; 
+use log::{info, debug, warn};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex, oneshot};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, lookup_host};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Official Bitcoin DNS seeds for peer discovery.
+const BITCOIN_DNS_SEEDS: &[&str] = &[
+    "seed.bitcoin.sipa.be",
+    "dnsseed.bluematt.me",
+    "seed.bitcoinstats.com",
+    "seed.bitcoin.jonasschnelli.ch",
+    "seed.btc.petertodd.org",
+];
 
 /// Messages for internal communication with the Bitcoin Bridge.
 pub enum BtcP2PMessage {
@@ -29,26 +38,31 @@ pub enum BtcP2PMessage {
 /// The Bitcoin P2pManager maintains connections to the Bitcoin network.
 pub async fn start_btc_p2p_client(
     spv_client: Arc<Mutex<SpvClient>>,
-    spv_state: Arc<SpvClientState>, // Added state for ingestion
+    spv_state: Arc<SpvClientState>,
     _progonos_config: Arc<ProgonosConfig>,
     mut btc_p2p_rx: mpsc::Receiver<BtcP2PMessage>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
-    info!("🚀 Starting Bitcoin P2P Protocol Engine...");
+    info!("🚀 Starting Progonos Bitcoin P2P Sync Engine...");
 
-    // Default to a local node or a well-known peer for testing
-    let bitcoin_peer_addr = "127.0.0.1:8333";
     let network = Network::Bitcoin;
-    
     let mut sync_interval = tokio::time::interval(Duration::from_secs(60));
+    let mut peer_list: Vec<String> = Vec::new();
 
     loop {
         tokio::select! {
             // Periodic Sync Attempt / Heartbeat
             _ = sync_interval.tick() => {
-                debug!("Bitcoin Bridge heartbeat: initiating sync...");
-                if let Err(e) = connect_and_sync_headers(&spv_client, &spv_state, bitcoin_peer_addr, network).await {
-                    error!("Bitcoin P2P Sync Error: {}. Retrying in 60s...", e);
+                if peer_list.is_empty() {
+                    debug!("Peer list empty. Performing DNS discovery...");
+                    peer_list = discover_peers().await;
+                }
+
+                if let Some(peer_addr) = peer_list.pop() {
+                    debug!("Attempting Bitcoin sync with peer: {}...", peer_addr);
+                    if let Err(e) = connect_and_sync_headers(&spv_client, &spv_state, &peer_addr, network).await {
+                        warn!("Bitcoin P2P Sync Error with {}: {}. Trying next peer...", peer_addr, e);
+                    }
                 }
             }
 
@@ -61,7 +75,7 @@ pub async fn start_btc_p2p_client(
                         let _ = tx.send(header);
                     }
                     BtcP2PMessage::ForceSync => {
-                        let _ = connect_and_sync_headers(&spv_client, &spv_state, bitcoin_peer_addr, network).await;
+                        peer_list = discover_peers().await;
                     }
                 }
             }
@@ -76,6 +90,19 @@ pub async fn start_btc_p2p_client(
     Ok(())
 }
 
+/// Performs DNS discovery to populate the Bitcoin peer list.
+async fn discover_peers() -> Vec<String> {
+    let mut discovered = Vec::new();
+    for seed in BITCOIN_DNS_SEEDS {
+        if let Ok(addrs) = lookup_host(format!("{}:8333", seed)).await {
+            for addr in addrs {
+                discovered.push(addr.to_string());
+            }
+        }
+    }
+    discovered
+}
+
 /// Manages the lifecycle of a Bitcoin peer connection and header synchronization.
 async fn connect_and_sync_headers(
     spv_client: &Arc<Mutex<SpvClient>>,
@@ -83,8 +110,6 @@ async fn connect_and_sync_headers(
     addr: &str,
     network: Network,
 ) -> Result<()> {
-    debug!("Attempting connection to Bitcoin peer at {}...", addr);
-    
     let mut stream = match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
         Ok(res) => res?,
         Err(_) => bail!("Connection to Bitcoin peer timed out"),
@@ -92,10 +117,9 @@ async fn connect_and_sync_headers(
 
     // 1. Perform Bitcoin P2P Handshake (Version/Verack)
     perform_bitcoin_handshake(&mut stream, network).await?;
-    info!("Bitcoin P2P Handshake Successful with {}.", addr);
+    info!("Bitcoin Handshake successful with {}.", addr);
 
     // 2. Initial Header Sync (getheaders)
-    // We fetch headers starting from our current SPV tip.
     sync_headers_from_peer(&mut stream, spv_client, spv_state, network).await?;
 
     Ok(())
@@ -105,7 +129,6 @@ async fn connect_and_sync_headers(
 async fn perform_bitcoin_handshake(stream: &mut TcpStream, network: Network) -> Result<()> {
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     
-    // Construct Version message
     let version_msg = VersionMessage {
         version: 70015,
         services: ServiceFlags::NONE,
@@ -119,34 +142,34 @@ async fn perform_bitcoin_handshake(stream: &mut TcpStream, network: Network) -> 
     };
 
     let raw_version = RawNetworkMessage::new(network.magic(), NetworkMessage::Version(version_msg));
-    let data = encode::serialize(&raw_version);
-    stream.write_all(&data).await?;
+    stream.write_all(&encode::serialize(&raw_version)).await?;
 
-    // Wait for Version and Verack from peer
     let mut ver_received = false;
     let mut vack_received = false;
 
     while !ver_received || !vack_received {
         let msg = read_raw_message(stream, network).await?;
-        // FIX: access payload via method call since the field is private
         match msg.payload() {
             NetworkMessage::Version(_) => {
                 ver_received = true;
-                // Reply with Verack
                 let vack = RawNetworkMessage::new(network.magic(), NetworkMessage::Verack);
                 stream.write_all(&encode::serialize(&vack)).await?;
             }
             NetworkMessage::Verack => {
                 vack_received = true;
             }
-            _ => debug!("Received unexpected message during handshake: {:?}", msg.cmd()),
+            NetworkMessage::Ping(nonce) => {
+                // Dereference nonce (bound as &u64 from the payload reference)
+                let pong = RawNetworkMessage::new(network.magic(), NetworkMessage::Pong(*nonce));
+                stream.write_all(&encode::serialize(&pong)).await?;
+            }
+            _ => debug!("Received {:?} during handshake", msg.cmd()),
         }
     }
 
     Ok(())
 }
 
-/// Requests headers starting from the local tip and ingests the response.
 async fn sync_headers_from_peer(
     stream: &mut TcpStream,
     spv_client: &Arc<Mutex<SpvClient>>,
@@ -154,10 +177,8 @@ async fn sync_headers_from_peer(
     network: Network,
 ) -> Result<()> {
     let tip_hash = spv_client.lock().await.tip();
-    info!("Requesting Bitcoin headers starting from tip {}...", tip_hash);
+    debug!("Requesting Bitcoin headers from tip {}...", tip_hash);
     
-    // Construct getheaders message
-    // locators: [tip_hash], stop_hash: zero (fetch max available)
     let get_headers = NetworkMessage::GetHeaders(bitcoin::p2p::message_blockdata::GetHeadersMessage::new(
         vec![tip_hash],
         BlockHash::all_zeros(),
@@ -166,54 +187,34 @@ async fn sync_headers_from_peer(
     let raw_msg = RawNetworkMessage::new(network.magic(), get_headers);
     stream.write_all(&encode::serialize(&raw_msg)).await?;
 
-    // Wait for Headers response
-    loop {
-        let msg = read_raw_message(stream, network).await?;
-        // FIX: access payload via method call since the field is private
-        match msg.payload() {
-            NetworkMessage::Headers(headers) => {
-                if headers.is_empty() {
-                    info!("No new Bitcoin headers found.");
-                    break;
-                }
-                
-                info!("Received {} Bitcoin headers. Ingesting...", headers.len());
-                // FIX: Use headers.to_vec() because ingest_headers expects an owned Vec<Header>
-                // but msg.payload() returns a reference to the internal headers.
+    // Wait for Headers response with timeout
+    let msg = tokio::time::timeout(Duration::from_secs(10), read_raw_message(stream, network)).await??;
+    match msg.payload() {
+        NetworkMessage::Headers(headers) => {
+            if headers.is_empty() {
+                debug!("No new Bitcoin headers from peer.");
+            } else {
+                info!("Ingesting {} new Bitcoin headers...", headers.len());
                 if let Err(e) = spv_state.ingest_headers(headers.to_vec()) {
-                    warn!("Failed to ingest Bitcoin headers: {:?}", e);
-                } else {
-                    info!("Bitcoin headers synchronized successfully.");
+                    warn!("Ingestion failed: {:?}", e);
                 }
-                break;
             }
-            _ => debug!("Received non-header message during sync: {:?}", msg.cmd()),
         }
+        _ => bail!("Unexpected response to getheaders: {:?}", msg.cmd()),
     }
     
     Ok(())
 }
 
-/// Helper function to read a raw Bitcoin P2P message from the stream.
 async fn read_raw_message(stream: &mut TcpStream, _network: Network) -> Result<RawNetworkMessage> {
-    let mut header_buf = [0u8; 24]; // Bitcoin P2P Header size
+    let mut header_buf = [0u8; 24];
     stream.read_exact(&mut header_buf).await?;
     
-    // Deserialize header to find out payload size
-    // FIX: prefix with underscore to suppress unused variable warning
-    let _header: bitcoin::p2p::message::RawNetworkMessage = encode::deserialize(&header_buf)
-        .map_err(|e| anyhow!("Failed to deserialize BTC P2P header: {}", e))?;
-    
-    // Read payload
-    // Note: RawNetworkMessage deserialization normally handles header+payload. 
-    // Here we wrap for async reliability.
     let payload_size = match deserialize_partial::<bitcoin::p2p::message::RawNetworkMessage>(&header_buf) {
         Ok((_, size)) => size,
-        Err(_) => bail!("Invalid header length"),
+        Err(_) => bail!("Invalid Bitcoin P2P header length"),
     };
     
-    // For simplicity in this implementation, we use the standard deserialize on the full buffer
-    // In production, we'd buffer the payload specifically.
     let mut payload_buf = vec![0u8; payload_size];
     stream.read_exact(&mut payload_buf).await?;
     

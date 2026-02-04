@@ -1,7 +1,18 @@
-// src/script.rs - Production-grade Bitcoin Script interpreter for Synergeia
+// src/script.rs - Production-grade Bitcoin Script interpreter for Synergeia with Malleability Protection
 
-use bitcoin_hashes::{hash160, Hash};
+use bitcoin_hashes::{hash160, sha256, sha256d, ripemd160, Hash};
 use secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1};
+use log::warn;
+
+// secp256k1 curve order / 2 for Low-S check.
+// N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+// N/2 = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+const SECP256K1_ORDER_HALF: [u8; 32] = [
+    0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d,
+    0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
+];
 
 /// Contextual data required for validating time-locked or sequence-locked transactions.
 pub struct ScriptContext {
@@ -11,7 +22,7 @@ pub struct ScriptContext {
 }
 
 /// Evaluates a combined script (scriptSig and scriptPubKey) to validate a transaction input.
-/// Expanded to support Multi-sig, Time-locks, and Alt-stack management.
+/// Hardened with BIP 66 strict DER checks and Low-S signature enforcement.
 pub fn evaluate(
     script_sig: &[u8],
     script_pub_key: &[u8],
@@ -22,6 +33,11 @@ pub fn evaluate(
     let mut alt_stack: Vec<Vec<u8>> = Vec::new();
     let mut execution_stack: Vec<bool> = Vec::new();
     
+    // Limits to prevent DoS (Script Resource Exhaustion)
+    const MAX_STACK_SIZE: usize = 1000;
+    const MAX_OPS: usize = 201;
+    let mut op_count = 0;
+
     let mut combined_script = script_sig.to_vec();
     combined_script.extend_from_slice(script_pub_key);
 
@@ -29,10 +45,12 @@ pub fn evaluate(
     let mut i = 0;
 
     while i < combined_script.len() {
+        if op_count > MAX_OPS { return false; }
+        op_count += 1;
+
         let opcode = combined_script[i];
         i += 1;
 
-        // Current execution state (true if not in a false branch)
         let exec = execution_stack.iter().all(|&e| e);
 
         match opcode {
@@ -41,14 +59,13 @@ pub fn evaluate(
                 let len = len as usize;
                 if i + len > combined_script.len() { return false; }
                 if exec {
+                    if stack.len() >= MAX_STACK_SIZE { return false; }
                     stack.push(combined_script[i..i + len].to_vec());
                 }
                 i += len;
             }
             
-            // OP_0 (Empty vector)
             0x00 => if exec { stack.push(vec![]) },
-            // OP_1 to OP_16
             val @ 0x51..=0x60 => {
                 if exec {
                     let num = (val - 0x50) as i32;
@@ -77,7 +94,9 @@ pub fn evaluate(
 
             // --- Opcodes that only run if exec is true ---
             _ if exec => match opcode {
-                // Alt Stack Management
+                0x61 => {}, // OP_NOP
+                
+                // Alt Stack
                 0x6b => { // OP_TOALTSTACK
                     if let Some(top) = stack.pop() { alt_stack.push(top); }
                     else { return false; }
@@ -104,7 +123,7 @@ pub fn evaluate(
                     stack.push(item);
                 }
 
-                // Bitwise / Logic
+                // Logic
                 0x87 | 0x88 => { // OP_EQUAL / OP_EQUALVERIFY
                     if stack.len() < 2 { return false; }
                     let b = stack.pop().unwrap();
@@ -124,21 +143,22 @@ pub fn evaluate(
                     } else { return false; }
                 }
 
-                // Arithmetic & Comparison
+                // Numeric Comparison
+                0x9f | 0xa0 => { // OP_LESSTHAN / OP_GREATERTHAN
+                    if stack.len() < 2 { return false; }
+                    let b = script_get_int(&stack.pop().unwrap());
+                    let a = script_get_int(&stack.pop().unwrap());
+                    let res = if opcode == 0x9f { a < b } else { a > b };
+                    stack.push(if res { vec![1] } else { vec![] });
+                }
+
+                // Arithmetic
                 0x93 | 0x94 => { // OP_ADD / OP_SUB
                     if stack.len() < 2 { return false; }
                     let b = script_get_int(&stack.pop().unwrap());
                     let a = script_get_int(&stack.pop().unwrap());
                     let res = if opcode == 0x93 { a + b } else { a - b };
                     stack.push(res.to_le_bytes().to_vec());
-                }
-                // FIX: Restore Comparison Opcodes (0x9f: LESSTHAN, 0xa0: GREATERTHAN)
-                0x9f | 0xa0 => {
-                    if stack.len() < 2 { return false; }
-                    let b = script_get_int(&stack.pop().unwrap());
-                    let a = script_get_int(&stack.pop().unwrap());
-                    let res = if opcode == 0x9f { a < b } else { a > b };
-                    stack.push(if res { vec![1] } else { vec![] });
                 }
 
                 // Time-locks
@@ -148,24 +168,33 @@ pub fn evaluate(
                         if context.lock_time < lock_time_req { return false; }
                     } else { return false; }
                 }
-                0xb2 => { // OP_CHECKSEQUENCEVERIFY
-                    if let Some(top) = stack.last() {
-                        let seq_req = script_get_int(top) as u32;
-                        if context.input_sequence < seq_req { return false; }
+
+                // Cryptography (Expanded)
+                0xa6 => { // OP_RIPEMD160
+                    if let Some(top) = stack.pop() {
+                        stack.push(ripemd160::Hash::hash(&top).to_byte_array().to_vec());
                     } else { return false; }
                 }
-
-                // Cryptography
+                0xa8 => { // OP_SHA256
+                    if let Some(top) = stack.pop() {
+                        stack.push(sha256::Hash::hash(&top).to_byte_array().to_vec());
+                    } else { return false; }
+                }
                 0xa9 => { // OP_HASH160
                     if let Some(top) = stack.pop() {
                         stack.push(hash160::Hash::hash(&top).to_byte_array().to_vec());
+                    } else { return false; }
+                }
+                0xaa => { // OP_HASH256
+                    if let Some(top) = stack.pop() {
+                        stack.push(sha256d::Hash::hash(&top).to_byte_array().to_vec());
                     } else { return false; }
                 }
                 0xac => { // OP_CHECKSIG
                     if stack.len() < 2 { return false; }
                     let pubkey_bytes = stack.pop().unwrap();
                     let sig_bytes = stack.pop().unwrap();
-                    if !verify_sig(&secp, &sig_bytes, &pubkey_bytes, sighash) { return false; }
+                    if !verify_sig_hardened(&secp, &sig_bytes, &pubkey_bytes, sighash) { return false; }
                     stack.push(vec![1]);
                 }
                 0xae => { // OP_CHECKMULTISIG
@@ -180,14 +209,13 @@ pub fn evaluate(
                     let mut sigs = Vec::new();
                     for _ in 0..m_sigs { sigs.push(stack.pop().unwrap()); }
                     
-                    // Dummy element for BIP-147 / historical bug parity
-                    stack.pop();
+                    stack.pop(); // Historical dummy element
 
                     let mut success = 0;
-                    let mut k = 0; // Current pubkey index
+                    let mut k = 0; 
                     for sig in sigs {
                         while k < pubkeys.len() {
-                            if verify_sig(&secp, &sig, &pubkeys[k], sighash) {
+                            if verify_sig_hardened(&secp, &sig, &pubkeys[k], sighash) {
                                 success += 1;
                                 k += 1;
                                 break;
@@ -199,7 +227,7 @@ pub fn evaluate(
                 }
                 _ => return false,
             }
-            _ => { /* Skip if branch is false */ }
+            _ => { /* Skip false branches */ }
         }
     }
 
@@ -207,20 +235,41 @@ pub fn evaluate(
     stack.pop().map(|v| is_truthy(&v)).unwrap_or(true)
 }
 
-fn verify_sig(secp: &Secp256k1<secp256k1::All>, sig_bytes: &[u8], pk_bytes: &[u8], sighash: &[u8]) -> bool {
+/// Verification hardened against malleability (BIP 66 and Low-S)
+fn verify_sig_hardened(secp: &Secp256k1<secp256k1::All>, sig_bytes: &[u8], pk_bytes: &[u8], sighash: &[u8]) -> bool {
     if sig_bytes.is_empty() { return false; }
+    
+    // 1. Strict DER Encoding Check (BIP 66)
     let sig = match Signature::from_der(sig_bytes) {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(_) => {
+            warn!("Signature failed strict DER encoding check.");
+            return false;
+        }
     };
+
+    // 2. Low-S Enforcement (Malleability Protection)
+    // The 's' value must be in the lower half of the curve range.
+    let compact = sig.serialize_compact();
+    let s_bytes = &compact[32..64];
+    
+    // Big-endian comparison to ensure s is not in the high range (> N/2)
+    // SECP256K1_ORDER_HALF is coerced to a slice for comparison with the &[u8] slice
+    if s_bytes > &SECP256K1_ORDER_HALF[..] {
+        warn!("Signature failed Low-S malleability check.");
+        return false;
+    }
+
     let pubkey = match PublicKey::from_slice(pk_bytes) {
         Ok(pk) => pk,
         Err(_) => return false,
     };
+    
     let msg = match Message::from_digest_slice(sighash) {
         Ok(m) => m,
         Err(_) => return false,
     };
+    
     secp.verify_ecdsa(&msg, &sig, &pubkey).is_ok()
 }
 
@@ -228,7 +277,7 @@ fn is_truthy(bytes: &[u8]) -> bool {
     if bytes.is_empty() { return false; }
     for (i, &b) in bytes.iter().enumerate() {
         if b != 0 {
-            if i == bytes.len() - 1 && b == 0x80 { return false; } // Negative zero
+            if i == bytes.len() - 1 && b == 0x80 { return false; } // Negative zero check
             return true;
         }
     }
