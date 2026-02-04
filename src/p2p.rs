@@ -1,16 +1,16 @@
-// src/p2p.rs
+// src/p2p.rs - Optimized Block Propagation and Peer Management
 
 use crate::config::{ConsensusConfig, NodeConfig, P2PConfig};
 use crate::{
     blockchain::Blockchain, 
     peer_manager::PeerManager,
-    block::Beacon,
-    cdf::FinalityVote, // Importing directly from cdf module
+    block::{Block, BlockHeader, Beacon},
+    cdf::FinalityVote,
 };
 use anyhow::Result;
 use bitcoin_hashes::sha256d;
-use log::{info, warn, debug};
-use serde::{Deserialize, Serialize};
+use log::{info, warn, debug, error};
+use serde::{Serialize, Deserialize}; // Added missing imports
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,15 +19,20 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum P2PMessage {
-    NewBlock(Box<crate::block::Block>),
+    NewBlock(Box<Block>),
+    /// Compact Block: Announcement containing only the header and transaction IDs.
+    CompactBlockAnnouncement {
+        header: BlockHeader,
+        txids: Vec<sha256d::Hash>,
+    },
+    /// Request for full block data after receiving a compact announcement.
+    GetBlockData(sha256d::Hash),
     NewTransaction(crate::transaction::Transaction),
-    /// A signed consensus beacon (Time, Stake, Delay, etc.)
     Beacon(Beacon),
-    /// A signed vote for the CDF Finality Gadget
     FinalityVote(FinalityVote),
     Version { version: u32, best_height: u32 },
     GetHeaders,
-    Headers(Vec<crate::block::BlockHeader>),
+    Headers(Vec<BlockHeader>),
     GetBlocks(Vec<sha256d::Hash>),
     /// Veto Message: (BlockHash, PublicKey, Signature)
     Veto(sha256d::Hash, Vec<u8>, Vec<u8>),
@@ -54,14 +59,24 @@ pub async fn start_server(
 
     loop {
         tokio::select! {
-            Ok((socket, addr)) = listener.accept() => {
-                info!("Accepted new peer connection from {}", addr);
-                tokio::spawn(handle_connection(
-                    socket, addr, blockchain.clone(), to_consensus_tx.clone(),
-                    broadcast_tx.subscribe(), peer_manager.clone(), p2p_config.clone(),
-                ));
+            res = listener.accept() => {
+                match res {
+                    Ok((socket, addr)) => {
+                        if peer_manager.lock().await.is_banned(&addr) {
+                            debug!("Rejecting connection from banned peer {}", addr);
+                            continue;
+                        }
+                        info!("Accepted connection from {}", addr);
+                        peer_manager.lock().await.on_connect(addr, false);
+                        tokio::spawn(handle_connection(
+                            socket, addr, blockchain.clone(), to_consensus_tx.clone(),
+                            broadcast_tx.subscribe(), peer_manager.clone(), p2p_config.clone(),
+                        ));
+                    }
+                    Err(e) => error!("Listener error: {}", e),
+                }
             }
-            _ = shutdown_rx.recv() => { break; }
+            _ = shutdown_rx.recv() => break,
         }
     }
     Ok(())
@@ -75,16 +90,20 @@ async fn start_client(
     consensus_config: Arc<ConsensusConfig>,
     p2p_config: Arc<P2PConfig>,
 ) {
-     loop {
-        for node_addr_str in &consensus_config.bootstrap_nodes {
-            if let Ok(node_addr) = node_addr_str.parse::<SocketAddr>() {
-                if peer_manager.lock().await.is_banned(&node_addr) { continue; }
-                if let Ok(socket) = TcpStream::connect(node_addr).await {
-                    info!("Successfully connected to peer: {}", node_addr);
-                    tokio::spawn(handle_connection(
-                        socket, node_addr, blockchain.clone(), to_consensus_tx.clone(),
-                        broadcast_tx.subscribe(), peer_manager.clone(), p2p_config.clone(),
-                    ));
+    loop {
+        let needs_peers = peer_manager.lock().await.needs_outbound();
+        if needs_peers {
+            for node_addr_str in &consensus_config.bootstrap_nodes {
+                if let Ok(node_addr) = node_addr_str.parse::<SocketAddr>() {
+                    if peer_manager.lock().await.is_banned(&node_addr) { continue; }
+                    if let Ok(socket) = TcpStream::connect(node_addr).await {
+                        info!("Connected to bootstrap peer: {}", node_addr);
+                        peer_manager.lock().await.on_connect(node_addr, true);
+                        tokio::spawn(handle_connection(
+                            socket, node_addr, blockchain.clone(), to_consensus_tx.clone(),
+                            broadcast_tx.subscribe(), peer_manager.clone(), p2p_config.clone(),
+                        ));
+                    }
                 }
             }
         }
@@ -102,50 +121,47 @@ async fn handle_connection(
     p2p_config: Arc<P2PConfig>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(socket);
-    
-    // Send our version first
-    let our_height = {
-        let bc = blockchain.lock().await;
-        bc.get_block(&bc.tip).map_or(0, |b| b.height)
-    };
-    let version_msg = P2PMessage::Version { version: p2p_config.protocol_version, best_height: our_height };
+    let (peer_tx, mut peer_rx) = mpsc::channel::<P2PMessage>(20);
+
+    // Initial Version Exchange
+    let our_height = blockchain.lock().await.headers.last().map(|h| h.time).unwrap_or(0);
+    let version_msg = P2PMessage::Version { version: p2p_config.protocol_version, best_height: our_height as u32 };
     if let Ok(s) = bincode::serialize(&version_msg) {
-        let len = s.len() as u32;
-        writer.write_all(&len.to_be_bytes()).await.ok();
-        writer.write_all(&s).await.ok();
+        let _ = writer.write_all(&(s.len() as u32).to_be_bytes()).await;
+        let _ = writer.write_all(&s).await;
     }
 
-    let (peer_tx, mut peer_rx) = mpsc::channel::<P2PMessage>(10);
-
-    // Write Task
+    // Write Task handles both global broadcasts and peer-specific replies
     let write_task = tokio::spawn(async move {
         loop {
-            tokio::select! {
-                Ok(msg) = broadcast_rx.recv() => {
+            let msg_result = tokio::select! {
+                res = broadcast_rx.recv() => res.map_err(|_| ()),
+                res = peer_rx.recv() => res.ok_or(()),
+            };
+
+            match msg_result {
+                Ok(msg) => {
                     if let Ok(s) = bincode::serialize(&msg) {
-                        let len = s.len() as u32;
-                        if writer.write_all(&len.to_be_bytes()).await.is_err() || writer.write_all(&s).await.is_err() { break; }
+                        let _ = writer.write_all(&(s.len() as u32).to_be_bytes()).await;
+                        if writer.write_all(&s).await.is_err() { break; }
                     }
                 }
-                Some(msg) = peer_rx.recv() => {
-                    if let Ok(s) = bincode::serialize(&msg) {
-                        let len = s.len() as u32;
-                        if writer.write_all(&len.to_be_bytes()).await.is_err() || writer.write_all(&s).await.is_err() { break; }
-                    }
-                }
+                Err(_) => break,
             }
         }
     });
 
-    // Read Task
+    let pm_read_clone = peer_manager.clone();
+    let bc_read_clone = blockchain.clone();
+    let p2p_cfg_read = p2p_config.clone();
+
     let read_task = tokio::spawn(async move {
         loop {
             let mut size_buf = [0u8; 4];
             if reader.read_exact(&mut size_buf).await.is_err() { break; }
             let size = u32::from_be_bytes(size_buf) as usize;
-
-            if size > p2p_config.max_message_size {
-                peer_manager.lock().await.report_misbehavior(addr, 100);
+            if size > p2p_cfg_read.max_message_size {
+                pm_read_clone.lock().await.report_misbehavior(addr, 100);
                 break;
             }
 
@@ -154,50 +170,37 @@ async fn handle_connection(
 
             if let Ok(msg) = bincode::deserialize::<P2PMessage>(&buf) {
                 match msg {
-                    P2PMessage::GetHeaders => {
-                        let headers = blockchain.lock().await.get_headers();
-                        peer_tx.send(P2PMessage::Headers(headers)).await.ok();
-                    }
-                    P2PMessage::GetBlocks(hashes) => {
-                        let blocks = {
-                            let bc = blockchain.lock().await;
-                            hashes.into_iter().filter_map(|h| bc.get_block(&h)).collect::<Vec<_>>()
-                        };
-                        for block in blocks {
-                            peer_tx.send(P2PMessage::NewBlock(Box::new(block))).await.ok();
+                    P2PMessage::CompactBlockAnnouncement { header, txids: _ } => {
+                        let hash = header.hash();
+                        if bc_read_clone.lock().await.get_block(&hash).is_none() {
+                            let _ = peer_tx.send(P2PMessage::GetBlockData(hash)).await;
                         }
                     }
-                    P2PMessage::Beacon(beacon) => {
-                        debug!("Received Beacon from {}", addr);
-                        // Forward to blockchain for mempool inclusion
-                        let mut bc = blockchain.lock().await;
-                        if let Err(e) = bc.receive_beacon(beacon) {
-                            warn!("Invalid beacon from {}: {}", addr, e);
-                            peer_manager.lock().await.report_misbehavior(addr, 10);
+                    P2PMessage::GetBlockData(hash) => {
+                        if let Some(block) = bc_read_clone.lock().await.get_block(&hash) {
+                            let _ = peer_tx.send(P2PMessage::NewBlock(Box::new(block))).await;
                         }
                     }
-                    P2PMessage::FinalityVote(vote) => {
-                        debug!("Received FinalityVote from {}", addr);
-                        let mut bc = blockchain.lock().await;
-                        bc.process_finality_vote(vote);
-                    }
-                    P2PMessage::Veto(block_hash, pubkey, sig) => {
-                        debug!("Received VETO for {} from {}", block_hash, addr);
-                        let mut bc = blockchain.lock().await;
-                        // Assuming 1000 stake for prototype, or look up validator weight
-                        let stake_weight = 1000; 
-                        if let Err(e) = bc.process_veto(block_hash, pubkey, sig, stake_weight) {
-                            warn!("Invalid VETO from {}: {}", addr, e);
-                            peer_manager.lock().await.report_misbehavior(addr, 20);
+                    P2PMessage::NewBlock(block) => {
+                        let mut bc = bc_read_clone.lock().await;
+                        match bc.add_block(*block) {
+                            Ok(_) => {
+                                pm_read_clone.lock().await.reward_peer(&addr, 10);
+                            }
+                            Err(e) => {
+                                warn!("Invalid block from {}: {}", addr, e);
+                                pm_read_clone.lock().await.report_misbehavior(addr, 50);
+                            }
                         }
                     }
-                    _ => {
-                        // Forward transactions and blocks to consensus loop
-                        if to_consensus_tx.send(msg).await.is_err() { break; }
+                    P2PMessage::NewTransaction(tx) => {
+                        let mut bc = bc_read_clone.lock().await;
+                        if bc.mempool.len() < 5000 {
+                            bc.mempool.insert(tx.id(), tx);
+                        }
                     }
+                    _ => { let _ = to_consensus_tx.send(msg).await; }
                 }
-            } else {
-                peer_manager.lock().await.report_misbehavior(addr, 50);
             }
         }
     });
@@ -206,5 +209,6 @@ async fn handle_connection(
         _ = write_task => {},
         _ = read_task => {},
     }
-    info!("Closing connection with {}.", addr);
+    peer_manager.lock().await.on_disconnect(&addr);
+    debug!("Peer {} disconnected", addr);
 }
