@@ -1,4 +1,4 @@
-// src/blockchain.rs - Optimized storage layer with rolling commitments and batched I/O
+// src/blockchain.rs - Optimized storage and reward enforcement
 
 use crate::{
     block::{Block, BlockHeader, Beacon},
@@ -21,7 +21,7 @@ use num_traits::{ToPrimitive, Zero};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use secp256k1::PublicKey;
-use sled::Batch; // Added for atomic batched updates
+use sled::Batch;
 
 const VETO_THRESHOLD_PERCENT: u64 = 51;
 const MAX_BEACONS_PER_BLOCK: usize = 16;
@@ -177,6 +177,14 @@ impl Blockchain {
         } else {
             let tip_bytes = blocks_tree.get(&bc.db_config.tip_key)?.ok_or_else(|| anyhow!("Tip missing"))?;
             bc.tip = sha256d::Hash::from_slice(&tip_bytes)?;
+            
+            // RESTORATION FIX: Correctly load total_work from DB
+            if let Some(work_bytes) = blocks_tree.get(&bc.db_config.total_work_key)? {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&work_bytes);
+                bc.total_work = u64::from_be_bytes(arr);
+            }
+
             if let Some(h_bytes) = blocks_tree.get("headers")? {
                 bc.headers = bincode::deserialize(&h_bytes)?;
             }
@@ -184,9 +192,6 @@ impl Blockchain {
         Ok(bc)
     }
 
-    /// Calculates an incremental UTXO root.
-    /// OPTIMIZATION: Instead of scanning the whole tree (O(N)), we now 
-    /// return a cached commitment that is updated incrementally.
     pub fn calculate_utxo_root(&self) -> Result<sha256d::Hash> {
         let tree = self.db.open_tree("metadata")?;
         if let Some(root_bytes) = tree.get("utxo_rolling_root")? {
@@ -195,8 +200,6 @@ impl Blockchain {
         Ok(sha256d::Hash::all_zeros())
     }
 
-    /// Optimized UTXO set update using sled::Batch.
-    /// This ensures all changes in a block are atomic and disk-efficient.
     pub fn update_utxo_set(&mut self, block: &Block) -> Result<()> {
         let utxo_tree = self.db.open_tree(&self.db_config.utxo_tree)?;
         let index_tree = self.db.open_tree(&self.db_config.tx_index_tree)?;
@@ -205,13 +208,11 @@ impl Blockchain {
         let mut utxo_batch = Batch::default();
         let mut index_batch = Batch::default();
         
-        // We use a rolling XOR hash of the UTXO entries to maintain a constant-time root.
         let mut rolling_root = self.calculate_utxo_root()?;
 
         for tx in &block.transactions {
             let txid = tx.id();
             
-            // 1. Remove Spent UTXOs
             if !tx.is_coinbase() {
                 for vin in &tx.vin {
                     let mut key = Vec::with_capacity(36);
@@ -225,7 +226,6 @@ impl Blockchain {
                 }
             }
 
-            // 2. Add New UTXOs & Update Tx Index
             index_batch.insert(txid.as_ref() as &[u8], block.header.hash().as_ref() as &[u8]);
             
             for (i, vout) in tx.vout.iter().enumerate() {
@@ -237,7 +237,6 @@ impl Blockchain {
                 utxo_batch.insert(key, val);
             }
 
-            // 3. Maintain Memory Hygiene: Transaction Cache Pruning
             if self.tx_cache.len() < MAX_TX_CACHE_SIZE {
                 self.tx_cache.insert(txid, tx.clone());
             } else {
@@ -245,11 +244,8 @@ impl Blockchain {
             }
         }
 
-        // Apply batches atomically
         utxo_tree.apply_batch(utxo_batch)?;
         index_tree.apply_batch(index_batch)?;
-        
-        // Store new rolling root
         meta_tree.insert("utxo_rolling_root", rolling_root.as_ref() as &[u8])?;
 
         Ok(())
@@ -312,8 +308,7 @@ impl Blockchain {
             let block_reward = self.consensus_params.coinbase_reward;
             let total_fees = self.calculate_total_fees(block);
             let economic_value = Fixed::from_integer(block_reward + total_fees);
-            // commitment is proportional to reward + fees * staking_ratio
-            let alpha = Fixed::from_f64(0.4); // Simplified placeholder staking ratio
+            let alpha = Fixed::from_f64(0.4); 
             let pos_commitment = alpha * economic_value;
             block.synergistic_work = (pos_commitment.0 / (1 << 64)) as u64;
         }
@@ -346,21 +341,23 @@ impl Blockchain {
 
     pub fn add_block(&mut self, mut block: Block) -> Result<()> {
         let hash = block.header.hash();
-        if self.veto_manager.blacklisted_blocks.contains(&hash) { bail!("Vetoed"); }
-
-        if self.veto_manager.blacklisted_blocks.contains(&block.header.prev_blockhash) {
-            self.veto_manager.blacklisted_blocks.insert(hash);
-            bail!("Builds on vetoed ancestor");
-        }
-
+        
+        if self.veto_manager.blacklisted_blocks.contains(&hash) { bail!("Vetoed block"); }
+        
         if self.finality_gadget.finalized {
             if let Some(cp) = self.finality_gadget.target_checkpoint {
-                if let Some(b) = self.get_block(&cp) {
-                    if block.height <= b.height && hash != cp { bail!("Finality violation"); }
+                if let Some(cp_block) = self.get_block(&cp) {
+                    if block.height <= cp_block.height && hash != cp {
+                        bail!("Finality Violation: Block {} attempts to fork below checkpoint {}", hash, cp);
+                    }
                 }
             }
         }
-        
+
+        if !block.beacons.is_empty() {
+            self.validate_beacon_bounties(&block)?;
+        }
+
         let is_pow = block.header.vrf_proof.is_none();
         if !is_pow {
             let fees = self.calculate_total_fees(&block);
@@ -371,30 +368,32 @@ impl Blockchain {
             if burned < required { bail!("Insufficient Proof-of-Burn"); }
         }
 
-        let prev = self.get_block(&block.header.prev_blockhash).ok_or(anyhow!("No parent"))?;
+        let prev = self.get_block(&block.header.prev_blockhash).ok_or(anyhow!("Parent not found"))?;
         self.calculate_synergistic_work(&mut block);
         block.total_work = prev.total_work + block.synergistic_work;
-        
-        self.db.open_tree(&self.db_config.blocks_tree)?.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
+
+        let blocks_tree = self.db.open_tree(&self.db_config.blocks_tree)?;
+        blocks_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
 
         if block.total_work > self.total_work {
             self.tip = hash;
             self.total_work = block.total_work;
-            self.headers.push(block.header.clone());
             self.update_utxo_set(&block)?;
             self.dcs.process_beacons(&block.beacons);
             
-            for beacon in &block.beacons {
-                self.metrics.beacon_providers.insert(beacon.public_key.clone());
-            }
-
             let fees = self.calculate_total_fees(&block);
             if self.burst_manager.check_and_activate(&block, fees) {
                 self.finality_gadget.activate(hash, self.total_staked);
             }
-            self.burst_manager.update_state(block.height);
             
-            if is_pow && self.finality_gadget.active { self.finality_gadget.process_pow_block(&hash); }
+            if self.finality_gadget.active && !self.finality_gadget.finalized {
+                if block.header.vrf_proof.is_none() {
+                    self.finality_gadget.process_pow_block(&hash);
+                }
+                if self.finality_gadget.check_finality() {
+                    info!("✅ CDF FINALITY REACHED for checkpoint {}", hash);
+                }
+            }
 
             self.ldd_state.recent_blocks.push((block.header.time, is_pow));
             if self.ldd_state.recent_blocks.len() >= self.ldd_state.current_adjustment_window {
@@ -404,7 +403,6 @@ impl Blockchain {
 
             self.update_and_execute_proposals();
 
-            let blocks_tree = self.db.open_tree(&self.db_config.blocks_tree)?;
             blocks_tree.insert("headers", bincode::serialize(&self.headers)?)?;
             blocks_tree.insert(self.db_config.tip_key.as_str(), hash.as_ref() as &[u8])?;
             blocks_tree.insert(&self.db_config.total_work_key, &self.total_work.to_be_bytes() as &[u8])?;
@@ -534,7 +532,7 @@ impl Blockchain {
     }
 
     pub fn update_and_execute_proposals(&mut self) {
-        let current_height = self.headers.last().map(|h| h.time).unwrap_or(0); // Simplified height tracking
+        let current_height = self.headers.last().map(|h| h.time).unwrap_or(0); 
         let proposals_clone = self.governance.proposals.clone();
         for proposal in proposals_clone.values() {
             if proposal.state == ProposalState::Active && current_height > proposal.end_block as u32 {
@@ -581,10 +579,33 @@ impl Blockchain {
     fn prune_vetoed_branch(&mut self, _root_hash: sha256d::Hash) {
         self.metrics.orphan_count += 1;
     }
+
+    /// Verifies that the coinbase transaction correctly distributed rewards to beacon providers.
+    fn validate_beacon_bounties(&self, block: &Block) -> Result<()> {
+        let coinbase = block.transactions.get(0).ok_or(anyhow!("Missing coinbase"))?;
+        
+        let pool = (self.consensus_params.coinbase_reward * 1) / 100;
+        let per_beacon = pool / block.beacons.len() as u64;
+
+        if per_beacon == 0 { return Ok(()); }
+
+        for beacon in &block.beacons {
+            let pk = PublicKey::from_slice(&beacon.public_key)?;
+            let addr = address_from_pubkey_hash(&hash_pubkey(&pk));
+            
+            let found = coinbase.vout.iter().any(|out| {
+                out.value == per_beacon && 
+                out.script_pub_key == TxOut::new(0, addr.clone()).script_pub_key
+            });
+            
+            if !found {
+                bail!("Invalid Coinbase: Missing bounty payment for provider {}", addr);
+            }
+        }
+        Ok(())
+    }
 }
 
-/// Utility for incremental root updates via XOR.
-/// Provides O(1) updates compared to O(N) Merkle tree rebuilds.
 fn xor_hashes(h1: sha256d::Hash, h2: sha256d::Hash) -> sha256d::Hash {
     let mut b1 = h1.to_byte_array();
     let b2 = h2.to_byte_array();

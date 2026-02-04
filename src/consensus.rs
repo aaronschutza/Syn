@@ -1,4 +1,4 @@
-// src/consensus.rs - Fix borrow error and telemetry scaling
+// src/consensus.rs - Redundancy cleanup and warning resolution
 
 use crate::{
     block::{Block, BlockHeader, Beacon, BeaconData},
@@ -8,10 +8,11 @@ use crate::{
     transaction::{Transaction, TxOut}, 
     wallet::Wallet,
     crypto::{hash_pubkey, address_from_pubkey_hash},
+    cdf::Color,
 };
 use anyhow::Result;
 use chrono::Utc;
-use log::info;
+use log::{info, debug}; // Removed unused 'warn'
 use num_bigint::BigUint;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,15 +21,23 @@ use secp256k1::PublicKey;
 
 const BEACON_REWARD_PERCENT: u64 = 1; 
 
+/// Injects bounty rewards into the block template for all providers who 
+/// contributed a valid beacon in this block.
 fn apply_beacon_rewards(block: &mut Block, total_reward: u64, beacons: &[Beacon]) {
     if beacons.is_empty() { return; }
-    let reward_per_beacon = total_reward / 100 * BEACON_REWARD_PERCENT;
-    let total_beacon_payout = reward_per_beacon * beacons.len() as u64;
+    
+    // Designated bounty is 1% of the coinbase reward
+    let total_bounty_pool = (total_reward * BEACON_REWARD_PERCENT) / 100;
+    let reward_per_beacon = total_bounty_pool / beacons.len() as u64;
+    
     if let Some(coinbase) = block.transactions.get_mut(0) {
-        if coinbase.vout.is_empty() { return; }
-        if coinbase.vout[0].value >= total_beacon_payout {
-            coinbase.vout[0].value -= total_beacon_payout;
+        if coinbase.vout.is_empty() || reward_per_beacon == 0 { return; }
+        
+        // Subtract total bounty from miner's share
+        if coinbase.vout[0].value >= total_bounty_pool {
+            coinbase.vout[0].value -= total_bounty_pool;
         } else { return; }
+
         for beacon in beacons {
             if let Ok(pk) = PublicKey::from_slice(&beacon.public_key) {
                 let addr = address_from_pubkey_hash(&hash_pubkey(&pk));
@@ -47,61 +56,87 @@ pub async fn start_consensus_loop(
     node_config: Arc<NodeConfig>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
-    info!("Starting consensus loop in {} mode.", mode);
+    info!("Starting Synergeia Consensus Engine (Mode: {})", mode);
     let wallet = Wallet::load_from_file(&node_config)?;
     let mining_wallet = wallet.clone();
-    let beacon_wallet = wallet.clone();
+    
+    // Heartbeat intervals
+    let mut beacon_timer = tokio::time::interval(Duration::from_secs(30));
+    let mut cdf_timer = tokio::time::interval(Duration::from_secs(10));
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+            // Block Production (Miner/Staker mode)
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {
                 if mode == "miner" || mode == "full" {
                     let mut bc_lock = bc.lock().await;
-                    let tip = bc_lock.tip;
-                    if let Some(last_block) = bc_lock.get_block(&tip) {
-                        let now = Utc::now().timestamp() as u32;
-                        let delta = now.saturating_sub(last_block.header.time);
-                        let bits = bc_lock.get_next_work_required(true, delta);
+                    let tip_hash = bc_lock.tip;
+                    
+                    if bc_lock.get_block(&tip_hash).is_some() {
+                        // Create block template
                         let reward = bc_lock.consensus_params.coinbase_reward;
                         let addr = mine_to_address.clone().unwrap_or_else(|| mining_wallet.get_address());
-                        let target = BlockHeader::calculate_target(bits);
+                        let txs = vec![Transaction::new_coinbase("Synergistic Block".into(), addr, reward, 1)];
                         
-                        let txs = vec![Transaction::new_coinbase("Mined".into(), addr, reward, 1)];
                         if let Ok(mut block) = bc_lock.create_block_template(txs, 1) {
-                            // Extract beacons to avoid double-borrow of block
-                            let beacons = block.beacons.clone();
-                            apply_beacon_rewards(&mut block, reward, &beacons);
+                            // Apply Beacon Bounties
+                            let beacons_copy = block.beacons.clone();
+                            apply_beacon_rewards(&mut block, reward, &beacons_copy);
                             
-                            let mut nonce = 0;
+                            // Proof-of-Work Attempt (Limited window)
+                            let target = BlockHeader::calculate_target(block.header.bits);
                             let start = std::time::Instant::now();
-                            while start.elapsed() < Duration::from_millis(50) {
-                                block.header.nonce = nonce;
+                            while start.elapsed() < Duration::from_millis(100) {
                                 if BigUint::from_bytes_be(block.header.hash().as_ref()) <= target {
                                     if bc_lock.add_block(block.clone()).is_ok() {
+                                        info!("Mined block at height {}!", block.height);
                                         p2p_tx.send(P2PMessage::NewBlock(Box::new(block))).ok();
                                     }
                                     break;
                                 }
-                                nonce += 1;
+                                block.header.nonce += 1;
                             }
                         }
                     }
                 }
             }
             
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            // DCS Beacon Generation
+            _ = beacon_timer.tick() => {
                 let mut bc_lock = bc.lock().await;
                 let metrics = bc_lock.get_and_reset_metrics();
-                let load = (bc_lock.get_mempool_load() * 1_000_000.0) as u64;
-                let branch = (bc_lock.get_branching_factor() * 1_000_000.0) as u64;
                 
-                if let Ok(b) = beacon_wallet.sign_beacon(BeaconData::Time(Utc::now().timestamp() as u64)) { p2p_tx.send(P2PMessage::Beacon(b)).ok(); }
-                if let Ok(b) = beacon_wallet.sign_beacon(BeaconData::Stake(bc_lock.total_staked)) { p2p_tx.send(P2PMessage::Beacon(b)).ok(); }
-                if let Ok(b) = beacon_wallet.sign_beacon(BeaconData::Load(load)) { p2p_tx.send(P2PMessage::Beacon(b)).ok(); }
-                if let Ok(b) = beacon_wallet.sign_beacon(BeaconData::Topology(branch, 0)) { p2p_tx.send(P2PMessage::Beacon(b)).ok(); }
-                if let Ok(b) = beacon_wallet.sign_beacon(BeaconData::Security(metrics.orphan_count, metrics.max_reorg_depth)) { p2p_tx.send(P2PMessage::Beacon(b)).ok(); }
+                // Sign and broadcast Time and Security beacons
+                if let Ok(b) = wallet.sign_beacon(BeaconData::Time(Utc::now().timestamp() as u64)) {
+                    p2p_tx.send(P2PMessage::Beacon(b)).ok();
+                }
+                if let Ok(b) = wallet.sign_beacon(BeaconData::Security(metrics.orphan_count, metrics.max_reorg_depth)) {
+                    p2p_tx.send(P2PMessage::Beacon(b)).ok();
+                }
             }
 
+            // Chromo-Dynamic Finality (CDF) Voting
+            _ = cdf_timer.tick() => {
+                let bc_lock = bc.lock().await;
+                if bc_lock.finality_gadget.active && !bc_lock.finality_gadget.finalized {
+                    if let Some(target) = bc_lock.finality_gadget.target_checkpoint {
+                        // Deterministically assign color based on stake key
+                        let color_val = (wallet.public_key.serialize()[0] % 3) as u8;
+                        let color = match color_val {
+                            0 => Color::Red,
+                            1 => Color::Green,
+                            _ => Color::Blue,
+                        };
+
+                        if let Ok(vote) = wallet.sign_finality_vote(target, color) {
+                            debug!("Broadcasting CDF Finality Vote for checkpoint {}", target);
+                            p2p_tx.send(P2PMessage::FinalityVote(vote)).ok();
+                        }
+                    }
+                }
+            }
+
+            // Message Handling
             Some(msg) = p2p_rx.recv() => {
                 let mut bc_lock = bc.lock().await;
                 match msg {
@@ -111,6 +146,7 @@ pub async fn start_consensus_loop(
                     _ => {}
                 }
             }
+
             _ = shutdown_rx.recv() => break,
         }
     }
