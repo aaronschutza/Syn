@@ -49,6 +49,8 @@ use crate::gov_module::GovernanceModule;
 use crate::storage::GovernanceStore;
 use crate::difficulty::DynamicDifficultyManager;
 use crate::engine::ConsensusEngine;
+use crate::client::SpvClientState;
+use crate::storage::HeaderStore;
 
 
 const CHANNEL_CAPACITY: usize = 100;
@@ -76,7 +78,7 @@ async fn main() -> Result<()> {
             let bank_module = Arc::new(BankModule {}); // Placeholder
             let staking_module = Arc::new(StakingModule::new(bank_module));
             let db_for_gov = Arc::new(sled::open(&data_dir)?);
-            let governance_store = GovernanceStore::new(db_for_gov);
+            let governance_store = GovernanceStore::new(db_for_gov.clone());
             let governance_module = Arc::new(GovernanceModule::new(param_manager.clone(), staking_module.clone(), governance_store));
             let difficulty_manager = Arc::new(DynamicDifficultyManager::new(param_manager.clone()));
 
@@ -100,8 +102,8 @@ async fn main() -> Result<()> {
             let progonos_config = Arc::new(loaded_config.progonos.clone());
 			let consensus_params = Arc::new(loaded_config.consensus.clone());
 
-            let bc = Arc::new(Mutex::new(blockchain::Blockchain::new(
-                &node_config.db_path,
+            let bc = Arc::new(Mutex::new(blockchain::Blockchain::new_with_db(
+                db_for_gov.clone(),
                 consensus_params.clone(),
                 fee_params,
                 governance_params.clone(),
@@ -110,6 +112,8 @@ async fn main() -> Result<()> {
             )?));
 
             let spv_client = Arc::new(Mutex::new(progonos::SpvClient::new(&progonos_config)));
+            let header_store = HeaderStore::new(db_for_gov.clone());
+            let spv_state = Arc::new(SpvClientState::new(header_store));
             let peer_manager = Arc::new(Mutex::new(peer_manager::PeerManager::new(p2p_config.clone())));
 
             let (p2p_tx, _p2p_rx) = mpsc::channel::<P2PMessage>(CHANNEL_CAPACITY);
@@ -138,7 +142,7 @@ async fn main() -> Result<()> {
                 p2p_config.clone(),
                 node_config.clone(),
                 consensus_params.clone(), // Pass consensus params
-                shutdown_tx.subscribe(),
+                shutdown_tx.subscribe(), // FIX: Changed shutdown_rx to shutdown_tx
             ));
             
             let rpc_handle = tokio::spawn(rpc::start_rpc_server(
@@ -152,8 +156,10 @@ async fn main() -> Result<()> {
                 shutdown_tx.subscribe(),
             ));
             
+            // FIX: Pass spv_state as the second argument to match start_btc_p2p_client signature
             let btc_p2p_handle = tokio::spawn(btc_p2p::start_btc_p2p_client(
                 spv_client.clone(),
+                spv_state,
                 progonos_config.clone(),
                 btc_p2p_rx,
                 shutdown_tx.subscribe(),
