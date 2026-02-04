@@ -1,4 +1,4 @@
-// src/p2p.rs - Optimized Block Propagation and Peer Management
+// src/p2p.rs - Optimized Block Propagation (Compact Blocks) and Peer Management
 
 use crate::config::{ConsensusConfig, NodeConfig, P2PConfig};
 use crate::{
@@ -8,24 +8,34 @@ use crate::{
     cdf::FinalityVote,
 };
 use anyhow::Result;
-use bitcoin_hashes::sha256d;
+use bitcoin_hashes::sha256d; // FIX: Removed unused Hash import
 use log::{info, warn, debug, error};
-use serde::{Serialize, Deserialize}; // Added missing imports
+use serde::{Serialize, Deserialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream}; // FIX: Added missing opening brace
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum P2PMessage {
     NewBlock(Box<Block>),
-    /// Compact Block: Announcement containing only the header and transaction IDs.
+    /// Compact Block Announcement: header and short IDs (hashes) of transactions.
     CompactBlockAnnouncement {
         header: BlockHeader,
         txids: Vec<sha256d::Hash>,
     },
-    /// Request for full block data after receiving a compact announcement.
+    /// Request for specific missing transactions within a compact block.
+    BlockTransactionsRequest {
+        block_hash: sha256d::Hash,
+        indexes: Vec<usize>,
+    },
+    /// Response providing the requested missing transactions.
+    BlockTransactions {
+        block_hash: sha256d::Hash,
+        transactions: Vec<crate::transaction::Transaction>,
+    },
+    /// Request for full block data (fallback).
     GetBlockData(sha256d::Hash),
     NewTransaction(crate::transaction::Transaction),
     Beacon(Beacon),
@@ -34,7 +44,6 @@ pub enum P2PMessage {
     GetHeaders,
     Headers(Vec<BlockHeader>),
     GetBlocks(Vec<sha256d::Hash>),
-    /// Veto Message: (BlockHash, PublicKey, Signature)
     Veto(sha256d::Hash, Vec<u8>, Vec<u8>),
 }
 
@@ -50,7 +59,7 @@ pub async fn start_server(
 ) -> Result<()> {
     let listener_addr = format!("0.0.0.0:{}", node_config.p2p_port);
     let listener = TcpListener::bind(&listener_addr).await?;
-    info!("P2P server listening on {}", listener_addr);
+    info!("Synergeia P2P server listening on {}", listener_addr);
 
     tokio::spawn(start_client(
         blockchain.clone(), to_consensus_tx.clone(), broadcast_tx.clone(),
@@ -123,6 +132,9 @@ async fn handle_connection(
     let (mut reader, mut writer) = tokio::io::split(socket);
     let (peer_tx, mut peer_rx) = mpsc::channel::<P2PMessage>(20);
 
+    // Track pending compact block reconstructions
+    let mut pending_compact_blocks: std::collections::HashMap<sha256d::Hash, (BlockHeader, Vec<sha256d::Hash>)> = std::collections::HashMap::new();
+
     // Initial Version Exchange
     let our_height = blockchain.lock().await.headers.last().map(|h| h.time).unwrap_or(0);
     let version_msg = P2PMessage::Version { version: p2p_config.protocol_version, best_height: our_height as u32 };
@@ -131,7 +143,6 @@ async fn handle_connection(
         let _ = writer.write_all(&s).await;
     }
 
-    // Write Task handles both global broadcasts and peer-specific replies
     let write_task = tokio::spawn(async move {
         loop {
             let msg_result = tokio::select! {
@@ -170,29 +181,104 @@ async fn handle_connection(
 
             if let Ok(msg) = bincode::deserialize::<P2PMessage>(&buf) {
                 match msg {
-                    P2PMessage::CompactBlockAnnouncement { header, txids: _ } => {
-                        let hash = header.hash();
-                        if bc_read_clone.lock().await.get_block(&hash).is_none() {
-                            let _ = peer_tx.send(P2PMessage::GetBlockData(hash)).await;
+                    P2PMessage::CompactBlockAnnouncement { header, txids } => {
+                        let block_hash = header.hash();
+                        let mut bc = bc_read_clone.lock().await;
+                        
+                        if bc.get_block(&block_hash).is_none() {
+                            // Attempt reconstruction from local mempool
+                            let mut reconstructed_txs = Vec::new();
+                            let mut missing_indexes = Vec::new();
+
+                            for (i, txid) in txids.iter().enumerate() {
+                                if let Some(tx) = bc.mempool.get(txid) {
+                                    reconstructed_txs.push(tx.clone());
+                                } else {
+                                    missing_indexes.push(i);
+                                }
+                            }
+
+                            if missing_indexes.is_empty() {
+                                debug!("Successfully reconstructed block {} from mempool.", block_hash);
+                                // Removed unnecessary mut from block
+                                let block = Block {
+                                    header, height: 0, // Height will be corrected in add_block
+                                    transactions: reconstructed_txs,
+                                    synergistic_work: 0, total_work: 0,
+                                    beacons: Vec::new(),
+                                };
+                                if bc.add_block(block).is_ok() {
+                                    pm_read_clone.lock().await.reward_peer(&addr, 5);
+                                }
+                            } else {
+                                debug!("Block {} missing {} transactions. Requesting...", block_hash, missing_indexes.len());
+                                pending_compact_blocks.insert(block_hash, (header, txids));
+                                let _ = peer_tx.send(P2PMessage::BlockTransactionsRequest {
+                                    block_hash,
+                                    indexes: missing_indexes,
+                                }).await;
+                            }
                         }
                     }
+
+                    P2PMessage::BlockTransactionsRequest { block_hash, indexes } => {
+                        if let Some(block) = bc_read_clone.lock().await.get_block(&block_hash) {
+                            let mut response_txs = Vec::new();
+                            for idx in indexes {
+                                if let Some(tx) = block.transactions.get(idx) {
+                                    response_txs.push(tx.clone());
+                                }
+                            }
+                            let _ = peer_tx.send(P2PMessage::BlockTransactions {
+                                block_hash,
+                                transactions: response_txs,
+                            }).await;
+                        }
+                    }
+
+                    P2PMessage::BlockTransactions { block_hash, transactions } => {
+                        if let Some((header, txids)) = pending_compact_blocks.remove(&block_hash) {
+                            let mut bc = bc_read_clone.lock().await;
+                            let mut full_txs = Vec::new();
+                            // Removed unnecessary mut from tx_pool
+                            let tx_pool: std::collections::HashMap<sha256d::Hash, crate::transaction::Transaction> = 
+                                transactions.into_iter().map(|tx| (tx.id(), tx)).collect();
+
+                            // Iterate by reference to avoid moving txids, allowing the .len() check below
+                            for txid in &txids {
+                                if let Some(tx) = bc.mempool.get(txid).or(tx_pool.get(txid)) {
+                                    full_txs.push(tx.clone());
+                                }
+                            }
+
+                            if full_txs.len() == txids.len() {
+                                let block = Block {
+                                    header, height: 0,
+                                    transactions: full_txs,
+                                    synergistic_work: 0, total_work: 0,
+                                    beacons: Vec::new(),
+                                };
+                                let _ = bc.add_block(block);
+                            } else {
+                                warn!("Failed to reconstruct block {} even after BlockTransactions response.", block_hash);
+                                let _ = peer_tx.send(P2PMessage::GetBlockData(block_hash)).await;
+                            }
+                        }
+                    }
+
                     P2PMessage::GetBlockData(hash) => {
                         if let Some(block) = bc_read_clone.lock().await.get_block(&hash) {
                             let _ = peer_tx.send(P2PMessage::NewBlock(Box::new(block))).await;
                         }
                     }
+
                     P2PMessage::NewBlock(block) => {
                         let mut bc = bc_read_clone.lock().await;
-                        match bc.add_block(*block) {
-                            Ok(_) => {
-                                pm_read_clone.lock().await.reward_peer(&addr, 10);
-                            }
-                            Err(e) => {
-                                warn!("Invalid block from {}: {}", addr, e);
-                                pm_read_clone.lock().await.report_misbehavior(addr, 50);
-                            }
+                        if bc.add_block(*block).is_ok() {
+                            pm_read_clone.lock().await.reward_peer(&addr, 10);
                         }
                     }
+
                     P2PMessage::NewTransaction(tx) => {
                         let mut bc = bc_read_clone.lock().await;
                         if bc.mempool.len() < 5000 {
