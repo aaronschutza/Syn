@@ -1,36 +1,33 @@
-// src/dcs.rs - Integer-only consensus aggregation
+// src/dcs.rs - BFT-robust telemetry aggregation for adaptive security
 
 use crate::block::{Beacon, BeaconData};
 
 /// The Decentralized Consensus Service (F_DCS)
-/// Responsible for aggregating on-chain beacons to provide BFT-robust consensus values.
+/// Aggregates on-chain beacons to provide metrics for Adaptive Protocol Homeostasis.
 #[derive(Debug, Clone, Default)]
 pub struct DecentralizedConsensusService {
-    // Caches for the current interval's beacons
     time_beacons: Vec<u64>,
     stake_beacons: Vec<u64>,
     delay_beacons: Vec<u32>,
-    load_beacons: Vec<u64>, // Scaled integer (fixed point 10^6)
+    load_beacons: Vec<u64>, 
     orphan_rates: Vec<u32>,
     reorg_depths: Vec<u32>,
-    branching_factors: Vec<u64>, // Scaled integer (fixed point 10^6)
+    branching_factors: Vec<u64>,
 }
 
+/// Consolidated metrics derived from BFT-secure beacon medians/percentiles.
 pub struct ConsensusValues {
     pub median_time: u64,
     pub median_total_stake: u64,
     pub consensus_delay: u32,
-    pub consensus_load: u64,         // Scaled integer
-    pub consensus_threat_level: u64, // Scaled integer (0 to 1,000,000)
-    pub chain_health_score: u64,     // Scaled integer
+    pub consensus_load: f64,
+    pub security_threat_level: f64, // S_threat [0.0 - 1.0]
+    pub chain_health_score: f64,     // H_chain [0.0 - 1.0]
 }
 
 impl DecentralizedConsensusService {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
-    /// Resets internal cache. Called at the start of a new DCS interval.
     pub fn reset_interval(&mut self) {
         self.time_beacons.clear();
         self.stake_beacons.clear();
@@ -41,7 +38,6 @@ impl DecentralizedConsensusService {
         self.branching_factors.clear();
     }
 
-    /// Ingests beacons from a valid block. 
     pub fn process_beacons(&mut self, beacons: &[Beacon]) {
         for beacon in beacons {
             match &beacon.data {
@@ -60,28 +56,29 @@ impl DecentralizedConsensusService {
         }
     }
 
-    /// Computes the BFT-robust consensus values for the current set of beacons.
+    /// Computes the BFT-robust consensus values.
+    /// Uses 90th percentiles for threat detection as per whitepaper Section 15.2.
     pub fn calculate_consensus(&self) -> ConsensusValues {
-        // Calculate Threat Level (S_threat) using integer logic
+        // 1. Calculate Security Threat Level (S_threat)
+        // High orphan rates or reorg depths pull S_threat towards 1.0
         let p90_orphan = self.calculate_percentile(&self.orphan_rates, 90).unwrap_or(0);
         let p90_reorg = self.calculate_percentile(&self.reorg_depths, 90).unwrap_or(0);
         
-        // Simple normalization: 1.0 is represented by 1,000,000
-        let threat_orphan = (p90_orphan as u64 * 1_000_000 / 50).min(1_000_000);
-        let threat_reorg = (p90_reorg as u64 * 1_000_000 / 3).min(1_000_000);
+        let threat_orphan = (p90_orphan as f64 / 10.0).min(1.0); // Baseline: 10 orphans/window is max threat
+        let threat_reorg = (p90_reorg as f64 / 6.0).min(1.0);   // Baseline: 6 block reorg is max threat
         let s_threat = threat_orphan.max(threat_reorg);
 
-        // Calculate Chain Health (H_chain)
+        // 2. Calculate Chain Health Score (H_chain)
+        // High branching factors pull H_chain towards 1.0
         let p90_branching = self.calculate_percentile_u64(&self.branching_factors, 90).unwrap_or(1_000_000);
-        // Normalize: 1.0 (1M) is healthy, > 2.0 (2M) is highly contested
-        let h_chain = p90_branching.saturating_sub(1_000_000).min(1_000_000);
+        let h_chain = ((p90_branching as f64 / 1_000_000.0) - 1.0).max(0.0).min(1.0);
 
         ConsensusValues {
             median_time: self.calculate_median(&self.time_beacons).unwrap_or(0),
             median_total_stake: self.calculate_median(&self.stake_beacons).unwrap_or(0),
             consensus_delay: self.calculate_percentile(&self.delay_beacons, 95).unwrap_or(0),
-            consensus_load: self.calculate_median_u64(&self.load_beacons).unwrap_or(0),
-            consensus_threat_level: s_threat,
+            consensus_load: self.calculate_median_u64(&self.load_beacons).unwrap_or(0) as f64 / 1_000_000.0,
+            security_threat_level: s_threat,
             chain_health_score: h_chain,
         }
     }
@@ -90,12 +87,7 @@ impl DecentralizedConsensusService {
         if values.is_empty() { return None; }
         let mut v = values.to_vec();
         v.sort_unstable();
-        let mid = v.len() / 2;
-        if v.len() % 2 == 0 {
-            Some((v[mid - 1] + v[mid]) / 2)
-        } else {
-            Some(v[mid])
-        }
+        Some(v[v.len() / 2])
     }
 
     fn calculate_median_u64(&self, values: &[u64]) -> Option<u64> {

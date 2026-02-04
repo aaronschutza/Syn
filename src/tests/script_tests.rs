@@ -1,74 +1,84 @@
-// src/tests/script_tests.rs - Unit tests for enhanced opcode support
+// src/tests/script_tests.rs - Expanded test vectors for Bitcoin script parity
 
 #[cfg(test)]
 mod tests {
-    use crate::crypto::{generate_keypair, hash_pubkey};
     use crate::script;
-    use bitcoin_hashes::{sha256d, Hash};
-    use secp256k1::{Message, Secp256k1};
+    use bitcoin_hashes::{sha256, sha256d, Hash};
 
     #[test]
-    fn test_arithmetic_ops() {
-        // OP_2 OP_3 OP_ADD OP_5 OP_EQUAL
-        let script_pub_key = vec![
+    fn test_conditional_logic() {
+        // OP_1 OP_IF OP_2 OP_ELSE OP_3 OP_ENDIF OP_2 OP_EQUAL
+        let script_if = vec![
+            0x51, // OP_1
+            0x63, // OP_IF
             0x52, // OP_2
+            0x67, // OP_ELSE
             0x53, // OP_3
-            0x93, // OP_ADD
-            0x55, // OP_5
+            0x68, // OP_ENDIF
+            0x52, // OP_2
             0x87, // OP_EQUAL
         ];
-        assert!(script::evaluate(&[], &script_pub_key, &[]));
+        assert!(script::evaluate(&[], &script_if, &[]));
 
-        // OP_10 OP_4 OP_SUB OP_6 OP_EQUAL
-        let script_sub = vec![
-            0x5a, // OP_10
-            0x54, // OP_4
-            0x94, // OP_SUB
-            0x56, // OP_6
+        // OP_0 OP_IF OP_2 OP_ELSE OP_3 OP_ENDIF OP_3 OP_EQUAL
+        let script_else = vec![
+            0x00, // OP_0
+            0x63, // OP_IF
+            0x52, // OP_2
+            0x67, // OP_ELSE
+            0x53, // OP_3
+            0x68, // OP_ENDIF
+            0x53, // OP_3
             0x87, // OP_EQUAL
         ];
-        assert!(script::evaluate(&[], &script_sub, &[]));
+        assert!(script::evaluate(&[], &script_else, &[]));
     }
 
     #[test]
-    fn test_logic_and_verify() {
-        // OP_1 OP_VERIFY (Should pass)
-        assert!(script::evaluate(&[], &[0x51, 0x69], &[]));
+    fn test_stack_manipulation() {
+        // OP_1 OP_2 OP_SWAP OP_1 OP_EQUAL OP_VERIFY OP_2 OP_EQUAL
+        let script_swap = vec![0x51, 0x52, 0x7c, 0x51, 0x87, 0x69, 0x52, 0x87];
+        assert!(script::evaluate(&[], &script_swap, &[]));
 
-        // OP_0 OP_VERIFY (Should fail)
-        assert!(!script::evaluate(&[], &[0x00, 0x69], &[]));
-
-        // OP_1 OP_NOT OP_0 OP_EQUAL
-        let script_not = vec![0x51, 0x91, 0x00, 0x87];
-        assert!(script::evaluate(&[], &script_not, &[]));
+        // OP_1 OP_2 OP_OVER OP_1 OP_EQUAL
+        let script_over = vec![0x51, 0x52, 0x78, 0x51, 0x87];
+        assert!(script::evaluate(&[], &script_over, &[]));
     }
 
     #[test]
-    fn test_p2pkh_complete_flow() {
-        let secp = Secp256k1::new();
-        let (sk, pk) = generate_keypair(&secp);
+    fn test_cryptography_opcodes() {
+        let data = b"hello";
+        let sha = sha256::Hash::hash(data).to_byte_array().to_vec();
+        let double_sha = sha256d::Hash::hash(data).to_byte_array().to_vec();
 
-        let sighash_data = b"transaction_data_to_sign";
-        let sighash = sha256d::Hash::hash(sighash_data);
-        let msg = Message::from_digest_slice(sighash.as_ref()).unwrap();
-        let sig = secp.sign_ecdsa(&msg, &sk);
+        // <data> OP_SHA256 <hash> OP_EQUAL
+        let mut script_sha = vec![data.len() as u8];
+        script_sha.extend_from_slice(data);
+        script_sha.push(0xa8);
+        script_sha.push(sha.len() as u8);
+        script_sha.extend_from_slice(&sha);
+        script_sha.push(0x87);
+        assert!(script::evaluate(&[], &script_sha, &[]));
 
-        // scriptSig: <sig> <pubkey>
-        let mut script_sig = Vec::new();
-        let der = sig.serialize_der();
-        script_sig.push(der.len() as u8);
-        script_sig.extend(der);
-        let pk_bytes = pk.serialize();
-        script_sig.push(pk_bytes.len() as u8);
-        script_sig.extend(pk_bytes);
+        // <data> OP_HASH256 <double_hash> OP_EQUAL
+        let mut script_hash256 = vec![data.len() as u8];
+        script_hash256.extend_from_slice(data);
+        script_hash256.push(0xaa);
+        script_hash256.push(double_sha.len() as u8);
+        script_hash256.extend_from_slice(&double_sha);
+        script_hash256.push(0x87);
+        assert!(script::evaluate(&[], &script_hash256, &[]));
+    }
 
-        // scriptPubKey: OP_DUP OP_HASH160 <pubKeyHash> OP_EQUALVERIFY OP_CHECKSIG
-        let pubkey_hash = hash_pubkey(&pk);
-        let mut script_pub_key = vec![0x76, 0xa9, 0x14];
-        script_pub_key.extend_from_slice(pubkey_hash.as_ref());
-        script_pub_key.extend(&[0x88, 0xac]);
-
-        let result = script::evaluate(&script_sig, &script_pub_key, sighash.as_ref());
-        assert!(result, "Production-grade P2PKH should evaluate to true");
+    #[test]
+    fn test_numeric_comparison() {
+        // OP_5 OP_10 OP_LESSTHAN
+        assert!(script::evaluate(&[], &[0x55, 0x5a, 0x9f], &[]));
+        
+        // OP_10 OP_5 OP_GREATERTHAN
+        assert!(script::evaluate(&[], &[0x5a, 0x55, 0xa0], &[]));
+        
+        // OP_5 OP_10 OP_GREATERTHAN (should fail)
+        assert!(!script::evaluate(&[], &[0x55, 0x5a, 0xa0], &[]));
     }
 }

@@ -21,6 +21,7 @@ mod tests {
     use chrono::Utc;
     use num_bigint::BigUint;
     use secp256k1::PublicKey;
+    use log::info; // Added missing macro import to resolve compilation errors
 
     // Helper to setup test environment
     fn setup_test_env(test_name: &str) -> (Arc<Mutex<Blockchain>>, Wallet, NodeConfig) {
@@ -78,15 +79,12 @@ mod tests {
     }
 
     /// Optimized helper to apply beacon rewards to block templates.
-    /// This logic MUST exactly match the enforcement in blockchain.rs.
     fn apply_test_bounties(coinbase: &mut Transaction, reward: u64, beacons: &[Beacon]) {
         if beacons.is_empty() { return; }
-        // Matching blockchain.rs: reward * 1 / 100
         let pool = (reward * 1) / 100;
         let per_beacon = pool / beacons.len() as u64;
         
         if per_beacon > 0 {
-            // Subtract exactly what we pay out (to prevent inflation errors)
             coinbase.vout[0].value -= per_beacon * beacons.len() as u64;
             for beacon in beacons {
                 if let Ok(pk) = PublicKey::from_slice(&beacon.public_key) {
@@ -100,7 +98,7 @@ mod tests {
     // Helper to mine a block manually with valid reward distribution
     async fn mine_block(bc_arc: Arc<Mutex<Blockchain>>, wallet: &Wallet) {
         let mut bc = bc_arc.lock().await;
-        let height = bc.headers.len() as u32; // Includes genesis
+        let height = bc.headers.len() as u32;
         let time = Utc::now().timestamp() as u32;
         
         let reward = bc.consensus_params.coinbase_reward;
@@ -114,7 +112,6 @@ mod tests {
         let mut txs = vec![];
         txs.extend(bc.get_mempool_txs());
         
-        // Include beacons and apply rewards
         let beacons = bc.beacon_mempool.clone();
         bc.beacon_mempool.clear();
         apply_test_bounties(&mut coinbase, reward, &beacons);
@@ -126,7 +123,6 @@ mod tests {
         block.beacons = beacons;
         block.header.utxo_root = bc.calculate_utxo_root().unwrap();
 
-        // Solve PoW
         let target = BlockHeader::calculate_target(block.header.bits);
         while BigUint::from_bytes_be(block.header.hash().as_ref()) > target {
             block.header.nonce += 1;
@@ -142,7 +138,6 @@ mod tests {
         let high_delay = 5000;
         let beacon = wallet.sign_beacon(BeaconData::Delay(high_delay)).unwrap();
         
-        // Mine enough blocks to fill the adjustment window (5)
         for _ in 0..5 {
             {
                 let mut bc = bc_arc.lock().await;
@@ -154,7 +149,6 @@ mod tests {
         {
             let bc = bc_arc.lock().await;
             let new_psi = bc.ldd_state.current_psi;
-            // Expected: Delay 5s + Safety Margin 2s = 7
             assert!(new_psi >= 6, "PSI should adapt to high delay. Got {}", new_psi);
         }
 
@@ -180,7 +174,7 @@ mod tests {
         let mut tx = Transaction {
             version: 1,
             vin: vec![TxIn { prev_txid: txid, prev_vout: vout, script_sig: vec![], sequence: 0xFFFFFFFF }],
-            vout: vec![], // All goes to fee
+            vout: vec![], 
             lock_time: 0,
         };
 
@@ -207,7 +201,6 @@ mod tests {
     async fn test_pos_proof_of_burn_enforcement() {
         let (bc_arc, wallet, node_config) = setup_test_env("burn");
         
-        // Mine blocks to produce mature UTXOs
         mine_block(bc_arc.clone(), &wallet).await;
         mine_block(bc_arc.clone(), &wallet).await;
 
@@ -234,17 +227,47 @@ mod tests {
         let mut bc = bc_arc.lock().await;
         let prev_block = bc.get_block(&bc.tip).unwrap();
 
-        // 2. Construct an invalid PoS block (Missing the required burn output)
         let coinbase = Transaction::new_coinbase("PoS Mining".to_string(), wallet.get_address(), bc.consensus_params.coinbase_reward, 1);
         let mut block = Block::new(Utc::now().timestamp() as u32, vec![coinbase, fee_tx], bc.tip, 0x207fffff, prev_block.height + 1, 1);
         block.header.vrf_proof = Some(vec![0u8; 64]);
         block.header.utxo_root = bc.calculate_utxo_root().unwrap();
 
-        // The block SHOULD be rejected because calculate_total_fees will see 1000 sat fees
         let result = bc.add_block(block);
         
         assert!(result.is_err(), "PoS block without Proof-of-Burn output should be rejected");
         assert!(result.unwrap_err().to_string().contains("Insufficient Proof-of-Burn"));
+
+        cleanup_test_env(&node_config).await;
+    }
+
+    #[tokio::test]
+    async fn test_economic_immune_response() {
+        let (bc_arc, wallet, node_config) = setup_test_env("immune");
+        
+        let threat_beacon = wallet.sign_beacon(BeaconData::Security(2, 5)).unwrap();
+        
+        {
+            let bc = bc_arc.lock().await;
+            info!("Initial burn rate: {}", bc.ldd_state.current_burn_rate);
+        }
+
+        for _ in 0..5 {
+            {
+                let mut bc = bc_arc.lock().await;
+                bc.receive_beacon(threat_beacon.clone()).unwrap();
+            }
+            mine_block(bc_arc.clone(), &wallet).await;
+        }
+
+        {
+            let bc = bc_arc.lock().await;
+            let new_burn = bc.ldd_state.current_burn_rate;
+            let initial_base = bc.fee_params.min_burn_rate;
+            
+            info!("Hardened burn rate: {}", new_burn);
+            assert!(new_burn > initial_base, "Burn rate should increase in response to security threat");
+            assert!(bc.ldd_state.current_adjustment_window < 240, "Adjustment window should compress to increase reactivity");
+        }
 
         cleanup_test_env(&node_config).await;
     }

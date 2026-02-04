@@ -475,44 +475,48 @@ impl Blockchain {
 
     pub fn adjust_ldd(&mut self) {
         let consensus_values = self.dcs.calculate_consensus();
+        
+        // 1. Adaptive Slot Gap & Target Block Time
         let consensus_delay_sec = (consensus_values.consensus_delay as f64 / 1000.0).ceil() as u32;
-        let consensus_load = consensus_values.consensus_load as f64 / 1_000_000.0;
-        let consensus_threat = consensus_values.consensus_threat_level as f64 / 1_000_000.0;
-        let chain_health = consensus_values.chain_health_score as f64 / 1_000_000.0;
-
         let safety_margin = 2; 
         let psi_new = consensus_delay_sec + safety_margin;
         
         let floor = psi_new + safety_margin; 
         let mu_max = self.consensus_params.target_block_time as u32;
-        let mut mu_target = mu_max.saturating_sub(((mu_max.saturating_sub(floor)) as f64 * consensus_load) as u32);
-        if mu_target < floor { mu_target = floor; }
+        let mu_target = mu_max.saturating_sub(((mu_max.saturating_sub(floor)) as f64 * consensus_values.consensus_load) as u32).max(floor);
 
         self.ldd_state.current_psi = psi_new;
         self.ldd_state.current_target_block_time = mu_target as u64;
 
+        // 2. Optimal Forging Window (Rayleigh Convergence)
         let delta_mu = (mu_target as f64 - psi_new as f64).max(1.0);
         let m_req = std::f64::consts::PI / (2.0 * delta_mu * delta_mu);
         let xi_optimal = ((-2.0 * P_FALLBACK.ln()) / m_req).sqrt().round() as u32;
         self.ldd_state.current_gamma = psi_new + xi_optimal;
 
-        let n_base = 240.0;
-        let n_min = 5.0;
-        self.ldd_state.current_adjustment_window = ((n_base - n_min) * (1.0 - consensus_threat) + n_min).round() as usize;
-
+        // 3. --- ALGORITHMIC MONETARY POLICY (Section 15.3) ---
+        // Adjust beta_burn based on security threat level (S_threat)
         let beta_base = self.fee_params.min_burn_rate;
-        self.ldd_state.current_burn_rate = (beta_base + 0.5 * consensus_threat).min(self.fee_params.max_burn_rate);
-
-        let participation_rate = self.metrics.beacon_providers.len() as f64 / 10.0;
-        if participation_rate < 0.5 {
-            self.ldd_state.beacon_bounty_bps = (self.ldd_state.beacon_bounty_bps + 10).min(500);
-        } else if participation_rate > 0.8 {
-            self.ldd_state.beacon_bounty_bps = (self.ldd_state.beacon_bounty_bps.saturating_sub(5)).max(50);
+        let k_sec = 0.5; // Sensitivity constant
+        self.ldd_state.current_burn_rate = (beta_base + k_sec * consensus_values.security_threat_level)
+            .min(self.fee_params.max_burn_rate);
+        
+        if consensus_values.security_threat_level > 0.1 {
+            info!("🛡️ ECONOMIC IMMUNE RESPONSE: Hardening burn rate to {:.4} due to threat level {:.2}", 
+                self.ldd_state.current_burn_rate, consensus_values.security_threat_level);
         }
 
-        let fee_base = 1_000_000.0; 
-        self.burst_manager.fee_burst_threshold = (fee_base * (1.0 + 2.0 * chain_health)) as u64;
+        // 4. Proactive Burst Hardening (Section 15.5)
+        let fee_base = self.fee_params.fee_burst_threshold as f64;
+        let k_topo = 2.0; // Sensitivity to branching
+        self.burst_manager.fee_burst_threshold = (fee_base * (1.0 + k_topo * consensus_values.chain_health_score)) as u64;
 
+        // 5. Adaptive Adjustment Window (mitigate gaming)
+        let n_base = 240.0;
+        let n_min = 5.0;
+        self.ldd_state.current_adjustment_window = ((n_base - n_min) * (1.0 - consensus_values.security_threat_level) + n_min).round() as usize;
+
+        // 6. Proportional Difficulty Ratio (50/50 split)
         let (pow_blocks, pos_blocks) = self.ldd_state.recent_blocks.iter().fold((0.0, 0.0), |(pow, pos), &(_, is_pow)| {
             if is_pow { (pow + 1.0, pos) } else { (pow, pos + 1.0) }
         });
@@ -521,14 +525,17 @@ impl Blockchain {
 
         let kappa_base = 0.1;
         let kappa_gain = 0.2;
-        self.ldd_state.current_kappa = kappa_base + kappa_gain * (0.0_f64.max(-proportion_error));
+        let current_kappa = kappa_base + kappa_gain * (0.0_f64.max(-proportion_error));
 
-        let new_f_a_pow = self.ldd_state.f_a_pow.to_f64() * (1.0 - self.ldd_state.current_kappa * proportion_error);
-        let new_f_a_pos = self.ldd_state.f_a_pos.to_f64() * (1.0 + self.ldd_state.current_kappa * proportion_error);
+        let new_f_a_pow = self.ldd_state.f_a_pow.to_f64() * (1.0 - current_kappa * proportion_error);
+        let new_f_a_pos = self.ldd_state.f_a_pos.to_f64() * (1.0 + current_kappa * proportion_error);
 
         self.ldd_state.f_a_pow = Fixed::from_f64(new_f_a_pow.max(0.01));
         self.ldd_state.f_a_pos = Fixed::from_f64(new_f_a_pos.max(0.01));
+
+        // Reset telemetry for the next adjustment period
         self.ldd_state.recent_blocks.clear();
+        self.dcs.reset_interval();
     }
 
     pub fn update_and_execute_proposals(&mut self) {
