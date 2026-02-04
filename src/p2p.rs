@@ -1,4 +1,4 @@
-// src/p2p.rs - Optimized Block Propagation (Compact Blocks) and Peer Management
+// src/p2p.rs - Optimized Block Propagation (Compact Blocks) and Peer Management (Eclipse Protection)
 
 use crate::config::{ConsensusConfig, NodeConfig, P2PConfig};
 use crate::{
@@ -8,14 +8,15 @@ use crate::{
     cdf::FinalityVote,
 };
 use anyhow::Result;
-use bitcoin_hashes::sha256d; // FIX: Removed unused Hash import
+use bitcoin_hashes::sha256d; 
 use log::{info, warn, debug, error};
 use serde::{Serialize, Deserialize};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, IpAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream}; // FIX: Added missing opening brace
+use tokio::net::{TcpListener, TcpStream}; 
 use tokio::sync::{broadcast, mpsc, Mutex};
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum P2PMessage {
@@ -47,6 +48,17 @@ pub enum P2PMessage {
     Veto(sha256d::Hash, Vec<u8>, Vec<u8>),
 }
 
+/// Max connections per /24 (IPv4) or /32 (IPv6) subnet to prevent Eclipse attacks.
+const MAX_CONNS_PER_SUBNET: usize = 2;
+
+/// Extracts a network subnet identifier from an IP address to support peer diversification.
+fn get_subnet_id(addr: IpAddr) -> Vec<u8> {
+    match addr {
+        IpAddr::V4(v4) => v4.octets()[0..3].to_vec(), // First 3 bytes (/24)
+        IpAddr::V6(v6) => v6.octets()[0..4].to_vec(), // First 4 bytes (/32)
+    }
+}
+
 pub async fn start_server(
     blockchain: Arc<Mutex<Blockchain>>,
     to_consensus_tx: mpsc::Sender<P2PMessage>,
@@ -59,11 +71,14 @@ pub async fn start_server(
 ) -> Result<()> {
     let listener_addr = format!("0.0.0.0:{}", node_config.p2p_port);
     let listener = TcpListener::bind(&listener_addr).await?;
-    info!("Synergeia P2P server listening on {}", listener_addr);
+    info!("Synergeia P2P server listening on {} with Eclipse protection", listener_addr);
+
+    // Track active subnets to ensure the validator isn't eclipsed by a single actor.
+    let active_subnets: Arc<Mutex<HashMap<Vec<u8>, usize>>> = Arc::new(Mutex::new(HashMap::new()));
 
     tokio::spawn(start_client(
         blockchain.clone(), to_consensus_tx.clone(), broadcast_tx.clone(),
-        peer_manager.clone(), consensus_config.clone(), p2p_config.clone(),
+        peer_manager.clone(), active_subnets.clone(), consensus_config.clone(), p2p_config.clone(),
     ));
 
     loop {
@@ -71,14 +86,30 @@ pub async fn start_server(
             res = listener.accept() => {
                 match res {
                     Ok((socket, addr)) => {
-                        if peer_manager.lock().await.is_banned(&addr) {
-                            debug!("Rejecting connection from banned peer {}", addr);
-                            continue;
+                        let subnet = get_subnet_id(addr.ip());
+                        
+                        {
+                            let mut subnets = active_subnets.lock().await;
+                            let count = subnets.get(&subnet).cloned().unwrap_or(0);
+                            
+                            if count >= MAX_CONNS_PER_SUBNET {
+                                debug!("Rejecting connection from {} to maintain subnet diversity (Eclipse protection)", addr);
+                                continue;
+                            }
+                            
+                            if peer_manager.lock().await.is_banned(&addr) {
+                                debug!("Rejecting connection from banned peer {}", addr);
+                                continue;
+                            }
+
+                            subnets.insert(subnet.clone(), count + 1);
                         }
+
                         info!("Accepted connection from {}", addr);
                         peer_manager.lock().await.on_connect(addr, false);
                         tokio::spawn(handle_connection(
-                            socket, addr, blockchain.clone(), to_consensus_tx.clone(),
+                            socket, addr, subnet, active_subnets.clone(), 
+                            blockchain.clone(), to_consensus_tx.clone(),
                             broadcast_tx.subscribe(), peer_manager.clone(), p2p_config.clone(),
                         ));
                     }
@@ -96,6 +127,7 @@ async fn start_client(
     to_consensus_tx: mpsc::Sender<P2PMessage>,
     broadcast_tx: broadcast::Sender<P2PMessage>,
     peer_manager: Arc<Mutex<PeerManager>>,
+    active_subnets: Arc<Mutex<HashMap<Vec<u8>, usize>>>,
     consensus_config: Arc<ConsensusConfig>,
     p2p_config: Arc<P2PConfig>,
 ) {
@@ -104,12 +136,29 @@ async fn start_client(
         if needs_peers {
             for node_addr_str in &consensus_config.bootstrap_nodes {
                 if let Ok(node_addr) = node_addr_str.parse::<SocketAddr>() {
+                    let subnet = get_subnet_id(node_addr.ip());
+                    
+                    {
+                        let subnets = active_subnets.lock().await;
+                        if subnets.get(&subnet).cloned().unwrap_or(0) >= MAX_CONNS_PER_SUBNET {
+                            continue; // Skip bootstrap nodes if subnet is full
+                        }
+                    }
+
                     if peer_manager.lock().await.is_banned(&node_addr) { continue; }
                     if let Ok(socket) = TcpStream::connect(node_addr).await {
                         info!("Connected to bootstrap peer: {}", node_addr);
+                        
+                        {
+                            let mut subnets = active_subnets.lock().await;
+                            let count = subnets.get(&subnet).cloned().unwrap_or(0);
+                            subnets.insert(subnet.clone(), count + 1);
+                        }
+
                         peer_manager.lock().await.on_connect(node_addr, true);
                         tokio::spawn(handle_connection(
-                            socket, node_addr, blockchain.clone(), to_consensus_tx.clone(),
+                            socket, node_addr, subnet, active_subnets.clone(),
+                            blockchain.clone(), to_consensus_tx.clone(),
                             broadcast_tx.subscribe(), peer_manager.clone(), p2p_config.clone(),
                         ));
                     }
@@ -123,6 +172,8 @@ async fn start_client(
 async fn handle_connection(
     socket: TcpStream,
     addr: SocketAddr,
+    subnet_id: Vec<u8>,
+    active_subnets: Arc<Mutex<HashMap<Vec<u8>, usize>>>,
     blockchain: Arc<Mutex<Blockchain>>,
     to_consensus_tx: mpsc::Sender<P2PMessage>,
     mut broadcast_rx: broadcast::Receiver<P2PMessage>,
@@ -200,7 +251,6 @@ async fn handle_connection(
 
                             if missing_indexes.is_empty() {
                                 debug!("Successfully reconstructed block {} from mempool.", block_hash);
-                                // Removed unnecessary mut from block
                                 let block = Block {
                                     header, height: 0, // Height will be corrected in add_block
                                     transactions: reconstructed_txs,
@@ -240,11 +290,9 @@ async fn handle_connection(
                         if let Some((header, txids)) = pending_compact_blocks.remove(&block_hash) {
                             let mut bc = bc_read_clone.lock().await;
                             let mut full_txs = Vec::new();
-                            // Removed unnecessary mut from tx_pool
                             let tx_pool: std::collections::HashMap<sha256d::Hash, crate::transaction::Transaction> = 
                                 transactions.into_iter().map(|tx| (tx.id(), tx)).collect();
 
-                            // Iterate by reference to avoid moving txids, allowing the .len() check below
                             for txid in &txids {
                                 if let Some(tx) = bc.mempool.get(txid).or(tx_pool.get(txid)) {
                                     full_txs.push(tx.clone());
@@ -295,6 +343,18 @@ async fn handle_connection(
         _ = write_task => {},
         _ = read_task => {},
     }
+    
+    // Clean up subnet tracking on disconnect
+    {
+        let mut subnets = active_subnets.lock().await;
+        if let Some(count) = subnets.get_mut(&subnet_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                subnets.remove(&subnet_id);
+            }
+        }
+    }
+    
     peer_manager.lock().await.on_disconnect(&addr);
     debug!("Peer {} disconnected", addr);
 }

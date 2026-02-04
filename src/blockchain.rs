@@ -1,4 +1,4 @@
-// src/blockchain.rs - Optimized storage and reward enforcement
+// src/blockchain.rs - Optimized storage and reward enforcement (Production Storage Gap #4)
 
 use crate::{
     block::{Block, BlockHeader, Beacon},
@@ -27,6 +27,10 @@ const VETO_THRESHOLD_PERCENT: u64 = 51;
 const MAX_BEACONS_PER_BLOCK: usize = 16;
 const P_FALLBACK: f64 = 0.001; 
 const MAX_TX_CACHE_SIZE: usize = 10000;
+
+/// Tree Names for persistent indexing
+const ADDR_UTXO_TREE: &str = "addr_utxo_index";
+const METADATA_TREE: &str = "chain_metadata";
 
 #[derive(Clone, Debug)]
 pub struct LddState {
@@ -76,6 +80,13 @@ pub struct VetoManager {
 
 pub struct Blockchain {
     pub db: Arc<sled::Db>,
+    /// Persistent handles to database trees to avoid re-opening costs.
+    pub blocks_tree: sled::Tree,
+    pub utxo_tree: sled::Tree,
+    pub addr_utxo_tree: sled::Tree, // Secondary index for Address -> UTXOs
+    pub tx_index_tree: sled::Tree,
+    pub meta_tree: sled::Tree,
+
     pub tip: sha256d::Hash,
     pub total_work: u64,
     pub mempool: HashMap<sha256d::Hash, Transaction>,
@@ -121,7 +132,13 @@ impl Blockchain {
         db_config: Arc<DatabaseConfig>,
         consensus_engine: ConsensusEngine,
     ) -> Result<Self> {
+        // Cache tree handles for O(1) access during runtime
         let blocks_tree = db.open_tree(&db_config.blocks_tree)?;
+        let utxo_tree = db.open_tree(&db_config.utxo_tree)?;
+        let addr_utxo_tree = db.open_tree(ADDR_UTXO_TREE)?;
+        let tx_index_tree = db.open_tree(&db_config.tx_index_tree)?;
+        let meta_tree = db.open_tree(METADATA_TREE)?;
+
         let mut ldd_state = LddState::default();
         ldd_state.current_psi = consensus_params.psi_slot_gap;
         ldd_state.current_gamma = consensus_params.gamma_recovery_threshold;
@@ -131,6 +148,11 @@ impl Blockchain {
 
         let mut bc = Blockchain {
             db,
+            blocks_tree,
+            utxo_tree,
+            addr_utxo_tree,
+            tx_index_tree,
+            meta_tree,
             tip: sha256d::Hash::all_zeros(),
             total_work: 0,
             mempool: HashMap::new(),
@@ -155,7 +177,7 @@ impl Blockchain {
             veto_manager: VetoManager::default(),
         };
 
-        if blocks_tree.is_empty() {
+        if bc.blocks_tree.is_empty() {
             let mut genesis = Block::create_genesis_block(
                 bc.consensus_params.coinbase_reward,
                 bc.consensus_params.genesis_timestamp,
@@ -168,24 +190,23 @@ impl Blockchain {
             let genesis_hash = genesis.header.hash();
             bc.calculate_synergistic_work(&mut genesis);
             genesis.total_work = genesis.synergistic_work;
-            blocks_tree.insert(genesis_hash.as_ref() as &[u8], bincode::serialize(&genesis)?)?;
-            blocks_tree.insert(bc.db_config.tip_key.as_str(), genesis_hash.as_ref() as &[u8])?;
+            bc.blocks_tree.insert(genesis_hash.as_ref() as &[u8], bincode::serialize(&genesis)?)?;
+            bc.blocks_tree.insert(bc.db_config.tip_key.as_str(), genesis_hash.as_ref() as &[u8])?;
             bc.tip = genesis_hash;
             bc.total_work = genesis.total_work;
             bc.headers.push(genesis.header.clone());
             bc.update_utxo_set(&genesis)?;
         } else {
-            let tip_bytes = blocks_tree.get(&bc.db_config.tip_key)?.ok_or_else(|| anyhow!("Tip missing"))?;
+            let tip_bytes = bc.blocks_tree.get(&bc.db_config.tip_key)?.ok_or_else(|| anyhow!("Tip missing"))?;
             bc.tip = sha256d::Hash::from_slice(&tip_bytes)?;
             
-            // RESTORATION FIX: Correctly load total_work from DB
-            if let Some(work_bytes) = blocks_tree.get(&bc.db_config.total_work_key)? {
+            if let Some(work_bytes) = bc.blocks_tree.get(&bc.db_config.total_work_key)? {
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(&work_bytes);
                 bc.total_work = u64::from_be_bytes(arr);
             }
 
-            if let Some(h_bytes) = blocks_tree.get("headers")? {
+            if let Some(h_bytes) = bc.blocks_tree.get("headers")? {
                 bc.headers = bincode::deserialize(&h_bytes)?;
             }
         }
@@ -193,20 +214,17 @@ impl Blockchain {
     }
 
     pub fn calculate_utxo_root(&self) -> Result<sha256d::Hash> {
-        let tree = self.db.open_tree("metadata")?;
-        if let Some(root_bytes) = tree.get("utxo_rolling_root")? {
+        if let Some(root_bytes) = self.meta_tree.get("utxo_rolling_root")? {
             return Ok(sha256d::Hash::from_slice(&root_bytes)?);
         }
         Ok(sha256d::Hash::all_zeros())
     }
 
+    /// Updates the UTXO set and secondary address index.
     pub fn update_utxo_set(&mut self, block: &Block) -> Result<()> {
-        let utxo_tree = self.db.open_tree(&self.db_config.utxo_tree)?;
-        let index_tree = self.db.open_tree(&self.db_config.tx_index_tree)?;
-        let meta_tree = self.db.open_tree("metadata")?;
-
         let mut utxo_batch = Batch::default();
         let mut index_batch = Batch::default();
+        let mut addr_index_batch = Batch::default();
         
         let mut rolling_root = self.calculate_utxo_root()?;
 
@@ -215,13 +233,22 @@ impl Blockchain {
             
             if !tx.is_coinbase() {
                 for vin in &tx.vin {
-                    let mut key = Vec::with_capacity(36);
-                    key.extend_from_slice(vin.prev_txid.as_ref());
-                    key.extend_from_slice(&vin.prev_vout.to_be_bytes());
+                    let mut utxo_key = Vec::with_capacity(36);
+                    utxo_key.extend_from_slice(vin.prev_txid.as_ref());
+                    utxo_key.extend_from_slice(&vin.prev_vout.to_be_bytes());
                     
-                    if let Some(val) = utxo_tree.get(&key)? {
+                    if let Some(val) = self.utxo_tree.get(&utxo_key)? {
                         rolling_root = xor_hashes(rolling_root, sha256d::Hash::hash(&val));
-                        utxo_batch.remove(key);
+                        
+                        // Clean up secondary address index when UTXO is spent
+                        let tx_out: TxOut = bincode::deserialize(&val)?;
+                        if !tx_out.script_pub_key.is_empty() {
+                            let mut addr_key = tx_out.script_pub_key.clone();
+                            addr_key.extend_from_slice(&utxo_key);
+                            addr_index_batch.remove(addr_key);
+                        }
+
+                        utxo_batch.remove(utxo_key);
                     }
                 }
             }
@@ -229,51 +256,68 @@ impl Blockchain {
             index_batch.insert(txid.as_ref() as &[u8], block.header.hash().as_ref() as &[u8]);
             
             for (i, vout) in tx.vout.iter().enumerate() {
-                let mut key = txid.to_byte_array().to_vec();
-                key.extend(&(i as u32).to_be_bytes());
+                let mut utxo_key = txid.to_byte_array().to_vec();
+                utxo_key.extend(&(i as u32).to_be_bytes());
                 let val = bincode::serialize(vout)?;
                 
                 rolling_root = xor_hashes(rolling_root, sha256d::Hash::hash(&val));
-                utxo_batch.insert(key, val);
+                utxo_batch.insert(utxo_key.clone(), val);
+
+                // Update secondary address index for O(1) spending lookups
+                if !vout.script_pub_key.is_empty() {
+                    let mut addr_key = vout.script_pub_key.clone();
+                    addr_key.extend_from_slice(&utxo_key);
+                    addr_index_batch.insert(addr_key, &[]); // Value is empty, existence is the index
+                }
             }
 
-            if self.tx_cache.len() < MAX_TX_CACHE_SIZE {
-                self.tx_cache.insert(txid, tx.clone());
-            } else {
+            // Maintain LRU cache for recent transactions to avoid DB lookups during script validation
+            if self.tx_cache.len() >= MAX_TX_CACHE_SIZE {
                 self.tx_cache.clear();
             }
+            self.tx_cache.insert(txid, tx.clone());
         }
 
-        utxo_tree.apply_batch(utxo_batch)?;
-        index_tree.apply_batch(index_batch)?;
-        meta_tree.insert("utxo_rolling_root", rolling_root.as_ref() as &[u8])?;
+        self.utxo_tree.apply_batch(utxo_batch)?;
+        self.tx_index_tree.apply_batch(index_batch)?;
+        self.addr_utxo_tree.apply_batch(addr_index_batch)?;
+        self.meta_tree.insert("utxo_rolling_root", rolling_root.as_ref() as &[u8])?;
 
         Ok(())
     }
 
+    /// Optimized spending lookup using the Address-to-UTXO secondary index.
     pub fn find_spendable_outputs(&self, address: &str, amount_needed: u64) -> Result<(u64, HashMap<sha256d::Hash, u32>)> {
         let mut unspent_outputs = HashMap::new();
         let mut accumulated_value = 0;
-        let utxo_tree = self.db.open_tree(&self.db_config.utxo_tree)?;
-        let script_pub_key_to_find = TxOut::new(0, address.to_string()).script_pub_key;
-        for item in utxo_tree.iter() {
-            let (key, value) = item?;
-            let tx_out: TxOut = bincode::deserialize(&value)?;
-            if tx_out.script_pub_key == script_pub_key_to_find {
-                let txid = sha256d::Hash::from_slice(&key[0..32])?;
-                let vout = u32::from_be_bytes(key[32..36].try_into()?);
+        
+        let script_pub_key = TxOut::new(0, address.to_string()).script_pub_key;
+        if script_pub_key.is_empty() { return Ok((0, HashMap::new())); }
+
+        // Use scan_prefix to perform a targeted lookup on the address index
+        for item in self.addr_utxo_tree.scan_prefix(&script_pub_key) {
+            let (addr_key, _) = item?;
+            
+            // Extract the UTXO key (txid + vout) from the end of the addr_key
+            let utxo_key = &addr_key[script_pub_key.len()..];
+            if let Some(val) = self.utxo_tree.get(utxo_key)? {
+                let tx_out: TxOut = bincode::deserialize(&val)?;
+                let txid = sha256d::Hash::from_slice(&utxo_key[0..32])?;
+                let vout = u32::from_be_bytes(utxo_key[32..36].try_into()?);
+                
                 accumulated_value += tx_out.value;
                 unspent_outputs.insert(txid, vout);
+                
                 if amount_needed > 0 && accumulated_value >= amount_needed { break; }
             }
         }
+
         if amount_needed > 0 && accumulated_value < amount_needed { bail!("Insufficient funds"); }
         Ok((accumulated_value, unspent_outputs))
     }
 
     pub fn get_confirmations(&self, txid: &sha256d::Hash) -> Result<u32> {
-        let tx_index_tree = self.db.open_tree(&self.db_config.tx_index_tree)?;
-        if let Some(block_hash_bytes) = tx_index_tree.get(txid.as_ref() as &[u8])? {
+        if let Some(block_hash_bytes) = self.tx_index_tree.get(txid.as_ref() as &[u8])? {
             let block_hash = sha256d::Hash::from_slice(&block_hash_bytes)?;
             if let Some(block) = self.get_block(&block_hash) {
                 let current_tip_height = self.get_block(&self.tip).map(|b| b.height).unwrap_or(0);
@@ -372,8 +416,7 @@ impl Blockchain {
         self.calculate_synergistic_work(&mut block);
         block.total_work = prev.total_work + block.synergistic_work;
 
-        let blocks_tree = self.db.open_tree(&self.db_config.blocks_tree)?;
-        blocks_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
+        self.blocks_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
 
         if block.total_work > self.total_work {
             self.tip = hash;
@@ -403,21 +446,19 @@ impl Blockchain {
 
             self.update_and_execute_proposals();
 
-            blocks_tree.insert("headers", bincode::serialize(&self.headers)?)?;
-            blocks_tree.insert(self.db_config.tip_key.as_str(), hash.as_ref() as &[u8])?;
-            blocks_tree.insert(&self.db_config.total_work_key, &self.total_work.to_be_bytes() as &[u8])?;
+            self.blocks_tree.insert("headers", bincode::serialize(&self.headers)?)?;
+            self.blocks_tree.insert(self.db_config.tip_key.as_str(), hash.as_ref() as &[u8])?;
+            self.blocks_tree.insert(&self.db_config.total_work_key, &self.total_work.to_be_bytes() as &[u8])?;
         }
         Ok(())
     }
 
     pub fn get_block(&self, hash: &sha256d::Hash) -> Option<Block> {
-        let tree = self.db.open_tree(&self.db_config.blocks_tree).ok()?;
-        tree.get(hash.as_ref() as &[u8]).ok()?.map(|b| bincode::deserialize(&b).unwrap())
+        self.blocks_tree.get(hash.as_ref() as &[u8]).ok()?.map(|b| bincode::deserialize(&b).unwrap())
     }
 
     pub fn get_transaction(&self, txid: &sha256d::Hash) -> Result<Option<Transaction>> {
-        let index = self.db.open_tree(&self.db_config.tx_index_tree)?;
-        if let Some(bh) = index.get(txid.as_ref() as &[u8])? {
+        if let Some(bh) = self.tx_index_tree.get(txid.as_ref() as &[u8])? {
             let block_hash = sha256d::Hash::from_slice(&bh)?;
             if let Some(block) = self.get_block(&block_hash) {
                 return Ok(block.transactions.iter().find(|t| t.id() == *txid).cloned());
@@ -451,12 +492,10 @@ impl Blockchain {
 
     pub fn get_branching_factor(&self) -> f64 {
         let mut seen_heights = HashMap::new();
-        if let Ok(blocks_tree) = self.db.open_tree(&self.db_config.blocks_tree) {
-            for item in blocks_tree.iter().take(100) {
-                if let Ok((_, val)) = item {
-                    if let Ok(block) = bincode::deserialize::<Block>(&val) {
-                        *seen_heights.entry(block.height).or_insert(0) += 1;
-                    }
+        for item in self.blocks_tree.iter().take(100) {
+            if let Ok((_, val)) = item {
+                if let Ok(block) = bincode::deserialize::<Block>(&val) {
+                    *seen_heights.entry(block.height).or_insert(0) += 1;
                 }
             }
         }
@@ -476,7 +515,6 @@ impl Blockchain {
     pub fn adjust_ldd(&mut self) {
         let consensus_values = self.dcs.calculate_consensus();
         
-        // 1. Adaptive Slot Gap & Target Block Time
         let consensus_delay_sec = (consensus_values.consensus_delay as f64 / 1000.0).ceil() as u32;
         let safety_margin = 2; 
         let psi_new = consensus_delay_sec + safety_margin;
@@ -488,16 +526,13 @@ impl Blockchain {
         self.ldd_state.current_psi = psi_new;
         self.ldd_state.current_target_block_time = mu_target as u64;
 
-        // 2. Optimal Forging Window (Rayleigh Convergence)
         let delta_mu = (mu_target as f64 - psi_new as f64).max(1.0);
         let m_req = std::f64::consts::PI / (2.0 * delta_mu * delta_mu);
         let xi_optimal = ((-2.0 * P_FALLBACK.ln()) / m_req).sqrt().round() as u32;
         self.ldd_state.current_gamma = psi_new + xi_optimal;
 
-        // 3. --- ALGORITHMIC MONETARY POLICY (Section 15.3) ---
-        // Adjust beta_burn based on security threat level (S_threat)
         let beta_base = self.fee_params.min_burn_rate;
-        let k_sec = 0.5; // Sensitivity constant
+        let k_sec = 0.5; 
         self.ldd_state.current_burn_rate = (beta_base + k_sec * consensus_values.security_threat_level)
             .min(self.fee_params.max_burn_rate);
         
@@ -506,17 +541,14 @@ impl Blockchain {
                 self.ldd_state.current_burn_rate, consensus_values.security_threat_level);
         }
 
-        // 4. Proactive Burst Hardening (Section 15.5)
         let fee_base = self.fee_params.fee_burst_threshold as f64;
-        let k_topo = 2.0; // Sensitivity to branching
+        let k_topo = 2.0; 
         self.burst_manager.fee_burst_threshold = (fee_base * (1.0 + k_topo * consensus_values.chain_health_score)) as u64;
 
-        // 5. Adaptive Adjustment Window (mitigate gaming)
         let n_base = 240.0;
         let n_min = 5.0;
         self.ldd_state.current_adjustment_window = ((n_base - n_min) * (1.0 - consensus_values.security_threat_level) + n_min).round() as usize;
 
-        // 6. Proportional Difficulty Ratio (50/50 split)
         let (pow_blocks, pos_blocks) = self.ldd_state.recent_blocks.iter().fold((0.0, 0.0), |(pow, pos), &(_, is_pow)| {
             if is_pow { (pow + 1.0, pos) } else { (pow, pos + 1.0) }
         });
@@ -533,7 +565,6 @@ impl Blockchain {
         self.ldd_state.f_a_pow = Fixed::from_f64(new_f_a_pow.max(0.01));
         self.ldd_state.f_a_pos = Fixed::from_f64(new_f_a_pos.max(0.01));
 
-        // Reset telemetry for the next adjustment period
         self.ldd_state.recent_blocks.clear();
         self.dcs.reset_interval();
     }
@@ -587,7 +618,6 @@ impl Blockchain {
         self.metrics.orphan_count += 1;
     }
 
-    /// Verifies that the coinbase transaction correctly distributed rewards to beacon providers.
     fn validate_beacon_bounties(&self, block: &Block) -> Result<()> {
         let coinbase = block.transactions.get(0).ok_or(anyhow!("Missing coinbase"))?;
         
