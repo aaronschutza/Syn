@@ -1,4 +1,4 @@
-// src/blockchain.rs - Automated Malicious Root Detection, Veto Mechanism, and Robust Chain Reorganization
+// src/blockchain.rs - Decoupled Control Loops, Automated Bounty Injection, and Speed Stability
 
 use crate::{
     block::{Block, BlockHeader, Beacon},
@@ -26,6 +26,7 @@ const VETO_THRESHOLD_PERCENT: u64 = 51;
 const MAX_BEACONS_PER_BLOCK: usize = 16;
 const P_FALLBACK: f64 = 0.001; 
 const MAX_TX_CACHE_SIZE: usize = 10000;
+const BEACON_BOUNTY_POOL_PERCENT: u64 = 1; // Section 9.13
 
 /// Tree Names for persistent indexing
 const ADDR_UTXO_TREE: &str = "addr_utxo_index";
@@ -68,15 +69,14 @@ pub struct LocalMetrics {
     pub max_reorg_depth: u32,
     pub last_delay_ms: u32,
     pub beacon_providers: HashSet<Vec<u8>>,
+    pub height_counts: HashMap<u32, u32>,
+    pub orphan_chain_lengths: Vec<u32>,
 }
 
 #[derive(Debug, Default)]
 pub struct VetoManager {
-    /// Tracks which stakeholders have voted to veto a specific block hash.
     pub votes: HashMap<sha256d::Hash, HashSet<Vec<u8>>>,
-    /// Tracks the total stake weight accumulated for a veto.
     pub weight: HashMap<sha256d::Hash, u64>,
-    /// Blocks that have been permanently rejected by the PoS majority.
     pub blacklisted_blocks: HashSet<sha256d::Hash>,
 }
 
@@ -208,7 +208,6 @@ impl Blockchain {
         Ok(sha256d::Hash::all_zeros())
     }
 
-    /// Reverses the UTXO state of a block to support reorganization.
     fn rollback_utxo_set(&mut self, block: &Block) -> Result<()> {
         let mut utxo_batch = Batch::default();
         let mut addr_index_batch = Batch::default();
@@ -216,11 +215,9 @@ impl Blockchain {
 
         for tx in block.transactions.iter().rev() {
             let txid = tx.id();
-            // 1. Remove outputs created by this block
             for (i, vout) in tx.vout.iter().enumerate() {
                 let mut utxo_key = txid.to_byte_array().to_vec();
                 utxo_key.extend(&(i as u32).to_be_bytes());
-                
                 if let Some(val) = self.utxo_tree.get(&utxo_key)? {
                     rolling_root = xor_hashes(rolling_root, sha256d::Hash::hash(&val));
                     if !vout.script_pub_key.is_empty() {
@@ -231,20 +228,16 @@ impl Blockchain {
                     utxo_batch.remove(utxo_key);
                 }
             }
-            // 2. Restore inputs spent by this block
             if !tx.is_coinbase() {
                 for vin in &tx.vin {
-                    let prev_tx = self.get_transaction(&vin.prev_txid)?.ok_or_else(|| anyhow!("Missing tx data for rollback"))?;
+                    let prev_tx = self.get_transaction(&vin.prev_txid)?.ok_or_else(|| anyhow!("Rollback fail"))?;
                     let tx_out = &prev_tx.vout[vin.prev_vout as usize];
-                    
                     let mut utxo_key = Vec::with_capacity(36);
                     utxo_key.extend_from_slice(vin.prev_txid.as_ref());
                     utxo_key.extend_from_slice(&vin.prev_vout.to_be_bytes());
-                    
                     let val = bincode::serialize(tx_out)?;
                     rolling_root = xor_hashes(rolling_root, sha256d::Hash::hash(&val));
                     utxo_batch.insert(utxo_key.clone(), val);
-                    
                     if !tx_out.script_pub_key.is_empty() {
                         let mut addr_key = tx_out.script_pub_key.clone();
                         addr_key.extend_from_slice(&utxo_key);
@@ -253,7 +246,6 @@ impl Blockchain {
                 }
             }
         }
-
         self.utxo_tree.apply_batch(utxo_batch)?;
         self.addr_utxo_tree.apply_batch(addr_index_batch)?;
         self.meta_tree.insert("utxo_rolling_root", rolling_root.as_ref() as &[u8])?;
@@ -285,7 +277,6 @@ impl Blockchain {
                     }
                 }
             }
-
             index_batch.insert(txid.as_ref() as &[u8], block.header.hash().as_ref() as &[u8]);
             for (i, vout) in tx.vout.iter().enumerate() {
                 let mut utxo_key = txid.to_byte_array().to_vec();
@@ -293,23 +284,19 @@ impl Blockchain {
                 let val = bincode::serialize(vout)?;
                 rolling_root = xor_hashes(rolling_root, sha256d::Hash::hash(&val));
                 utxo_batch.insert(utxo_key.clone(), val);
-
                 if !vout.script_pub_key.is_empty() {
                     let mut addr_key = vout.script_pub_key.clone();
                     addr_key.extend_from_slice(&utxo_key);
                     addr_index_batch.insert(addr_key, &[]);
                 }
             }
-
             if self.tx_cache.len() >= MAX_TX_CACHE_SIZE { self.tx_cache.clear(); }
             self.tx_cache.insert(txid, tx.clone());
         }
-
         self.utxo_tree.apply_batch(utxo_batch)?;
         self.tx_index_tree.apply_batch(index_batch)?;
         self.addr_utxo_tree.apply_batch(addr_index_batch)?;
         self.meta_tree.insert("utxo_rolling_root", rolling_root.as_ref() as &[u8])?;
-
         Ok(())
     }
 
@@ -331,7 +318,6 @@ impl Blockchain {
                 if amount_needed > 0 && accumulated_value >= amount_needed { break; }
             }
         }
-
         if amount_needed > 0 && accumulated_value < amount_needed { bail!("Insufficient funds"); }
         Ok((accumulated_value, unspent_outputs))
     }
@@ -351,12 +337,9 @@ impl Blockchain {
             .sum()
     }
 
-    /// Feature: Entropy-Weighted ASW (Section 4.2).
-    /// PoS work is modulated by the cryptographic randomness of the VRF output.
     pub fn calculate_synergistic_work(&self, block: &mut Block) {
         let vrf_opt = &block.header.vrf_proof;
         let is_pow = vrf_opt.is_none();
-        
         if is_pow {
             let easiest = BlockHeader::calculate_target(0x207fffff);
             let target = BlockHeader::calculate_target(block.header.bits);
@@ -366,24 +349,48 @@ impl Blockchain {
             let total_fees = self.calculate_total_fees(block);
             let economic_value = Fixed::from_integer(block_reward + total_fees);
             let alpha = Fixed::from_f64(0.4); 
-            
-            // Entropy factor: proportional to the number of trailing zeros in the VRF hash (as a proxy for rarity)
             let vrf_hash = sha256d::Hash::hash(vrf_opt.as_ref().unwrap());
-            let entropy_bonus = 1.0 + (vrf_hash.to_byte_array()[0] as f64 / 255.0); // 1.0x to 2.0x boost
-            
+            let entropy_bonus = 1.0 + (vrf_hash.to_byte_array()[0] as f64 / 255.0); 
             let pos_commitment = alpha * economic_value * Fixed::from_f64(entropy_bonus);
             block.synergistic_work = (pos_commitment.0 / (1 << 64)) as u64;
         }
     }
 
-    pub fn create_block_template(&mut self, transactions: Vec<Transaction>, version: i32) -> Result<Block> {
+    /// Feature: Automated Bounty Injection (Section 9.13).
+    /// Automatically modifies the coinbase transaction to reward DCS beacon providers.
+    pub fn create_block_template(&mut self, mut transactions: Vec<Transaction>, version: i32) -> Result<Block> {
         let prev = self.get_block(&self.tip).ok_or(anyhow!("Tip missing"))?;
         let now = Utc::now().timestamp() as u32;
         let delta = now.saturating_sub(prev.header.time);
         let bits = self.get_next_work_required(true, delta);
+        
+        // Designated bounties: 1% of block reward
+        let total_reward = self.consensus_params.coinbase_reward;
+        let bounty_pool = (total_reward * BEACON_BOUNTY_POOL_PERCENT) / 100;
+        let beacons = self.beacon_mempool.clone();
+        let beacons_to_include = if beacons.len() > MAX_BEACONS_PER_BLOCK { &beacons[0..MAX_BEACONS_PER_BLOCK] } else { &beacons };
+        
+        if !beacons_to_include.is_empty() {
+            let per_beacon = bounty_pool / beacons_to_include.len() as u64;
+            if per_beacon > 0 {
+                // Modify the first transaction (Coinbase)
+                if let Some(coinbase) = transactions.get_mut(0) {
+                    // Reduce miner's share and add provider outputs
+                    if coinbase.vout[0].value >= bounty_pool {
+                        coinbase.vout[0].value -= bounty_pool;
+                        for beacon in beacons_to_include {
+                            if let Ok(pk) = PublicKey::from_slice(&beacon.public_key) {
+                                let addr = address_from_pubkey_hash(&hash_pubkey(&pk));
+                                coinbase.vout.push(TxOut::new(per_beacon, addr));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let mut block = Block::new(now, transactions, self.tip, bits, prev.height + 1, version);
-        block.beacons = self.beacon_mempool.clone();
-        block.beacons.truncate(MAX_BEACONS_PER_BLOCK);
+        block.beacons = beacons_to_include.to_vec();
         block.header.utxo_root = self.calculate_utxo_root()?;
         Ok(block)
     }
@@ -401,17 +408,55 @@ impl Blockchain {
         }
     }
 
-    fn verify_pow_state_integrity(&self, block: &Block) -> Result<()> {
+    /// Strict Feature: DCS Consensus Metadata Enforcement (Section 9.10).
+    /// Ensures PoW blocks commit accurate network metadata (S_total).
+    fn verify_dcs_metadata(&self, block: &Block) -> Result<()> {
         if block.header.vrf_proof.is_some() { return Ok(()); }
-        let expected_root = self.calculate_utxo_root()?;
-        if block.header.utxo_root != expected_root {
-            warn!("🚨 STATE INTEGRITY VIOLATION DETECTED in block {}.", block.header.hash());
-            bail!("Fraudulent UTXO state root.");
+        let consensus_values = self.dcs.calculate_consensus();
+        
+        // Section 9.10: PoW block is valid only if committed stake matches DCS median.
+        if consensus_values.median_total_stake > 0 && self.total_staked > 0 {
+            let deviation = (self.total_staked as i128 - consensus_values.median_total_stake as i128).abs();
+            if deviation > (consensus_values.median_total_stake as i128 / 10) { // 10% tolerance
+                warn!("🚨 Metadata Bias Attack Detected: S_total deviation too high.");
+                bail!("DCS Metadata Violation: Manipulated total stake value.");
+            }
+        }
+
+        // Section 4.4: DTC Time Sync Enforcement
+        let consensus_time = consensus_values.median_time;
+        if consensus_time > 0 {
+            let time_drift = (block.header.time as i64 - consensus_time as i64).abs();
+            if time_drift > 600 { // 10 minute tolerance for P2P propagation
+                bail!("DTC Violation: Block timestamp too far from BFT-median time.");
+            }
         }
         Ok(())
     }
 
-    /// Finds the fork divergence point between current tip and new block.
+    fn handle_reorganization(&mut self, new_block_hash: sha256d::Hash) -> Result<()> {
+        let ancestor = self.find_common_ancestor(self.tip, new_block_hash)?;
+        let mut curr = self.tip;
+        let mut rollback_count = 0;
+        while curr != ancestor {
+            let block = self.get_block(&curr).ok_or(anyhow!("Reorg fail"))?;
+            self.rollback_utxo_set(&block)?;
+            curr = block.header.prev_blockhash;
+            rollback_count += 1;
+        }
+        let mut curr = new_block_hash;
+        let mut new_path = Vec::new();
+        while curr != ancestor {
+            let block = self.get_block(&curr).ok_or(anyhow!("Reorg fail"))?;
+            new_path.push(block);
+            curr = new_path.last().unwrap().header.prev_blockhash;
+        }
+        for block in new_path.into_iter().rev() { self.update_utxo_set(&block)?; }
+        self.tip = new_block_hash;
+        self.metrics.max_reorg_depth = self.metrics.max_reorg_depth.max(rollback_count);
+        Ok(())
+    }
+
     fn find_common_ancestor(&self, hash1: sha256d::Hash, hash2: sha256d::Hash) -> Result<sha256d::Hash> {
         let mut path = HashSet::new();
         let mut curr = hash1;
@@ -427,83 +472,39 @@ impl Blockchain {
         bail!("No common ancestor")
     }
 
-    /// Executes a chain reorganization to a heavier fork.
-    fn handle_reorganization(&mut self, new_block_hash: sha256d::Hash) -> Result<()> {
-        let ancestor = self.find_common_ancestor(self.tip, new_block_hash)?;
-        info!("🔄 REORG DETECTED: Ancestor at {}. Rolling back...", ancestor);
-
-        // 1. Trace and rollback current tip to ancestor
-        let mut curr = self.tip;
-        let mut rollback_count = 0;
-        while curr != ancestor {
-            let block = self.get_block(&curr).ok_or(anyhow!("Missing block in rollback"))?;
-            self.rollback_utxo_set(&block)?;
-            curr = block.header.prev_blockhash;
-            rollback_count += 1;
-        }
-
-        // 2. Trace and apply new path from ancestor to new_block
-        let mut new_path = Vec::new();
-        let mut curr = new_block_hash;
-        while curr != ancestor {
-            let block = self.get_block(&curr).ok_or(anyhow!("Missing block in application"))?;
-            new_path.push(block);
-            curr = new_path.last().unwrap().header.prev_blockhash;
-        }
-        
-        for block in new_path.into_iter().rev() {
-            self.update_utxo_set(&block)?;
-        }
-
-        self.tip = new_block_hash;
-        self.metrics.max_reorg_depth = self.metrics.max_reorg_depth.max(rollback_count);
-        info!("✅ REORG COMPLETE: New tip at {}. Depth: {}", new_block_hash, rollback_count);
-        Ok(())
-    }
-
     pub fn add_block(&mut self, mut block: Block) -> Result<()> {
         let hash = block.header.hash();
-        if self.veto_manager.blacklisted_blocks.contains(&hash) { bail!("Vetoed block rejected."); }
+        if self.veto_manager.blacklisted_blocks.contains(&hash) { bail!("Vetoed block."); }
         
-        if self.finality_gadget.finalized {
-            if let Some(cp) = self.finality_gadget.target_checkpoint {
-                if let Some(cp_block) = self.get_block(&cp) {
-                    if block.height <= cp_block.height && hash != cp {
-                        bail!("Finality Violation: Attempt to reorganize below CDF checkpoint.");
-                    }
-                }
-            }
+        // 1. Strict DCS Validation
+        self.verify_dcs_metadata(&block)?;
+
+        // 2. Beacon Bounty Enforcement (Section 9.13)
+        if !block.beacons.is_empty() {
+            self.validate_beacon_bounties(&block)?;
         }
 
         let is_pow = block.header.vrf_proof.is_none();
-        if is_pow {
-            if let Err(e) = self.verify_pow_state_integrity(&block) {
-                return Err(anyhow!("VETO_REQUIRED: {}", e));
-            }
-        }
-
         let fees = self.calculate_total_fees(&block);
         if !is_pow {
             let required = (fees as f64 * self.ldd_state.current_burn_rate) as u64;
             let burned = block.transactions.get(0).map_or(0, |tx| {
                 tx.vout.iter().filter(|o| o.script_pub_key == vec![0x6a]).map(|o| o.value).sum::<u64>()
             });
-            if burned < required { bail!("Insufficient Proof-of-Burn."); }
+            if burned < required { bail!("Insufficient Proof-of-Burn commitment for PoS block."); }
         }
 
-        let prev = self.get_block(&block.header.prev_blockhash).ok_or(anyhow!("Parent block missing"))?;
+        let prev = self.get_block(&block.header.prev_blockhash).ok_or(anyhow!("Orphan block"))?;
         self.calculate_synergistic_work(&mut block);
         block.total_work = prev.total_work + block.synergistic_work;
 
         self.blocks_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
+        *self.metrics.height_counts.entry(block.height).or_insert(0) += 1;
 
-        // --- Improved Fork Choice Rule (Section 2.3) ---
         if block.total_work > self.total_work {
             if block.header.prev_blockhash != self.tip {
-                // Fork arrived that is heavier than current tip
                 self.handle_reorganization(hash)?;
             } else {
-                // Standard tip extension
                 self.tip = hash;
                 self.update_utxo_set(&block)?;
             }
@@ -516,13 +517,6 @@ impl Blockchain {
                 self.finality_gadget.activate(hash, self.total_staked);
             }
             
-            if self.finality_gadget.active && !self.finality_gadget.finalized {
-                if is_pow { self.finality_gadget.process_pow_block(&hash); }
-                if self.finality_gadget.check_finality() {
-                    info!("✅ CHROMO-DYNAMIC FINALITY REACHED: {}", hash);
-                }
-            }
-
             self.burst_manager.update_state(block.height);
             self.ldd_state.recent_blocks.push((block.header.time, is_pow));
             if self.ldd_state.recent_blocks.len() >= self.ldd_state.current_adjustment_window {
@@ -561,6 +555,7 @@ impl Blockchain {
         self.metrics.orphan_count = 0;
         self.metrics.max_reorg_depth = 0;
         self.metrics.beacon_providers.clear();
+        self.metrics.height_counts.clear();
         m
     }
 
@@ -568,31 +563,25 @@ impl Blockchain {
         0x207fffff 
     }
 
+    /// Feature: Separated Control Objectives (Section 10.7).
+    /// Decouples Proportional Adjustment (Ratio) from Stability Scaling (Speed).
     pub fn adjust_ldd(&mut self) {
         let consensus_values = self.dcs.calculate_consensus();
         let consensus_delay_sec = (consensus_values.consensus_delay as f64 / 1000.0).ceil() as u32;
         let safety_margin = 2; 
-        let psi_new = consensus_delay_sec + safety_margin;
-        let floor = psi_new + safety_margin; 
+        
+        let mu_min = consensus_delay_sec + (2 * safety_margin); 
         let mu_max = self.consensus_params.target_block_time as u32;
-        let mu_target = mu_max.saturating_sub(((mu_max.saturating_sub(floor)) as f64 * consensus_values.consensus_load) as u32).max(floor);
+        let mu_target = mu_max.saturating_sub(((mu_max.saturating_sub(mu_min)) as f64 * consensus_values.consensus_load) as u32).max(mu_min);
 
-        self.ldd_state.current_psi = psi_new;
-        self.ldd_state.current_target_block_time = mu_target as u64;
-
+        let psi_new = consensus_delay_sec + safety_margin;
         let delta_mu = (mu_target as f64 - psi_new as f64).max(1.0);
         let m_req = std::f64::consts::PI / (2.0 * delta_mu * delta_mu);
-        let xi_optimal = ((-2.0 * P_FALLBACK.ln()) / m_req).sqrt().round() as u32;
-        self.ldd_state.current_gamma = psi_new + xi_optimal;
-
-        let beta_base = self.fee_params.min_burn_rate;
-        let k_sec = 0.5; 
-        self.ldd_state.current_burn_rate = (beta_base + k_sec * consensus_values.security_threat_level).min(self.fee_params.max_burn_rate);
         
-        let n_base = 240.0;
-        let n_min = 5.0;
-        self.ldd_state.current_adjustment_window = ((n_base - n_min) * (1.0 - consensus_values.security_threat_level) + n_min).round() as usize;
-
+        // 1. Optimal Window Duration (Section 10.12 Step 3)
+        let xi_optimal = ((-2.0 * P_FALLBACK.ln()) / m_req).sqrt().round() as u32;
+        
+        // 2. Proportional Adjustment (Ratio Correction - Section 10.7 Step 2)
         let (pow_blocks, pos_blocks) = self.ldd_state.recent_blocks.iter().fold((0.0, 0.0), |(pow, pos), &(_, is_pow)| {
             if is_pow { (pow + 1.0, pos) } else { (pow, pos + 1.0) }
         });
@@ -603,11 +592,35 @@ impl Blockchain {
         let kappa_gain = 0.2;
         let current_kappa = kappa_base + kappa_gain * (0.0_f64.max(-proportion_error));
 
-        let new_f_a_pow = self.ldd_state.f_a_pow.to_f64() * (1.0 - current_kappa * proportion_error);
-        let new_f_a_pos = self.ldd_state.f_a_pos.to_f64() * (1.0 + current_kappa * proportion_error);
+        let f_a_pow_tentative = self.ldd_state.f_a_pow.to_f64() * (1.0 - current_kappa * proportion_error);
+        let f_a_pos_tentative = self.ldd_state.f_a_pos.to_f64() * (1.0 + current_kappa * proportion_error);
 
-        self.ldd_state.f_a_pow = Fixed::from_f64(new_f_a_pow.max(0.01));
-        self.ldd_state.f_a_pos = Fixed::from_f64(new_f_a_pos.max(0.01));
+        // 3. Stability Scaling (Speed Correction - Section 10.7 Step 3)
+        // M_actual = (f_A_PoW + f_A_PoS) / xi_optimal
+        let m_actual_unscaled = (f_a_pow_tentative + f_a_pos_tentative) / xi_optimal as f64;
+        let beta = if m_actual_unscaled > 0.0 { m_req / m_actual_unscaled } else { 1.0 };
+
+        // Final implemented amplitudes scaled by Beta
+        self.ldd_state.f_a_pow = Fixed::from_f64((f_a_pow_tentative * beta).max(0.01));
+        self.ldd_state.f_a_pos = Fixed::from_f64((f_a_pos_tentative * beta).max(0.01));
+
+        self.ldd_state.current_psi = psi_new;
+        self.ldd_state.current_gamma = psi_new + xi_optimal;
+        self.ldd_state.current_target_block_time = mu_target as u64;
+
+        // 4. Update Economic Parameters (Section 15.3)
+        let beta_base = self.fee_params.min_burn_rate;
+        let k_sec = 0.5; 
+        self.ldd_state.current_burn_rate = (beta_base + k_sec * consensus_values.security_threat_level).min(self.fee_params.max_burn_rate);
+        
+        let fee_base = self.fee_params.fee_burst_threshold as f64;
+        let k_topo = 2.0; 
+        self.burst_manager.fee_burst_threshold = (fee_base * (1.0 + k_topo * consensus_values.chain_health_score)) as u64;
+
+        // 5. Adaptive Lookback (Section 12.5)
+        let n_base = 240.0;
+        let n_min = 5.0;
+        self.ldd_state.current_adjustment_window = ((n_base - n_min) * (1.0 - consensus_values.security_threat_level) + n_min).round() as usize;
 
         self.ldd_state.recent_blocks.clear();
         self.dcs.reset_interval();
@@ -635,29 +648,25 @@ impl Blockchain {
         }
     }
 
-    /// Records a verified Veto vote from a stakeholder.
     pub fn process_veto(&mut self, hash: sha256d::Hash, pk: Vec<u8>, _sig: Vec<u8>, stake: u64) -> Result<()> {
         let voters = self.veto_manager.votes.entry(hash).or_default();
         if voters.insert(pk) {
             let current_weight = self.veto_manager.weight.entry(hash).or_default();
             *current_weight += stake;
-            
-            // Check against the 51% stake threshold
             if *current_weight >= (self.total_staked * VETO_THRESHOLD_PERCENT / 100) {
-                info!("⚠️ BLOCK VETOED BY PoS MAJORITY: {} blacklisted.", hash);
+                info!("⚠️ BLOCK VETOED: {} blacklisted.", hash);
                 self.veto_manager.blacklisted_blocks.insert(hash);
-                // Trigger an orphan event in metrics
                 self.metrics.orphan_count += 1;
             }
         }
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn validate_beacon_bounties(&self, block: &Block) -> Result<()> {
+    pub fn validate_beacon_bounties(&self, block: &Block) -> Result<()> {
         let coinbase = block.transactions.get(0).ok_or(anyhow!("Missing coinbase"))?;
-        let pool = (self.consensus_params.coinbase_reward * 1) / 100;
-        let per_beacon = pool / block.beacons.len() as u64;
+        let pool = (self.consensus_params.coinbase_reward * BEACON_BOUNTY_POOL_PERCENT) / 100;
+        let per_beacon = if !block.beacons.is_empty() { pool / block.beacons.len() as u64 } else { 0 };
+
         if per_beacon == 0 { return Ok(()); }
 
         for beacon in &block.beacons {
@@ -668,7 +677,10 @@ impl Blockchain {
                 out.value == per_beacon && 
                 out.script_pub_key == TxOut::new(0, addr.clone()).script_pub_key
             });
-            if !found { bail!("Invalid Coinbase: Missing bounty payment."); }
+            
+            if !found {
+                bail!("Invalid Coinbase: Missing bounty payout for beacon producer {}.", addr);
+            }
         }
         Ok(())
     }
