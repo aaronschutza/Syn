@@ -1,10 +1,15 @@
 // src/p2p.rs
 
 use crate::config::{ConsensusConfig, NodeConfig, P2PConfig};
-use crate::{blockchain::Blockchain, peer_manager::PeerManager};
+use crate::{
+    blockchain::Blockchain, 
+    peer_manager::PeerManager,
+    block::Beacon,
+    cdf::FinalityVote, // Importing directly from cdf module
+};
 use anyhow::Result;
 use bitcoin_hashes::sha256d;
-use log::info;
+use log::{info, warn, debug};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,11 +21,16 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 pub enum P2PMessage {
     NewBlock(Box<crate::block::Block>),
     NewTransaction(crate::transaction::Transaction),
+    /// A signed consensus beacon (Time, Stake, Delay, etc.)
+    Beacon(Beacon),
+    /// A signed vote for the CDF Finality Gadget
+    FinalityVote(FinalityVote),
     Version { version: u32, best_height: u32 },
     GetHeaders,
     Headers(Vec<crate::block::BlockHeader>),
     GetBlocks(Vec<sha256d::Hash>),
-    Veto(sha256d::Hash),
+    /// Veto Message: (BlockHash, PublicKey, Signature)
+    Veto(sha256d::Hash, Vec<u8>, Vec<u8>),
 }
 
 pub async fn start_server(
@@ -157,7 +167,32 @@ async fn handle_connection(
                             peer_tx.send(P2PMessage::NewBlock(Box::new(block))).await.ok();
                         }
                     }
+                    P2PMessage::Beacon(beacon) => {
+                        debug!("Received Beacon from {}", addr);
+                        // Forward to blockchain for mempool inclusion
+                        let mut bc = blockchain.lock().await;
+                        if let Err(e) = bc.receive_beacon(beacon) {
+                            warn!("Invalid beacon from {}: {}", addr, e);
+                            peer_manager.lock().await.report_misbehavior(addr, 10);
+                        }
+                    }
+                    P2PMessage::FinalityVote(vote) => {
+                        debug!("Received FinalityVote from {}", addr);
+                        let mut bc = blockchain.lock().await;
+                        bc.process_finality_vote(vote);
+                    }
+                    P2PMessage::Veto(block_hash, pubkey, sig) => {
+                        debug!("Received VETO for {} from {}", block_hash, addr);
+                        let mut bc = blockchain.lock().await;
+                        // Assuming 1000 stake for prototype, or look up validator weight
+                        let stake_weight = 1000; 
+                        if let Err(e) = bc.process_veto(block_hash, pubkey, sig, stake_weight) {
+                            warn!("Invalid VETO from {}: {}", addr, e);
+                            peer_manager.lock().await.report_misbehavior(addr, 20);
+                        }
+                    }
                     _ => {
+                        // Forward transactions and blocks to consensus loop
                         if to_consensus_tx.send(msg).await.is_err() { break; }
                     }
                 }

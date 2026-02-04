@@ -5,6 +5,8 @@ use crate::{
     crypto::{address_from_pubkey_hash, generate_keypair, hash_pubkey},
     pos::StakeInfo,
     transaction::{Transaction, TxOut},
+    block::{Beacon, BeaconData},
+    cdf::{FinalityVote, Color}, // Import Color and FinalityVote from CDF
 };
 use anyhow::{anyhow, Result};
 use bitcoin_hashes::{sha256d, Hash};
@@ -135,5 +137,49 @@ impl Wallet {
             tx_for_signing.vin[i].script_sig = vec![];
         }
         Ok(())
+    }
+
+    /// Sign a consensus beacon.
+    pub fn sign_beacon(&self, data: BeaconData) -> Result<Beacon> {
+        let msg_hash = sha256d::Hash::hash(&bincode::serialize(&data)?);
+        let msg = Message::from_digest_slice(msg_hash.as_ref())?;
+        let sig = self.sign(&msg);
+        
+        Ok(Beacon {
+            public_key: self.public_key.serialize().to_vec(),
+            data,
+            signature: sig.serialize_compact().to_vec(),
+        })
+    }
+
+    /// Sign a finality vote for CDF.
+    pub fn sign_finality_vote(&self, checkpoint_hash: sha256d::Hash, color: Color) -> Result<FinalityVote> {
+        // Message structure: checkpoint_hash + color
+        let mut msg_bytes = checkpoint_hash.to_byte_array().to_vec();
+        msg_bytes.push(color as u8);
+        let msg_hash = sha256d::Hash::hash(&msg_bytes);
+        
+        let msg = Message::from_digest_slice(msg_hash.as_ref())?;
+        let sig = self.sign(&msg);
+
+        Ok(FinalityVote {
+            voter_public_key: self.public_key.serialize().to_vec(),
+            checkpoint_hash,
+            color,
+            signature: sig.serialize_compact().to_vec(),
+        })
+    }
+
+    /// Sign a VETO message.
+    pub fn sign_veto(&self, block_hash: sha256d::Hash) -> Result<(Vec<u8>, Vec<u8>)> {
+        // Message structure: "VETO" + block_hash
+        let mut msg_bytes = b"VETO".to_vec();
+        msg_bytes.extend_from_slice(block_hash.as_ref());
+        let msg_hash = sha256d::Hash::hash(&msg_bytes);
+        
+        let msg = Message::from_digest_slice(msg_hash.as_ref())?;
+        let sig = self.sign(&msg);
+
+        Ok((self.public_key.serialize().to_vec(), sig.serialize_compact().to_vec()))
     }
 }

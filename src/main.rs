@@ -9,6 +9,9 @@ pub mod cli;
 pub mod config;
 pub mod consensus;
 pub mod crypto;
+pub mod dcs;
+pub mod burst;
+pub mod cdf; // ADDED: Chromo-Dynamic Finality
 pub mod fixed_point;
 pub mod governance;
 pub mod p2p;
@@ -18,7 +21,7 @@ pub mod pos;
 pub mod progonos;
 pub mod rpc;
 pub mod script;
-pub mod stk_module; // Corrected: was staking
+pub mod stk_module; 
 pub mod transaction;
 pub mod wallet;
 pub mod engine;

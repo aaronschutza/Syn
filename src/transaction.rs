@@ -24,6 +24,33 @@ pub struct TxOut {
     pub script_pub_key: Vec<u8>,
 }
 
+impl TxOut {
+    /// Creates a new transaction output with a standard P2PKH script.
+    pub fn new(value: u64, address: String) -> Self {
+        if address.is_empty() { return TxOut { value, script_pub_key: vec![] }; }
+        let pubkey_hash_with_version = match bs58::decode(&address).into_vec() {
+            Ok(vec) => vec,
+            Err(_) => return TxOut { value, script_pub_key: vec![] },
+        };
+
+        if pubkey_hash_with_version.len() < 5 {
+             return TxOut { value, script_pub_key: vec![] };
+        }
+        let pubkey_hash = &pubkey_hash_with_version[1..pubkey_hash_with_version.len() - 4];
+
+        let mut script_pub_key = vec![0x76, 0xa9, 0x14];
+        script_pub_key.extend_from_slice(pubkey_hash);
+        script_pub_key.extend(&[0x88, 0xac]);
+
+        TxOut { value, script_pub_key }
+    }
+
+    /// Checks if this output is a burn output (OP_RETURN).
+    pub fn is_burn(&self) -> bool {
+        !self.script_pub_key.is_empty() && self.script_pub_key[0] == 0x6a
+    }
+}
+
 /// Represents a transaction, which is a collection of inputs and outputs.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
@@ -139,27 +166,5 @@ impl Transaction {
             value: amount,
             script_pub_key: vec![0x6a], // OP_RETURN
         }
-    }
-}
-
-impl TxOut {
-    /// Creates a new transaction output with a standard P2PKH script.
-    pub fn new(value: u64, address: String) -> Self {
-        if address.is_empty() { return TxOut { value, script_pub_key: vec![] }; }
-        let pubkey_hash_with_version = match bs58::decode(&address).into_vec() {
-            Ok(vec) => vec,
-            Err(_) => return TxOut { value, script_pub_key: vec![] },
-        };
-
-        if pubkey_hash_with_version.len() < 5 {
-             return TxOut { value, script_pub_key: vec![] };
-        }
-        let pubkey_hash = &pubkey_hash_with_version[1..pubkey_hash_with_version.len() - 4];
-
-        let mut script_pub_key = vec![0x76, 0xa9, 0x14];
-        script_pub_key.extend_from_slice(pubkey_hash);
-        script_pub_key.extend(&[0x88, 0xac]);
-
-        TxOut { value, script_pub_key }
     }
 }

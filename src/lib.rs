@@ -9,6 +9,9 @@ pub mod cli;
 pub mod config;
 pub mod consensus;
 pub mod crypto;
+pub mod dcs;
+pub mod burst;
+pub mod cdf;
 pub mod fixed_point;
 pub mod governance;
 pub mod p2p;
@@ -39,4 +42,6 @@ mod tests {
     mod script_tests;
     // Integration tests for the entire node.
     mod integration_tests;
+    // Tests for advanced adaptive features (DCS, Burst, LDD).
+    mod advanced_feature_tests;
 }

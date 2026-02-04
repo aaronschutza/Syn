@@ -13,6 +13,8 @@ pub struct Config {
     pub governance: GovernanceConfig,
     pub database: DatabaseConfig,
     pub progonos: ProgonosConfig,
+    // ADDED: Configuration for Decentralized Consensus Service
+    pub dcs: DcsConfig,
 }
 
 /// Node-specific configuration.
@@ -80,6 +82,8 @@ pub struct FeeConfig {
     pub target_staking_ratio: f64,
     pub min_burn_rate: f64,
     pub max_burn_rate: f64,
+    pub fee_burst_threshold: u64,
+    pub k_burst: u32,
 }
 
 /// Governance-specific configuration.
@@ -93,6 +97,15 @@ pub struct GovernanceConfig {
 pub struct ProgonosConfig {
     pub btc_confirmations: u32,
     pub btc_genesis_header: String,
+}
+
+/// Configuration for the Decentralized Consensus Service (Beacons).
+#[derive(Clone, Deserialize, Debug, Default)]
+pub struct DcsConfig {
+    /// Interval (in seconds) to broadcast Time/Stake beacons.
+    pub beacon_interval_secs: u64,
+    /// Interval (in seconds) to check for CDF voting conditions.
+    pub cdf_check_interval_secs: u64,
 }
 
 /// Loads the configuration from the `synergeia.toml` file.

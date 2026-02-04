@@ -6,12 +6,39 @@ use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 
+/// Represents the specific type of data carried by a consensus beacon.
+/// Corresponds to the beacon types defined in Whitepaper Section 9.12.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum BeaconData {
+    /// Time Beacon: Miner's local timestamp. Used for DTC.
+    Time(u64),
+    /// Stake Beacon: Validator's view of Total Network Stake. Used for DSC.
+    Stake(u64),
+    /// Delay Beacon: Observed block propagation delay (in ms). Used for Adaptive Slot Gap.
+    Delay(u32),
+    /// Load Beacon: Observed transaction load (normalized 0.0-1.0). Used for Adaptive Target Slope.
+    Load(f64),
+    /// Security Beacon: Observed threat metrics. Used for Adaptive Burn Rate.
+    /// (orphan_count, max_reorg_depth)
+    Security(u32, u32), 
+    /// Topology Beacon: Observed chain structure. Used for Adaptive Burst Threshold.
+    /// (branching_factor, max_orphan_chain_length)
+    Topology(f64, u32),
+}
+
 #[serde_as]
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Beacon {
+    /// The public key of the node producing the beacon (Miner or Validator).
     #[serde_as(as = "Bytes")]
     pub public_key: Vec<u8>,
-    pub timestamp: u64,
+    
+    /// The actual measurement data.
+    pub data: BeaconData,
+    
+    /// Signature proving the node attested to this data.
+    #[serde_as(as = "Bytes")]
+    pub signature: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -26,16 +53,18 @@ pub struct BlockHeader {
     pub time: u32,
     pub bits: u32,
     pub nonce: u32,
+    /// VRF Proof for PoS blocks. None for PoW blocks.
     pub vrf_proof: Option<Vec<u8>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Block {
     pub header: BlockHeader,
     pub height: u32,
     pub transactions: Vec<Transaction>,
     pub synergistic_work: u64,
     pub total_work: u64,
+    /// Beacons included in this block to support the DCS (Decentralized Consensus Service).
     pub beacons: Vec<Beacon>,
 }
 
