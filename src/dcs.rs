@@ -1,4 +1,4 @@
-// src/dcs.rs
+// src/dcs.rs - Integer-only consensus aggregation
 
 use crate::block::{Beacon, BeaconData};
 
@@ -10,23 +10,19 @@ pub struct DecentralizedConsensusService {
     time_beacons: Vec<u64>,
     stake_beacons: Vec<u64>,
     delay_beacons: Vec<u32>,
-    load_beacons: Vec<f64>,
-    
-    // Security metrics
+    load_beacons: Vec<u64>, // Scaled integer (fixed point 10^6)
     orphan_rates: Vec<u32>,
     reorg_depths: Vec<u32>,
-    
-    // Topology metrics
-    branching_factors: Vec<f64>,
+    branching_factors: Vec<u64>, // Scaled integer (fixed point 10^6)
 }
 
 pub struct ConsensusValues {
     pub median_time: u64,
     pub median_total_stake: u64,
     pub consensus_delay: u32,
-    pub consensus_load: f64,
-    pub consensus_threat_level: f64, // Normalized 0.0 - 1.0
-    pub chain_health_score: f64,     // Normalized 0.0 - 1.0
+    pub consensus_load: u64,         // Scaled integer
+    pub consensus_threat_level: u64, // Scaled integer (0 to 1,000,000)
+    pub chain_health_score: u64,     // Scaled integer
 }
 
 impl DecentralizedConsensusService {
@@ -66,29 +62,25 @@ impl DecentralizedConsensusService {
 
     /// Computes the BFT-robust consensus values for the current set of beacons.
     pub fn calculate_consensus(&self) -> ConsensusValues {
-        // Calculate Threat Level (S_threat)
-        // High percentile of orphan rates and reorg depths
-        let p90_orphan = self.calculate_percentile(&self.orphan_rates, 0.90).unwrap_or(0) as f64;
-        let p90_reorg = self.calculate_percentile(&self.reorg_depths, 0.90).unwrap_or(0) as f64;
+        // Calculate Threat Level (S_threat) using integer logic
+        let p90_orphan = self.calculate_percentile(&self.orphan_rates, 90).unwrap_or(0);
+        let p90_reorg = self.calculate_percentile(&self.reorg_depths, 90).unwrap_or(0);
         
-        // Simple normalization model for threat level:
-        // Threat = 1.0 if > 50% orphans or > 3 block reorgs
-        // This effectively triggers high-alert mode.
-        let threat_orphan = (p90_orphan / 50.0).min(1.0);
-        let threat_reorg = (p90_reorg / 3.0).min(1.0);
+        // Simple normalization: 1.0 is represented by 1,000,000
+        let threat_orphan = (p90_orphan as u64 * 1_000_000 / 50).min(1_000_000);
+        let threat_reorg = (p90_reorg as u64 * 1_000_000 / 3).min(1_000_000);
         let s_threat = threat_orphan.max(threat_reorg);
 
         // Calculate Chain Health (H_chain)
-        // Based on branching factor
-        let p90_branching = self.calculate_percentile_float(&self.branching_factors, 0.90).unwrap_or(1.0);
-        // Normalize: 1.0 is healthy, > 2.0 is highly contested
-        let h_chain = ((p90_branching - 1.0) / 1.0).max(0.0).min(1.0);
+        let p90_branching = self.calculate_percentile_u64(&self.branching_factors, 90).unwrap_or(1_000_000);
+        // Normalize: 1.0 (1M) is healthy, > 2.0 (2M) is highly contested
+        let h_chain = p90_branching.saturating_sub(1_000_000).min(1_000_000);
 
         ConsensusValues {
             median_time: self.calculate_median(&self.time_beacons).unwrap_or(0),
             median_total_stake: self.calculate_median(&self.stake_beacons).unwrap_or(0),
-            consensus_delay: self.calculate_percentile(&self.delay_beacons, 0.95).unwrap_or(0),
-            consensus_load: self.calculate_median_float(&self.load_beacons).unwrap_or(0.0),
+            consensus_delay: self.calculate_percentile(&self.delay_beacons, 95).unwrap_or(0),
+            consensus_load: self.calculate_median_u64(&self.load_beacons).unwrap_or(0),
             consensus_threat_level: s_threat,
             chain_health_score: h_chain,
         }
@@ -106,27 +98,23 @@ impl DecentralizedConsensusService {
         }
     }
 
-    fn calculate_median_float(&self, values: &[f64]) -> Option<f64> {
-        if values.is_empty() { return None; }
-        let mut v = values.to_vec();
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mid = v.len() / 2;
-        Some(v[mid])
+    fn calculate_median_u64(&self, values: &[u64]) -> Option<u64> {
+        self.calculate_median(values)
     }
 
-    fn calculate_percentile(&self, values: &[u32], percentile: f64) -> Option<u32> {
+    fn calculate_percentile(&self, values: &[u32], percentile: u32) -> Option<u32> {
         if values.is_empty() { return None; }
         let mut v = values.to_vec();
         v.sort_unstable();
-        let idx = ((v.len() as f64 - 1.0) * percentile).round() as usize;
+        let idx = ((v.len() as u64 - 1) * percentile as u64 / 100) as usize;
         Some(v[idx.min(v.len() - 1)])
     }
 
-    fn calculate_percentile_float(&self, values: &[f64], percentile: f64) -> Option<f64> {
+    fn calculate_percentile_u64(&self, values: &[u64], percentile: u32) -> Option<u64> {
         if values.is_empty() { return None; }
         let mut v = values.to_vec();
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let idx = ((v.len() as f64 - 1.0) * percentile).round() as usize;
+        v.sort_unstable();
+        let idx = ((v.len() as u64 - 1) * percentile as u64 / 100) as usize;
         Some(v[idx.min(v.len() - 1)])
     }
 }

@@ -6,7 +6,7 @@ use crate::{
     pos::StakeInfo,
     transaction::{Transaction, TxOut},
     block::{Beacon, BeaconData},
-    cdf::{FinalityVote, Color}, // Import Color and FinalityVote from CDF
+    cdf::{FinalityVote, Color}, 
 };
 use anyhow::{anyhow, Result};
 use bitcoin_hashes::{sha256d, Hash};
@@ -98,53 +98,29 @@ impl Wallet {
 
     pub fn sign_transaction(&self, tx: &mut Transaction, prev_tx_outputs: HashMap<sha256d::Hash, TxOut>) -> Result<()> {
         if tx.is_coinbase() { return Ok(()); }
-
-        // --- FIX: Create a single copy of the transaction to be modified for sighashing. ---
         let mut tx_for_signing = tx.clone();
-
         for i in 0..tx.vin.len() {
-            // Clear all input scripts for the signing copy.
-            for input in &mut tx_for_signing.vin {
-                input.script_sig = vec![];
-            }
-
+            for input in &mut tx_for_signing.vin { input.script_sig = vec![]; }
             let vin = &tx.vin[i];
-            let prev_tx_out = prev_tx_outputs.get(&vin.prev_txid).ok_or_else(|| anyhow!("Previous transaction output not found in UTXO set"))?;
-
-            // Set the script of the input being signed in the copy.
+            let prev_tx_out = prev_tx_outputs.get(&vin.prev_txid).ok_or_else(|| anyhow!("Prev out missing"))?;
             tx_for_signing.vin[i].script_sig = prev_tx_out.script_pub_key.clone();
-            
-            // Hash the modified copy.
             let sighash = sha256d::Hash::hash(&bincode::serialize(&tx_for_signing).unwrap());
-            let digest = sighash.to_byte_array();
-            let msg = Message::from_digest_slice(&digest)?;
-
+            let msg = Message::from_digest_slice(sighash.as_ref())?;
             let sig = self.secp.sign_ecdsa(&msg, &self.secret_key);
-
-            let mut script_sig_vec = sig.serialize_der().to_vec();
-            let pk_vec = self.public_key.serialize().to_vec();
-
-            let mut final_script_sig = vec![script_sig_vec.len() as u8];
-            final_script_sig.append(&mut script_sig_vec);
-
-            final_script_sig.push(pk_vec.len() as u8);
-            final_script_sig.extend(pk_vec);
-
-            // --- FIX: Apply the final signature to the original transaction. ---
+            let mut final_script_sig = vec![sig.serialize_der().len() as u8];
+            final_script_sig.extend(sig.serialize_der());
+            final_script_sig.push(self.public_key.serialize().len() as u8);
+            final_script_sig.extend(self.public_key.serialize());
             tx.vin[i].script_sig = final_script_sig;
-
-            // Reset the script in the copy for the next iteration.
             tx_for_signing.vin[i].script_sig = vec![];
         }
         Ok(())
     }
 
-    /// Sign a consensus beacon.
     pub fn sign_beacon(&self, data: BeaconData) -> Result<Beacon> {
         let msg_hash = sha256d::Hash::hash(&bincode::serialize(&data)?);
         let msg = Message::from_digest_slice(msg_hash.as_ref())?;
         let sig = self.sign(&msg);
-        
         Ok(Beacon {
             public_key: self.public_key.serialize().to_vec(),
             data,
@@ -152,34 +128,17 @@ impl Wallet {
         })
     }
 
-    /// Sign a finality vote for CDF.
     pub fn sign_finality_vote(&self, checkpoint_hash: sha256d::Hash, color: Color) -> Result<FinalityVote> {
-        // Message structure: checkpoint_hash + color
         let mut msg_bytes = checkpoint_hash.to_byte_array().to_vec();
         msg_bytes.push(color as u8);
         let msg_hash = sha256d::Hash::hash(&msg_bytes);
-        
         let msg = Message::from_digest_slice(msg_hash.as_ref())?;
         let sig = self.sign(&msg);
-
         Ok(FinalityVote {
             voter_public_key: self.public_key.serialize().to_vec(),
             checkpoint_hash,
             color,
             signature: sig.serialize_compact().to_vec(),
         })
-    }
-
-    /// Sign a VETO message.
-    pub fn sign_veto(&self, block_hash: sha256d::Hash) -> Result<(Vec<u8>, Vec<u8>)> {
-        // Message structure: "VETO" + block_hash
-        let mut msg_bytes = b"VETO".to_vec();
-        msg_bytes.extend_from_slice(block_hash.as_ref());
-        let msg_hash = sha256d::Hash::hash(&msg_bytes);
-        
-        let msg = Message::from_digest_slice(msg_hash.as_ref())?;
-        let sig = self.sign(&msg);
-
-        Ok((self.public_key.serialize().to_vec(), sig.serialize_compact().to_vec()))
     }
 }

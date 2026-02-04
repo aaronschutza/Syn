@@ -8,7 +8,7 @@ use serde_with::{serde_as, Bytes};
 
 /// Represents the specific type of data carried by a consensus beacon.
 /// Corresponds to the beacon types defined in Whitepaper Section 9.12.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BeaconData {
     /// Time Beacon: Miner's local timestamp. Used for DTC.
     Time(u64),
@@ -17,17 +17,17 @@ pub enum BeaconData {
     /// Delay Beacon: Observed block propagation delay (in ms). Used for Adaptive Slot Gap.
     Delay(u32),
     /// Load Beacon: Observed transaction load (normalized 0.0-1.0). Used for Adaptive Target Slope.
-    Load(f64),
+    Load(u64), // Changed to u64 for Hash compatibility or use a fixed-point bit representation
     /// Security Beacon: Observed threat metrics. Used for Adaptive Burn Rate.
     /// (orphan_count, max_reorg_depth)
     Security(u32, u32), 
     /// Topology Beacon: Observed chain structure. Used for Adaptive Burst Threshold.
-    /// (branching_factor, max_orphan_chain_length)
-    Topology(f64, u32),
+    /// (branching_factor_bits, max_orphan_chain_length)
+    Topology(u64, u32), // Changed branching factor to u64 for Hash compatibility
 }
 
 #[serde_as]
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Beacon {
     /// The public key of the node producing the beacon (Miner or Validator).
     #[serde_as(as = "Bytes")]
