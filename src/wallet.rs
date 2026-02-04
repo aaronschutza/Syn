@@ -1,10 +1,10 @@
-// src/wallet.rs
+// src/wallet.rs - Wallet implementation with SIGHASH_ALL support
 
 use crate::{
     config::NodeConfig,
     crypto::{address_from_pubkey_hash, generate_keypair, hash_pubkey},
     pos::StakeInfo,
-    transaction::{Transaction, TxOut},
+    transaction::{Transaction, TxOut, SigHashType},
     block::{Beacon, BeaconData},
     cdf::{FinalityVote, Color}, 
 };
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 
+/// Serializable structure for persisting wallet state.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct WalletData {
     secret_key: [u8; 32],
@@ -23,6 +24,7 @@ struct WalletData {
     stake_info: Option<StakeInfo>,
 }
 
+/// The main Wallet structure for managing keys and signing messages.
 pub struct Wallet {
     pub secret_key: SecretKey,
     pub public_key: PublicKey,
@@ -47,6 +49,7 @@ impl Clone for Wallet {
 }
 
 impl Wallet {
+    /// Creates a new random wallet.
     pub fn new() -> Self {
         let secp = Secp256k1::new();
         let (sk, pk) = generate_keypair(&secp);
@@ -59,6 +62,7 @@ impl Wallet {
         }
     }
 
+    /// Loads the wallet from the configured file path.
     pub fn load_from_file(node_config: &NodeConfig) -> Result<Self> {
         if !std::path::Path::new(&node_config.wallet_file).exists() {
             info!("No wallet file found at {}. Creating a new one.", &node_config.wallet_file);
@@ -81,6 +85,7 @@ impl Wallet {
         })
     }
 
+    /// Persists the wallet state to disk.
     pub fn save_to_file(&self, node_config: &NodeConfig) -> Result<()> {
         let data = WalletData {
             secret_key: self.secret_key.secret_bytes(),
@@ -92,31 +97,54 @@ impl Wallet {
     }
 
     pub fn get_public_key(&self) -> &PublicKey { &self.public_key }
-    pub fn get_address(&self) -> String { address_from_pubkey_hash(&hash_pubkey(&self.public_key)) }
     
-    pub fn sign(&self, msg: &Message) -> Signature { self.secp.sign_ecdsa(msg, &self.secret_key) }
+    /// Returns the Base58Check encoded address.
+    pub fn get_address(&self) -> String { 
+        address_from_pubkey_hash(&hash_pubkey(&self.public_key)) 
+    }
+    
+    /// Low-level signature utility.
+    pub fn sign(&self, msg: &Message) -> Signature { 
+        self.secp.sign_ecdsa(msg, &self.secret_key) 
+    }
 
+    /// Signs a transaction using SIGHASH_ALL to prevent malleability.
+    /// Commits to all inputs and outputs within the transaction.
     pub fn sign_transaction(&self, tx: &mut Transaction, prev_tx_outputs: HashMap<sha256d::Hash, TxOut>) -> Result<()> {
         if tx.is_coinbase() { return Ok(()); }
-        let mut tx_for_signing = tx.clone();
+
+        // We iterate through each input to sign it individually
         for i in 0..tx.vin.len() {
-            for input in &mut tx_for_signing.vin { input.script_sig = vec![]; }
             let vin = &tx.vin[i];
-            let prev_tx_out = prev_tx_outputs.get(&vin.prev_txid).ok_or_else(|| anyhow!("Prev out missing"))?;
-            tx_for_signing.vin[i].script_sig = prev_tx_out.script_pub_key.clone();
-            let sighash = sha256d::Hash::hash(&bincode::serialize(&tx_for_signing).unwrap());
+            let prev_tx_out = prev_tx_outputs.get(&vin.prev_txid)
+                .ok_or_else(|| anyhow!("Previous output missing for tx {}", vin.prev_txid))?;
+
+            // 1. Calculate the SIGHASH_ALL digest for this specific input
+            let sighash = tx.calculate_sighash(i, &prev_tx_out.script_pub_key, SigHashType::All);
             let msg = Message::from_digest_slice(sighash.as_ref())?;
+
+            // 2. Sign the digest
             let sig = self.secp.sign_ecdsa(&msg, &self.secret_key);
-            let mut final_script_sig = vec![sig.serialize_der().len() as u8];
-            final_script_sig.extend(sig.serialize_der());
-            final_script_sig.push(self.public_key.serialize().len() as u8);
-            final_script_sig.extend(self.public_key.serialize());
+            
+            // 3. Construct the scriptSig (Standard P2PKH: <sig> <pubkey>)
+            // We append the SigHashType byte to the DER signature (Bitcoin standard)
+            let mut der_sig = sig.serialize_der().to_vec();
+            der_sig.push(SigHashType::All as u8);
+
+            let mut final_script_sig = vec![der_sig.len() as u8];
+            final_script_sig.extend(der_sig);
+            
+            let pk_bytes = self.public_key.serialize();
+            final_script_sig.push(pk_bytes.len() as u8);
+            final_script_sig.extend(pk_bytes);
+
+            // 4. Update the actual transaction input with the unlocking script
             tx.vin[i].script_sig = final_script_sig;
-            tx_for_signing.vin[i].script_sig = vec![];
         }
         Ok(())
     }
 
+    /// Signs an on-chain beacon for the Decentralized Consensus Service (DCS).
     pub fn sign_beacon(&self, data: BeaconData) -> Result<Beacon> {
         let msg_hash = sha256d::Hash::hash(&bincode::serialize(&data)?);
         let msg = Message::from_digest_slice(msg_hash.as_ref())?;
@@ -128,6 +156,7 @@ impl Wallet {
         })
     }
 
+    /// Signs a vote for the Chromo-Dynamic Finality (CDF) mechanism.
     pub fn sign_finality_vote(&self, checkpoint_hash: sha256d::Hash, color: Color) -> Result<FinalityVote> {
         let mut msg_bytes = checkpoint_hash.to_byte_array().to_vec();
         msg_bytes.push(color as u8);

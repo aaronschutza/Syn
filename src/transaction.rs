@@ -1,4 +1,4 @@
-// src/transaction.rs
+// src/transaction.rs - Secure transaction structure with SIGHASH_ALL and UTXO creation
 
 use crate::{block::serde_hash, script, blockchain::Blockchain, wallet::Wallet};
 use anyhow::{anyhow, bail, Result};
@@ -7,7 +7,13 @@ use bs58;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Represents a transaction input, which points to a previous transaction's output.
+/// Standard SigHash types to control which parts of the transaction are signed.
+/// Currently focused on ALL to ensure full transaction commitment.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigHashType {
+    All = 0x01,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TxIn {
     #[serde(with = "serde_hash")]
@@ -17,7 +23,6 @@ pub struct TxIn {
     pub sequence: u32,
 }
 
-/// Represents a transaction output, which specifies an amount and a locking script.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TxOut {
     pub value: u64,
@@ -25,7 +30,6 @@ pub struct TxOut {
 }
 
 impl TxOut {
-    /// Creates a new transaction output with a standard P2PKH script.
     pub fn new(value: u64, address: String) -> Self {
         if address.is_empty() { return TxOut { value, script_pub_key: vec![] }; }
         let pubkey_hash_with_version = match bs58::decode(&address).into_vec() {
@@ -45,13 +49,11 @@ impl TxOut {
         TxOut { value, script_pub_key }
     }
 
-    /// Checks if this output is a burn output (OP_RETURN).
     pub fn is_burn(&self) -> bool {
         !self.script_pub_key.is_empty() && self.script_pub_key[0] == 0x6a
     }
 }
 
-/// Represents a transaction, which is a collection of inputs and outputs.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     pub version: i32,
@@ -61,17 +63,14 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    /// Calculates the transaction ID by hashing the transaction data.
     pub fn id(&self) -> sha256d::Hash {
         sha256d::Hash::hash(&bincode::serialize(self).unwrap())
     }
 
-    /// Checks if the transaction is a coinbase transaction.
     pub fn is_coinbase(&self) -> bool {
         self.vin.len() == 1 && self.vin[0].prev_txid == sha256d::Hash::all_zeros()
     }
 
-    /// Creates a new coinbase transaction.
     pub fn new_coinbase(coinbase_data: String, address: String, reward: u64, version: i32) -> Self {
         Transaction {
             version,
@@ -87,6 +86,7 @@ impl Transaction {
     }
 
     /// Creates a new transaction that spends UTXOs.
+    /// This function handles UTXO selection, fee calculation, and signing.
     pub fn new_utxo_transaction(
         from_wallet: &Wallet,
         to_address: String,
@@ -100,7 +100,7 @@ impl Transaction {
         let mut prev_tx_outputs = HashMap::new();
 
         for (txid, out_idx) in unspent_outputs {
-            let prev_tx = bc.get_transaction(&txid)?.ok_or_else(|| anyhow!("Previous tx not found"))?;
+            let prev_tx = bc.get_transaction(&txid)?.ok_or_else(|| anyhow!("Previous tx {} not found", txid))?;
             prev_tx_outputs.insert(txid, prev_tx.vout[out_idx as usize].clone());
 
             let input = TxIn {
@@ -124,43 +124,51 @@ impl Transaction {
             lock_time: 0,
         };
 
+        // Sign the transaction using SIGHASH_ALL to prevent malleability
         from_wallet.sign_transaction(&mut tx, prev_tx_outputs.clone())?;
 
         Ok((tx, prev_tx_outputs))
     }
 
-    // This function is no longer responsible for cloning and can be simplified or removed
-    // if sign_transaction handles all hashing logic. For clarity, we'll have it just hash.
-    pub fn sighash(tx_to_sign: &Transaction) -> sha256d::Hash {
-        sha256d::Hash::hash(&bincode::serialize(tx_to_sign).unwrap())
+    /// Generates the digest for a specific input's signature using SIGHASH_ALL.
+    pub fn calculate_sighash(&self, input_index: usize, prev_pubkey_script: &[u8], sighash_type: SigHashType) -> sha256d::Hash {
+        let mut tx_copy = self.clone();
+
+        // 1. Clear all scriptSigs
+        for input in &mut tx_copy.vin {
+            input.script_sig = vec![];
+        }
+
+        // 2. Set the scriptSig of the input being signed to the previous output's scriptPubKey
+        if input_index < tx_copy.vin.len() {
+            tx_copy.vin[input_index].script_sig = prev_pubkey_script.to_vec();
+        }
+
+        // 3. Serialize and append the SigHashType
+        let mut data = bincode::serialize(&tx_copy).unwrap();
+        data.extend_from_slice(&(sighash_type as u32).to_le_bytes());
+
+        sha256d::Hash::hash(&data)
     }
 
-    /// Verifies the transaction's signatures and scripts.
     pub fn verify(&self, prev_txs: &HashMap<sha256d::Hash, Transaction>) -> Result<()> {
         if self.is_coinbase() { return Ok(()); }
     
-        let mut tx_for_verifying = self.clone();
-        for input in &mut tx_for_verifying.vin {
-            input.script_sig = vec![];
-        }
-    
         for (i, vin) in self.vin.iter().enumerate() {
-            let prev_tx = prev_txs.get(&vin.prev_txid).ok_or_else(|| anyhow!("Previous tx not found"))?;
+            let prev_tx = prev_txs.get(&vin.prev_txid).ok_or_else(|| anyhow!("Prev tx {} not found", vin.prev_txid))?;
             let prev_tx_out = &prev_tx.vout[vin.prev_vout as usize];
             
-            let mut temp_tx = tx_for_verifying.clone();
-            temp_tx.vin[i].script_sig = prev_tx_out.script_pub_key.clone();
+            // Reconstruct the message that was signed using SIGHASH_ALL
+            let sighash = self.calculate_sighash(i, &prev_tx_out.script_pub_key, SigHashType::All);
+            let digest = sighash.to_byte_array();
     
-            let sighash = Self::sighash(&temp_tx).to_byte_array();
-    
-            if !script::evaluate(&vin.script_sig, &prev_tx_out.script_pub_key, &sighash) {
-                bail!(format!("Script verification failed for input {}", i));
+            if !script::evaluate(&vin.script_sig, &prev_tx_out.script_pub_key, &digest) {
+                bail!("Signature verification failed for input {}", i);
             }
         }
         Ok(())
     }
 
-    /// Creates a burn output, which is an unspendable output used for burning tokens.
     pub fn create_burn_output(amount: u64) -> TxOut {
         TxOut {
             value: amount,
