@@ -16,6 +16,8 @@ pub enum ConsensusError {
 
 use crate::block::Block;
 
+// Resolve E0382 by implementing Clone
+#[derive(Clone)]
 pub struct ConsensusEngine {
     _param_manager: Arc<ParamManager>,
     pub staking_module: Arc<StakingModule>,
@@ -36,9 +38,6 @@ impl ConsensusEngine {
     }
 
     pub fn process_block(&self, block: &Block) -> Result<(), ConsensusError> {
-        for tx in &block.transactions {
-            let _ = tx; 
-        }
         self.governance_module.end_block_logic(block.height);
         self.staking_module.end_block_logic(block.height);
         let is_pow = block.header.vrf_proof.is_none();
@@ -82,7 +81,6 @@ impl ConsensusEngine {
         let psi = Fixed::from_integer(5); 
         let gamma = Fixed::from_integer(45);
         
-        // Use Fixed-Point conversion from the difficulty manager state
         let f_a = Fixed::from_f64(diff_state.f_a_pos.to_num::<f64>());
         let delta = Fixed::from_integer(delta_seconds as u64);
 
@@ -99,11 +97,9 @@ impl ConsensusEngine {
         let vrf_val = BigUint::from_bytes_be(vrf_output);
         let max_vrf = BigUint::from(1u32) << 256;
         
-        // Final Fix for E0282: Use explicit BigUint variables and intermediate binding
         let numerator: BigUint = vrf_val << 64;
         let division_result: BigUint = numerator / max_vrf;
         
-        // Convert the BigUint result directly to u128 for the Fixed struct
         let normalized_bits: u128 = division_result.try_into().unwrap_or(u128::MAX);
         let normalized_vrf = Fixed(normalized_bits);
 
