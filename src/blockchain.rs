@@ -1,4 +1,4 @@
-// src/blockchain.rs - State Commitment with Progonos Bridge & CDF Irreversibility
+// src/blockchain.rs - State Commitment with Progonos Bridge Maturity Enforcement
 
 use crate::{
     block::{Block, BlockHeader, Beacon},
@@ -267,23 +267,36 @@ impl Blockchain {
         Ok(())
     }
 
+    /// Validates a Progonos sBTC Mint transaction by checking the SPV proof and preventing double-minting.
     fn validate_progonos_mint(&self, tx: &Transaction, btc_tx_batch: &mut Batch) -> Result<()> {
         let binding = tx.vin.get(0).map(|v| v.script_sig.clone()).unwrap_or_default();
         let proof_json = String::from_utf8_lossy(&binding);
         let request: DepositProofRequest = serde_json::from_str(&proof_json)
             .map_err(|_| anyhow!("Invalid Progonos Proof Metadata"))?;
 
+        // 1. Nullifier Check
         if self.btc_txid_tree.contains_key(request.expected_txid.as_bytes())? {
             bail!("Double-Mint Attempt: Bitcoin TXID {} already used.", request.expected_txid);
         }
 
+        // 2. SPV Logic Verification (Inclusion Proof)
         let btc_header = spv::verify_deposit_proof(request.clone(), &self.spv_state)
             .map_err(|e| anyhow!("SPV Verification Failed: {}", e))?;
 
-        let _btc_tip_hash = self.spv_state.get_tip_hash().map_err(|e| anyhow!("BTC SPV Storage error: {:?}", e))?;
-        self.spv_state.get_header_by_hash(&btc_header.block_hash())
+        // 3. Confirmations Check (Depth Verification)
+        let btc_block_hash = btc_header.block_hash();
+        let stored_header = self.spv_state.get_stored_header(&btc_block_hash)
             .map_err(|_| anyhow!("Bitcoin block not found in synchronized chain"))?;
+        
+        let btc_tip_hash = self.spv_state.get_tip_hash().map_err(|e| anyhow!("BTC SPV Storage error: {:?}", e))?;
+        let btc_tip_header = self.spv_state.get_stored_header(&btc_tip_hash)?;
 
+        let depth = btc_tip_header.height.saturating_sub(stored_header.height) + 1;
+        if depth < self.progonos_config.btc_confirmations {
+            bail!("Progonos Bridge: Insufficient confirmations. Have {}, Require {}", depth, self.progonos_config.btc_confirmations);
+        }
+
+        // 4. Record nullifier
         btc_tx_batch.insert(request.expected_txid.as_bytes(), &[]);
         
         log::info!("Progonos Bridge: Validated Mint for BTC TXID {}", request.expected_txid);
@@ -461,11 +474,9 @@ impl Blockchain {
             }
         }
 
-        // Handle Genesis Replacement/Parallel Forks starting from null parent
         let is_parallel_genesis = block.header.prev_blockhash == sha256d::Hash::all_zeros();
         
         if is_parallel_genesis {
-            // For blocks with no parent in DB, we must still check finality violation
             if let Some(_finalized) = self.last_finalized_checkpoint {
                 log::warn!("🚨 ATTEMPTED REORG REVERTING FINALITY (Genesis): Rejected chain tip {}.", hash);
                 bail!("Irreversibility Violation: Fork reverts a CDF-finalized block.");

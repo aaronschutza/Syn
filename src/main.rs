@@ -1,4 +1,4 @@
-// src/main.rs
+// src/main.rs - Integrated CLI and Node Entry point
 
 pub mod block;
 pub mod blockchain;
@@ -53,24 +53,23 @@ const CHANNEL_CAPACITY: usize = 100;
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
+    
+    // Load config globally based on CLI flag
+    let loaded_config = config::load(&cli.config)?;
 
     match cli.command {
         Commands::CreateWallet => {
-            let config_path = "synergeia.toml";
-            let config = config::load(config_path)?;
             let wallet = wallet::Wallet::new();
-            wallet.save_to_file(&config.node)?;
-            println!("New wallet created and saved to {}", config.node.wallet_file);
+            wallet.save_to_file(&loaded_config.node)?;
+            println!("New wallet created and saved to {}", loaded_config.node.wallet_file);
             println!("Address: {}", wallet.get_address());
         }
-        Commands::StartNode { mode, config, data_dir, mine_to_address } => {
-            let loaded_config = config::load(&config)?;
-            
+        Commands::StartNode { mode, mine_to_address } => {
             // --- Engine Dependencies Initialization ---
             let param_manager = Arc::new(ParamManager::new());
-            let bank_module = Arc::new(BankModule {}); // Placeholder
+            let bank_module = Arc::new(BankModule {}); 
             let staking_module = Arc::new(StakingModule::new(bank_module));
-            let db_for_gov = Arc::new(sled::open(&data_dir)?);
+            let db_for_gov = Arc::new(sled::open(&cli.data_dir)?);
             let governance_store = GovernanceStore::new(db_for_gov.clone());
             let governance_module = Arc::new(GovernanceModule::new(param_manager.clone(), staking_module.clone(), governance_store));
             let difficulty_manager = Arc::new(DynamicDifficultyManager::new(param_manager.clone()));
@@ -87,33 +86,33 @@ async fn main() -> Result<()> {
             let fee_params = Arc::new(loaded_config.fees.clone());
             let governance_params = Arc::new(loaded_config.governance.clone());
             let db_config = Arc::new(loaded_config.database.clone());
+            
             let mut node_conf = loaded_config.node.clone();
-            node_conf.db_path = data_dir;
+            node_conf.db_path = cli.data_dir.clone();
             let node_config = Arc::new(node_conf);
 
             let p2p_config = Arc::new(loaded_config.p2p.clone());
             let progonos_config = Arc::new(loaded_config.progonos.clone());
             let consensus_params = Arc::new(loaded_config.consensus.clone());
 
-            // --- SPV State Initialization (Required for Blockchain) ---
+            // --- SPV State Initialization ---
             let header_store = HeaderStore::new(db_for_gov.clone());
             let spv_state = Arc::new(SpvClientState::new(header_store));
             let spv_client = Arc::new(Mutex::new(progonos::SpvClient::new(&progonos_config)));
 
-            // --- Blockchain Initialization (Fixed E0061: Added missing arguments) ---
+            // --- Blockchain Initialization ---
             let bc = Arc::new(Mutex::new(blockchain::Blockchain::new_with_db(
                 db_for_gov.clone(),
                 consensus_params.clone(),
                 fee_params,
                 governance_params.clone(),
-                progonos_config.clone(), // New argument 5
-                spv_state.clone(),       // New argument 6
+                progonos_config.clone(),
+                spv_state.clone(),
                 db_config,
                 consensus_engine, 
             )?));
 
             let peer_manager = Arc::new(Mutex::new(peer_manager::PeerManager::new(p2p_config.clone())));
-
             let (p2p_tx, _p2p_rx) = mpsc::channel::<P2PMessage>(CHANNEL_CAPACITY);
             let (broadcast_tx, _) = broadcast::channel::<P2PMessage>(CHANNEL_CAPACITY);
             let (_btc_p2p_tx, btc_p2p_rx) = mpsc::channel::<BtcP2PMessage>(CHANNEL_CAPACITY);
@@ -172,8 +171,7 @@ async fn main() -> Result<()> {
             }
         }
         _ => {
-            let config = config::load("synergeia.toml")?;
-            rpc::client::handle_cli_command(cli.command, &config).await?;
+            rpc::client::handle_cli_command(cli.command, &loaded_config).await?;
         }
     }
 

@@ -1,10 +1,18 @@
-// src/cli.rs
+// src/cli.rs - Global configuration and command definition
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(author = "Proof-of-Consensus LLC", version = "0.1.0 (Kratos)", about = "Synergeia Node (Hybrid PoW/PoS)", long_about = None)]
 pub struct Cli {
+    /// Path to the configuration file.
+    #[arg(long, global = true, default_value = "synergeia.toml")]
+    pub config: String,
+
+    /// Path to the database directory.
+    #[arg(long, global = true, default_value = "./data_kratos")]
+    pub data_dir: String,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -17,14 +25,6 @@ pub enum Commands {
         #[arg(long, default_value = "full")]
         mode: String,
         
-        /// Path to the configuration file.
-        #[arg(long, default_value = "synergeia.toml")]
-        config: String,
-
-        /// Path to the database directory.
-        #[arg(long, default_value = "./data_kratos")]
-        data_dir: String,
-
         /// Optional address to mine PoW rewards to.
         #[arg(long)]
         mine_to_address: Option<String>,
@@ -71,4 +71,3 @@ pub enum Commands {
         amount: u64,
     },
 }
-

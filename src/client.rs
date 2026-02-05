@@ -2,10 +2,10 @@
 
 use crate::storage::{StorageError, HeaderStore};
 use bitcoin::hash_types::BlockHash;
-use bitcoin::{block::Header as BitcoinHeader, Work}; // Removed unused Target
+use bitcoin::{block::Header as BitcoinHeader, Work};
 use primitive_types::U256;
 use std::sync::Arc;
-use log::{info, warn}; // Removed unused debug
+use log::{info, warn};
 use std::collections::{HashMap, VecDeque};
 use parking_lot::RwLock;
 use std::str::FromStr;
@@ -54,6 +54,12 @@ impl SpvClientState {
     
     pub fn get_tip_hash(&self) -> Result<BlockHash, StorageError> {
         self.store.get_tip().map(|(hash, _)| hash)
+    }
+
+    /// Returns the full metadata for a block, including its height.
+    /// Required by the Blockchain consensus logic for Progonos maturity checks.
+    pub fn get_stored_header(&self, hash: &BlockHash) -> Result<StoredHeader, StorageError> {
+        self.store.get_header(hash)
     }
 
     pub fn get_header_by_hash(&self, hash: &BlockHash) -> Result<BitcoinHeader, StorageError> {
@@ -108,8 +114,13 @@ impl SpvClientState {
         self.store.insert_header(hash, &stored_header)?;
 
         // Tip Update Logic (Longest Chain Rule)
-        let (_, current_tip) = self.store.get_tip()?;
-        if total_work > current_tip.total_work {
+        let tip_res = self.store.get_tip();
+        let update_tip = match tip_res {
+            Ok((_, current_tip)) => total_work > current_tip.total_work,
+            Err(_) => true, // First header after genesis
+        };
+
+        if update_tip {
             info!("Bitcoin tip updated to height {}: {}", new_height, hash);
             self.store.set_tip(hash)?;
         }
