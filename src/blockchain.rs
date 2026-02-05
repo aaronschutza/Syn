@@ -1,4 +1,4 @@
-// src/blockchain.rs - Performance-optimized Storage Layer with UTXO Caching
+// src/blockchain.rs - State Commitment with Corrected Error Handling
 
 use crate::{
     block::{Block, BlockHeader, Beacon},
@@ -17,6 +17,7 @@ use bitcoin_hashes::{sha256d, Hash};
 use chrono::Utc;
 use log::info;
 use num_traits::{ToPrimitive, Zero};
+use num_bigint::BigUint;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use secp256k1::PublicKey;
@@ -26,10 +27,15 @@ use serde::{Serialize, Deserialize};
 const VETO_THRESHOLD_PERCENT: u64 = 51;
 const MAX_BEACONS_PER_BLOCK: usize = 16;
 const P_FALLBACK: f64 = 0.001; 
-const MAX_UTXO_CACHE_SIZE: usize = 50000;
+const MAX_UTXO_CACHE_SIZE: usize = 100000;
 const BEACON_BOUNTY_POOL_PERCENT: u64 = 1;
 
-/// Persistent structure for a UTXO entry including metadata.
+const PQC_ENFORCEMENT_HEIGHT: u32 = 100_000;
+
+lazy_static::lazy_static! {
+    static ref MUHASH_PRIME: BigUint = BigUint::parse_bytes(b"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFFFF0000000000000000FFFFFFFF", 16).unwrap();
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UtxoEntry {
     pub output: TxOut,
@@ -105,7 +111,6 @@ pub struct Blockchain {
     pub db_config: Arc<DatabaseConfig>,
     pub headers: Vec<BlockHeader>,
     
-    /// In-memory cache for the most active UTXOs to minimize disk I/O.
     pub utxo_cache: HashMap<(sha256d::Hash, u32), UtxoEntry>,
     
     pub pos_block_count: u32,
@@ -142,171 +147,125 @@ impl Blockchain {
         ldd_state.current_burn_rate = fee_params.min_burn_rate;
 
         let mut bc = Blockchain {
-            db,
-            blocks_tree,
-            utxo_tree,
-            addr_utxo_tree,
-            tx_index_tree,
-            meta_tree,
+            db, blocks_tree, utxo_tree, addr_utxo_tree, tx_index_tree, meta_tree,
             tip: sha256d::Hash::all_zeros(),
-            total_work: 0,
-            mempool: HashMap::new(),
-            beacon_mempool: Vec::new(),
-            ldd_state,
-            consensus_params,
-            fee_params: fee_params.clone(),
-            governance_params,
-            total_staked: 0,
-            governance: Governance::new(),
-            db_config,
-            headers: Vec::new(),
+            total_work: 0, mempool: HashMap::new(), beacon_mempool: Vec::new(),
+            ldd_state, consensus_params, fee_params: fee_params.clone(),
+            governance_params, total_staked: 0, governance: Governance::new(),
+            db_config, headers: Vec::new(),
             utxo_cache: HashMap::with_capacity(MAX_UTXO_CACHE_SIZE),
-            pos_block_count: 0,
-            bootstrap_phase_complete: false,
+            pos_block_count: 0, bootstrap_phase_complete: false,
             last_pow_block_hash: sha256d::Hash::all_zeros(),
-            consensus_engine,
-            dcs: DecentralizedConsensusService::new(),
+            consensus_engine, dcs: DecentralizedConsensusService::new(),
             burst_manager: BurstFinalityManager::new(fee_params.k_burst, fee_params.fee_burst_threshold), 
-            finality_gadget: FinalityGadget::new(),
-            metrics: LocalMetrics::default(),
+            finality_gadget: FinalityGadget::new(), metrics: LocalMetrics::default(),
             veto_manager: VetoManager::default(),
         };
 
         if bc.blocks_tree.is_empty() {
             let mut genesis = Block::create_genesis_block(
-                bc.consensus_params.coinbase_reward,
-                bc.consensus_params.genesis_timestamp,
-                bc.consensus_params.genesis_bits,
-                bc.consensus_params.genesis_coinbase_data.clone(),
-                bc.consensus_params.genesis_address.clone(),
-                bc.consensus_params.block_version,
+                bc.consensus_params.coinbase_reward, bc.consensus_params.genesis_timestamp,
+                bc.consensus_params.genesis_bits, bc.consensus_params.genesis_coinbase_data.clone(),
+                bc.consensus_params.genesis_address.clone(), bc.consensus_params.block_version,
                 bc.consensus_params.transaction_version,
             );
             bc.calculate_synergistic_work(&mut genesis);
             genesis.total_work = genesis.synergistic_work;
             let genesis_hash = genesis.header.hash();
-            
             bc.blocks_tree.insert(genesis_hash.as_ref() as &[u8], bincode::serialize(&genesis)?)?;
             bc.blocks_tree.insert(bc.db_config.tip_key.as_str(), genesis_hash.as_ref() as &[u8])?;
-            bc.tip = genesis_hash;
-            bc.total_work = genesis.total_work;
+            bc.tip = genesis_hash; bc.total_work = genesis.total_work;
             bc.headers.push(genesis.header.clone());
+            bc.meta_tree.insert("utxo_muhash_root", BigUint::from(1u32).to_bytes_be().as_slice())?;
             bc.update_utxo_set(&genesis)?;
         } else {
             let tip_bytes = bc.blocks_tree.get(&bc.db_config.tip_key)?.ok_or_else(|| anyhow!("Tip missing"))?;
             bc.tip = sha256d::Hash::from_slice(&tip_bytes)?;
-            
             if let Some(work_bytes) = bc.blocks_tree.get(&bc.db_config.total_work_key)? {
-                let mut arr = [0u8; 8];
-                arr.copy_from_slice(&work_bytes);
-                bc.total_work = u64::from_be_bytes(arr);
+                let mut arr = [0u8; 8]; arr.copy_from_slice(&work_bytes); bc.total_work = u64::from_be_bytes(arr);
             }
         }
         Ok(bc)
     }
 
-    /// Fetches a UTXO entry, checking the in-memory cache before hitting the disk.
-    pub fn get_utxo(&mut self, txid: &sha256d::Hash, vout: u32) -> Result<Option<UtxoEntry>> {
-        if let Some(entry) = self.utxo_cache.get(&(*txid, vout)) {
-            return Ok(Some(entry.clone()));
-        }
-
-        let mut utxo_key = Vec::with_capacity(36);
-        utxo_key.extend_from_slice(txid.as_ref());
-        utxo_key.extend_from_slice(&vout.to_be_bytes());
-
-        if let Some(val) = self.utxo_tree.get(&utxo_key)? {
-            let entry: UtxoEntry = bincode::deserialize(&val)?;
-            // Populate cache (evicting if necessary)
-            if self.utxo_cache.len() >= MAX_UTXO_CACHE_SIZE {
-                self.utxo_cache.clear(); // Simple eviction strategy for now
-            }
-            self.utxo_cache.insert((*txid, vout), entry.clone());
-            return Ok(Some(entry));
-        }
-        Ok(None)
-    }
-
-    pub fn calculate_utxo_root(&self) -> Result<sha256d::Hash> {
-        if let Some(root_bytes) = self.meta_tree.get("utxo_rolling_root")? {
-            return Ok(sha256d::Hash::from_slice(&root_bytes)?);
-        }
-        Ok(sha256d::Hash::all_zeros())
-    }
-
-    /// Optimizes block addition with atomic batch commits and state root calculation.
     pub fn update_utxo_set(&mut self, block: &Block) -> Result<()> {
         let mut utxo_batch = Batch::default();
         let mut addr_batch = Batch::default();
         let mut index_batch = Batch::default();
-        let mut rolling_root = self.calculate_utxo_root()?;
+        let mut rolling_muhash = self.get_muhash_root()?;
+        let pqc_enforced = block.height >= PQC_ENFORCEMENT_HEIGHT;
 
         for tx in &block.transactions {
+            let mut prev_txs = HashMap::new();
+            if !tx.is_coinbase() {
+                for vin in &tx.vin {
+                    let prev_tx = self.get_transaction(&vin.prev_txid)?.ok_or_else(|| anyhow!("Input tx missing"))?;
+                    prev_txs.insert(vin.prev_txid, prev_tx);
+                }
+                tx.verify_hybrid(&prev_txs, pqc_enforced)?;
+            }
+
             let txid = tx.id();
-            
-            // 1. Remove spent UTXOs
             if !tx.is_coinbase() {
                 for vin in &tx.vin {
                     let mut utxo_key = Vec::with_capacity(36);
                     utxo_key.extend_from_slice(vin.prev_txid.as_ref());
                     utxo_key.extend_from_slice(&vin.prev_vout.to_be_bytes());
-
                     if let Some(val) = self.utxo_tree.get(&utxo_key)? {
-                        let entry: UtxoEntry = bincode::deserialize(&val)?;
-                        rolling_root = xor_hashes(rolling_root, sha256d::Hash::hash(&val));
-                        
-                        // Clear from cache and database
+                        let entry_hash = BigUint::from_bytes_be(sha256d::Hash::hash(&val).as_ref());
+                        rolling_muhash = self.muhash_div(rolling_muhash, entry_hash);
                         self.utxo_cache.remove(&(vin.prev_txid, vin.prev_vout));
                         utxo_batch.remove(utxo_key.as_slice());
-
-                        // Clear from address index
+                        let entry: UtxoEntry = bincode::deserialize(&val)?;
                         if !entry.output.script_pub_key.is_empty() {
                             let mut addr_key = entry.output.script_pub_key;
                             addr_key.extend_from_slice(&utxo_key);
                             addr_batch.remove(addr_key);
                         }
-                    } else {
-                        bail!("Referenced non-existent UTXO in tx {}.", txid);
-                    }
+                    } else { bail!("UTXO missing in tx {}.", txid); }
                 }
             }
 
-            // 2. Add new UTXOs
             for (i, vout) in tx.vout.iter().enumerate() {
-                let entry = UtxoEntry {
-                    output: vout.clone(),
-                    height: block.height,
-                    is_coinbase: tx.is_coinbase(),
-                };
-                
+                let entry = UtxoEntry { output: vout.clone(), height: block.height, is_coinbase: tx.is_coinbase() };
                 let mut utxo_key = Vec::with_capacity(36);
                 utxo_key.extend_from_slice(txid.as_ref());
                 utxo_key.extend_from_slice(&(i as u32).to_be_bytes());
-
                 let serialized = bincode::serialize(&entry)?;
-                rolling_root = xor_hashes(rolling_root, sha256d::Hash::hash(&serialized));
-
+                let entry_hash = BigUint::from_bytes_be(sha256d::Hash::hash(&serialized).as_ref());
+                rolling_muhash = self.muhash_mul(rolling_muhash, entry_hash);
                 utxo_batch.insert(utxo_key.clone(), serialized);
-                self.utxo_cache.insert((txid, i as u32), entry);
-
+                if self.utxo_cache.len() < MAX_UTXO_CACHE_SIZE { self.utxo_cache.insert((txid, i as u32), entry); }
                 if !vout.script_pub_key.is_empty() {
-                    let mut addr_key = vout.script_pub_key.clone();
-                    addr_key.extend_from_slice(&utxo_key);
-                    addr_batch.insert(addr_key, &[]);
+                    let mut addr_key = vout.script_pub_key.clone(); addr_key.extend_from_slice(&utxo_key); addr_batch.insert(addr_key, &[]);
                 }
             }
-
-            // Index transaction for lookup
             index_batch.insert(txid.as_ref() as &[u8], block.header.hash().as_ref() as &[u8]);
         }
-
-        // Atomic commit of the entire block state change
-        self.utxo_tree.apply_batch(utxo_batch)?;
-        self.addr_utxo_tree.apply_batch(addr_batch)?;
-        self.tx_index_tree.apply_batch(index_batch)?;
-        self.meta_tree.insert("utxo_rolling_root", rolling_root.as_ref() as &[u8])?;
-
+        self.utxo_tree.apply_batch(utxo_batch)?; self.addr_utxo_tree.apply_batch(addr_batch)?; self.tx_index_tree.apply_batch(index_batch)?;
+        self.meta_tree.insert("utxo_muhash_root", rolling_muhash.to_bytes_be().as_slice())?;
         Ok(())
+    }
+
+    fn get_muhash_root(&self) -> Result<BigUint> {
+        match self.meta_tree.get("utxo_muhash_root")? {
+            Some(bytes) => Ok(BigUint::from_bytes_be(&bytes)),
+            None => Ok(BigUint::from(1u32)),
+        }
+    }
+
+    fn muhash_mul(&self, a: BigUint, b: BigUint) -> BigUint { (a * b) % &*MUHASH_PRIME }
+    fn muhash_div(&self, a: BigUint, b: BigUint) -> BigUint {
+        let inv = b.modpow(&(&*MUHASH_PRIME - BigUint::from(2u32)), &*MUHASH_PRIME);
+        (a * inv) % &*MUHASH_PRIME
+    }
+
+    pub fn calculate_utxo_root(&self) -> Result<sha256d::Hash> {
+        let root = self.get_muhash_root()?;
+        let mut bytes = root.to_bytes_be();
+        if bytes.len() > 32 { bytes = bytes[bytes.len()-32..].to_vec(); }
+        else if bytes.len() < 32 { let mut tmp = vec![0u8; 32-bytes.len()]; tmp.extend(bytes); bytes = tmp; }
+        Ok(sha256d::Hash::from_slice(&bytes)?)
     }
 
     pub fn find_spendable_outputs(&self, address: &str, amount_needed: u64) -> Result<(u64, HashMap<sha256d::Hash, u32>)> {
@@ -314,8 +273,6 @@ impl Blockchain {
         let mut accumulated_value = 0;
         let script_pub_key = TxOut::new(0, address.to_string()).script_pub_key;
         if script_pub_key.is_empty() { return Ok((0, HashMap::new())); }
-
-        // Efficient prefix scan using the address index
         for item in self.addr_utxo_tree.scan_prefix(&script_pub_key) {
             let (addr_key, _) = item?;
             let utxo_key = &addr_key[script_pub_key.len()..];
@@ -323,10 +280,7 @@ impl Blockchain {
                 let entry: UtxoEntry = bincode::deserialize(&val)?;
                 let txid = sha256d::Hash::from_slice(&utxo_key[0..32])?;
                 let vout = u32::from_be_bytes(utxo_key[32..36].try_into()?);
-                
-                accumulated_value += entry.output.value;
-                unspent_outputs.insert(txid, vout);
-                
+                accumulated_value += entry.output.value; unspent_outputs.insert(txid, vout);
                 if amount_needed > 0 && accumulated_value >= amount_needed { break; }
             }
         }
@@ -349,26 +303,17 @@ impl Blockchain {
     }
 
     pub fn calculate_total_fees(&self, block: &Block) -> u64 {
-        block.transactions.iter()
-            .filter(|tx| !tx.is_coinbase())
-            .map(|tx| {
-                let mut total_in = 0;
-                for vin in &tx.vin {
-                    // Optimized fee calculation using the index
-                    if let Ok(Some(prev_tx)) = self.get_transaction(&vin.prev_txid) {
-                        total_in += prev_tx.vout[vin.prev_vout as usize].value;
-                    }
-                }
-                let total_out: u64 = tx.vout.iter().map(|v| v.value).sum();
-                total_in.saturating_sub(total_out)
-            })
-            .sum()
+        block.transactions.iter().filter(|tx| !tx.is_coinbase()).map(|tx| {
+            let mut total_in = 0;
+            for vin in &tx.vin { if let Ok(Some(prev_tx)) = self.get_transaction(&vin.prev_txid) { total_in += prev_tx.vout[vin.prev_vout as usize].value; } }
+            let total_out: u64 = tx.vout.iter().map(|v| v.value).sum();
+            total_in.saturating_sub(total_out)
+        }).sum()
     }
 
     pub fn calculate_synergistic_work(&self, block: &mut Block) {
         let vrf_opt = &block.header.vrf_proof;
-        let is_pow = vrf_opt.is_none();
-        if is_pow {
+        if vrf_opt.is_none() {
             let easiest = BlockHeader::calculate_target(0x207fffff);
             let target = BlockHeader::calculate_target(block.header.bits);
             block.synergistic_work = if target.is_zero() { 1 } else { (&easiest / &target).to_u64().unwrap_or(1) };
@@ -386,10 +331,7 @@ impl Blockchain {
 
     pub fn get_and_reset_metrics(&mut self) -> LocalMetrics {
         let m = self.metrics.clone();
-        self.metrics.orphan_count = 0;
-        self.metrics.max_reorg_depth = 0;
-        self.metrics.beacon_providers.clear();
-        self.metrics.height_counts.clear();
+        self.metrics.orphan_count = 0; self.metrics.max_reorg_depth = 0; self.metrics.beacon_providers.clear(); self.metrics.height_counts.clear();
         m
     }
 
@@ -407,28 +349,21 @@ impl Blockchain {
         }
     }
 
-    pub fn get_next_work_required(&self, _pow: bool, _delta: u32) -> u32 {
-        0x207fffff 
-    }
+    pub fn get_next_work_required(&self, _pow: bool, _delta: u32) -> u32 { 0x207fffff }
 
     pub fn create_block_template(&mut self, mut transactions: Vec<Transaction>, version: i32) -> Result<Block> {
         let prev = self.get_block(&self.tip).ok_or(anyhow!("Tip missing"))?;
         let now = Utc::now().timestamp() as u32;
         let delta = now.saturating_sub(prev.header.time);
         let bits = self.get_next_work_required(true, delta);
-        
-        // Designated bounties: 1% of block reward
         let total_reward = self.consensus_params.coinbase_reward;
         let bounty_pool = (total_reward * BEACON_BOUNTY_POOL_PERCENT) / 100;
         let beacons = self.beacon_mempool.clone();
         let beacons_to_include = if beacons.len() > MAX_BEACONS_PER_BLOCK { &beacons[0..MAX_BEACONS_PER_BLOCK] } else { &beacons };
-        
         if !beacons_to_include.is_empty() {
             let per_beacon = bounty_pool / beacons_to_include.len() as u64;
             if per_beacon > 0 {
-                // Modify the first transaction (Coinbase)
                 if let Some(coinbase) = transactions.get_mut(0) {
-                    // Reduce miner's share and add provider outputs
                     if coinbase.vout[0].value >= bounty_pool {
                         coinbase.vout[0].value -= bounty_pool;
                         for beacon in beacons_to_include {
@@ -441,7 +376,6 @@ impl Blockchain {
                 }
             }
         }
-
         let mut block = Block::new(now, transactions, self.tip, bits, prev.height + 1, version);
         block.beacons = beacons_to_include.to_vec();
         block.header.utxo_root = self.calculate_utxo_root()?;
@@ -451,13 +385,8 @@ impl Blockchain {
     pub fn add_block(&mut self, mut block: Block) -> Result<()> {
         let hash = block.header.hash();
         if self.veto_manager.blacklisted_blocks.contains(&hash) { bail!("Vetoed block."); }
-        
         self.verify_dcs_metadata(&block)?;
-
-        if !block.beacons.is_empty() {
-            self.validate_beacon_bounties(&block)?;
-        }
-
+        if !block.beacons.is_empty() { self.validate_beacon_bounties(&block)?; }
         let is_pow = block.header.vrf_proof.is_none();
         let fees = self.calculate_total_fees(&block);
         if !is_pow {
@@ -465,37 +394,23 @@ impl Blockchain {
             let burned = block.transactions.get(0).map_or(0, |tx| {
                 tx.vout.iter().filter(|o| o.script_pub_key == vec![0x6a]).map(|o| o.value).sum::<u64>()
             });
-            if burned < required { bail!("Insufficient Proof-of-Burn commitment for PoS block."); }
+            // FIX: Restore error string exactly for test parity
+            if burned < required { bail!("Insufficient Proof-of-Burn commitment."); }
         }
-
         let prev = self.get_block(&block.header.prev_blockhash).ok_or(anyhow!("Orphan block"))?;
         self.calculate_synergistic_work(&mut block);
         block.total_work = prev.total_work + block.synergistic_work;
-
         self.blocks_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
-        
         if block.total_work > self.total_work {
-            if block.header.prev_blockhash != self.tip {
-                self.handle_reorganization(hash)?;
-            } else {
-                self.tip = hash;
-                self.update_utxo_set(&block)?;
-            }
-            
+            if block.header.prev_blockhash != self.tip { self.handle_reorganization(hash)?; }
+            else { self.tip = hash; self.update_utxo_set(&block)?; }
             self.total_work = block.total_work;
             self.headers.push(block.header.clone());
             self.dcs.process_beacons(&block.beacons);
-            
-            if self.burst_manager.check_and_activate(&block, fees) {
-                self.finality_gadget.activate(hash, self.total_staked);
-            }
-            
+            if self.burst_manager.check_and_activate(&block, fees) { self.finality_gadget.activate(hash, self.total_staked); }
             self.burst_manager.update_state(block.height);
             self.ldd_state.recent_blocks.push((block.header.time, is_pow));
-            if self.ldd_state.recent_blocks.len() >= self.ldd_state.current_adjustment_window {
-                self.adjust_ldd();
-            }
-
+            if self.ldd_state.recent_blocks.len() >= self.ldd_state.current_adjustment_window { self.adjust_ldd(); }
             self.update_and_execute_proposals();
             self.blocks_tree.insert(self.db_config.tip_key.as_str(), hash.as_ref() as &[u8])?;
             self.blocks_tree.insert(&self.db_config.total_work_key, &self.total_work.to_be_bytes() as &[u8])?;
@@ -506,20 +421,14 @@ impl Blockchain {
     fn verify_dcs_metadata(&self, block: &Block) -> Result<()> {
         if block.header.vrf_proof.is_some() { return Ok(()); }
         let consensus_values = self.dcs.calculate_consensus();
-        
         if consensus_values.median_total_stake > 0 && self.total_staked > 0 {
             let deviation = (self.total_staked as i128 - consensus_values.median_total_stake as i128).abs();
-            if deviation > (consensus_values.median_total_stake as i128 / 10) { 
-                bail!("DCS Metadata Violation: Manipulated total stake value.");
-            }
+            if deviation > (consensus_values.median_total_stake as i128 / 10) { bail!("DCS Metadata Violation."); }
         }
-
         let consensus_time = consensus_values.median_time;
         if consensus_time > 0 {
             let time_drift = (block.header.time as i64 - consensus_time as i64).abs();
-            if time_drift > 600 {
-                bail!("DTC Violation: Block timestamp too far from BFT-median time.");
-            }
+            if time_drift > 600 { bail!("DTC Violation."); }
         }
         Ok(())
     }
@@ -528,21 +437,14 @@ impl Blockchain {
         let coinbase = block.transactions.get(0).ok_or(anyhow!("Missing coinbase"))?;
         let pool = (self.consensus_params.coinbase_reward * BEACON_BOUNTY_POOL_PERCENT) / 100;
         let per_beacon = if !block.beacons.is_empty() { pool / block.beacons.len() as u64 } else { 0 };
-
         if per_beacon == 0 { return Ok(()); }
-
         for beacon in &block.beacons {
             let pk = PublicKey::from_slice(&beacon.public_key)?;
             let addr = address_from_pubkey_hash(&hash_pubkey(&pk));
-            
             let found = coinbase.vout.iter().any(|out| {
-                out.value == per_beacon && 
-                out.script_pub_key == TxOut::new(0, addr.clone()).script_pub_key
+                out.value == per_beacon && out.script_pub_key == TxOut::new(0, addr.clone()).script_pub_key
             });
-            
-            if !found {
-                bail!("Invalid Coinbase: Missing bounty payout for beacon producer {}.", addr);
-            }
+            if !found { bail!("Invalid Coinbase bounty."); }
         }
         Ok(())
     }
@@ -550,44 +452,28 @@ impl Blockchain {
     fn handle_reorganization(&mut self, new_block_hash: sha256d::Hash) -> Result<()> {
         let ancestor = self.find_common_ancestor(self.tip, new_block_hash)?;
         let mut curr = self.tip;
-        while curr != ancestor {
-            let block = self.get_block(&curr).ok_or(anyhow!("Reorg fail"))?;
-            self.rollback_utxo_set(&block)?;
-            curr = block.header.prev_blockhash;
-        }
+        while curr != ancestor { let block = self.get_block(&curr).ok_or(anyhow!("Reorg fail"))?; self.rollback_utxo_set(&block)?; curr = block.header.prev_blockhash; }
         let mut curr = new_block_hash;
         let mut new_path = Vec::new();
-        while curr != ancestor {
-            let block = self.get_block(&curr).ok_or(anyhow!("Reorg fail"))?;
-            new_path.push(block);
-            curr = new_path.last().unwrap().header.prev_blockhash;
-        }
+        while curr != ancestor { let block = self.get_block(&curr).ok_or(anyhow!("Reorg fail"))?; new_path.push(block); curr = new_path.last().unwrap().header.prev_blockhash; }
         for block in new_path.into_iter().rev() { self.update_utxo_set(&block)?; }
         self.tip = new_block_hash;
         Ok(())
     }
 
     fn rollback_utxo_set(&mut self, block: &Block) -> Result<()> {
-        let mut utxo_batch = Batch::default();
-        let mut addr_batch = Batch::default();
-        let mut rolling_root = self.calculate_utxo_root()?;
-
+        let mut rolling_muhash = self.get_muhash_root()?;
         for tx in block.transactions.iter().rev() {
             let txid = tx.id();
-            for (i, vout) in tx.vout.iter().enumerate() {
+            for (i, _) in tx.vout.iter().enumerate() {
                 let mut utxo_key = Vec::with_capacity(36);
                 utxo_key.extend_from_slice(txid.as_ref());
                 utxo_key.extend_from_slice(&(i as u32).to_be_bytes());
-
                 if let Some(val) = self.utxo_tree.get(&utxo_key)? {
-                    rolling_root = xor_hashes(rolling_root, sha256d::Hash::hash(&val));
+                    let entry_hash = BigUint::from_bytes_be(sha256d::Hash::hash(&val).as_ref());
+                    rolling_muhash = self.muhash_div(rolling_muhash, entry_hash);
                     self.utxo_cache.remove(&(txid, i as u32));
-                    utxo_batch.remove(utxo_key.as_slice());
-                    if !vout.script_pub_key.is_empty() {
-                        let mut addr_key = vout.script_pub_key.clone();
-                        addr_key.extend_from_slice(&utxo_key);
-                        addr_batch.remove(addr_key);
-                    }
+                    self.utxo_tree.remove(utxo_key.as_slice())?;
                 }
             }
             if !tx.is_coinbase() {
@@ -599,90 +485,56 @@ impl Blockchain {
                         utxo_key.extend_from_slice(vin.prev_txid.as_ref());
                         utxo_key.extend_from_slice(&vin.prev_vout.to_be_bytes());
                         let val = bincode::serialize(&entry)?;
-                        rolling_root = xor_hashes(rolling_root, sha256d::Hash::hash(&val));
-                        utxo_batch.insert(utxo_key, val);
-                        self.utxo_cache.insert((vin.prev_txid, vin.prev_vout), entry);
+                        let entry_hash = BigUint::from_bytes_be(sha256d::Hash::hash(&val).as_ref());
+                        rolling_muhash = self.muhash_mul(rolling_muhash, entry_hash);
+                        self.utxo_tree.insert(utxo_key, val)?;
                     }
                 }
             }
         }
-        self.utxo_tree.apply_batch(utxo_batch)?;
-        self.addr_utxo_tree.apply_batch(addr_batch)?;
-        self.meta_tree.insert("utxo_rolling_root", rolling_root.as_ref() as &[u8])?;
+        self.meta_tree.insert("utxo_muhash_root", rolling_muhash.to_bytes_be().as_slice())?;
         Ok(())
     }
 
     fn find_common_ancestor(&self, hash1: sha256d::Hash, hash2: sha256d::Hash) -> Result<sha256d::Hash> {
         let mut path = HashSet::new();
         let mut curr = hash1;
-        while curr != sha256d::Hash::all_zeros() {
-            path.insert(curr);
-            curr = self.get_block(&curr).map(|b| b.header.prev_blockhash).unwrap_or(sha256d::Hash::all_zeros());
-        }
+        while curr != sha256d::Hash::all_zeros() { path.insert(curr); curr = self.get_block(&curr).map(|b| b.header.prev_blockhash).unwrap_or(sha256d::Hash::all_zeros()); }
         curr = hash2;
-        while curr != sha256d::Hash::all_zeros() {
-            if path.contains(&curr) { return Ok(curr); }
-            curr = self.get_block(&curr).map(|b| b.header.prev_blockhash).unwrap_or(sha256d::Hash::all_zeros());
-        }
+        while curr != sha256d::Hash::all_zeros() { if path.contains(&curr) { return Ok(curr); } curr = self.get_block(&curr).map(|b| b.header.prev_blockhash).unwrap_or(sha256d::Hash::all_zeros()); }
         bail!("No common ancestor")
     }
 
-    pub fn get_mempool_txs(&mut self) -> Vec<Transaction> {
-        let txs = self.mempool.values().cloned().collect();
-        self.mempool.clear();
-        txs
-    }
+    pub fn get_mempool_txs(&mut self) -> Vec<Transaction> { let txs = self.mempool.values().cloned().collect(); self.mempool.clear(); txs }
 
     pub fn adjust_ldd(&mut self) {
         let consensus_values = self.dcs.calculate_consensus();
         let consensus_delay_sec = (consensus_values.consensus_delay as f64 / 1000.0).ceil() as u32;
         let safety_margin = 2; 
-        
         let mu_min = consensus_delay_sec + (2 * safety_margin); 
         let mu_max = self.consensus_params.target_block_time as u32;
         let mu_target = mu_max.saturating_sub(((mu_max.saturating_sub(mu_min)) as f64 * consensus_values.consensus_load) as u32).max(mu_min);
-
         let psi_new = consensus_delay_sec + safety_margin;
         let delta_mu = (mu_target as f64 - psi_new as f64).max(1.0);
         let m_req = std::f64::consts::PI / (2.0 * delta_mu * delta_mu);
-        
         let xi_optimal = ((-2.0 * P_FALLBACK.ln()) / m_req).sqrt().round() as u32;
-        
-        let (pow_blocks, pos_blocks) = self.ldd_state.recent_blocks.iter().fold((0.0, 0.0), |(pow, pos), &(_, is_pow)| {
-            if is_pow { (pow + 1.0, pos) } else { (pow, pos + 1.0) }
-        });
+        let (pow_blocks, pos_blocks) = self.ldd_state.recent_blocks.iter().fold((0.0, 0.0), |(pow, pos), &(_, is_pow)| { if is_pow { (pow + 1.0, pos) } else { (pow, pos + 1.0) } });
         let total_blocks = pow_blocks + pos_blocks;
         let proportion_error = if total_blocks > 0.0 { (pow_blocks / total_blocks) - 0.5 } else { 0.0 };
-
-        let kappa_base = 0.1;
-        let kappa_gain = 0.2;
-        let current_kappa = kappa_base + kappa_gain * (0.0_f64.max(-proportion_error));
-
+        let kappa_base = 0.1; let kappa_gain = 0.2; let current_kappa = kappa_base + kappa_gain * (0.0_f64.max(-proportion_error));
         let f_a_pow_tentative = self.ldd_state.f_a_pow.to_f64() * (1.0 - current_kappa * proportion_error);
         let f_a_pos_tentative = self.ldd_state.f_a_pos.to_f64() * (1.0 + current_kappa * proportion_error);
-
         let m_actual_unscaled = (f_a_pow_tentative + f_a_pos_tentative) / xi_optimal as f64;
         let beta = if m_actual_unscaled > 0.0 { m_req / m_actual_unscaled } else { 1.0 };
-
         self.ldd_state.f_a_pow = Fixed::from_f64((f_a_pow_tentative * beta).max(0.01));
         self.ldd_state.f_a_pos = Fixed::from_f64((f_a_pos_tentative * beta).max(0.01));
-
-        self.ldd_state.current_psi = psi_new;
-        self.ldd_state.current_gamma = psi_new + xi_optimal;
-        self.ldd_state.current_target_block_time = mu_target as u64;
-
-        let beta_base = self.fee_params.min_burn_rate;
-        let k_sec = 0.5; 
+        self.ldd_state.current_psi = psi_new; self.ldd_state.current_gamma = psi_new + xi_optimal; self.ldd_state.current_target_block_time = mu_target as u64;
+        let beta_base = self.fee_params.min_burn_rate; let k_sec = 0.5; 
         self.ldd_state.current_burn_rate = (beta_base + k_sec * consensus_values.security_threat_level).min(self.fee_params.max_burn_rate);
-        
-        let fee_base = self.fee_params.fee_burst_threshold as f64;
-        let k_topo = 2.0; 
+        let fee_base = self.fee_params.fee_burst_threshold as f64; let k_topo = 2.0; 
         self.burst_manager.fee_burst_threshold = (fee_base * (1.0 + k_topo * consensus_values.chain_health_score)) as u64;
-
-        let n_base = 240.0;
-        let n_min = 5.0;
+        let n_base = 240.0; let n_min = 5.0;
         self.ldd_state.current_adjustment_window = ((n_base - n_min) * (1.0 - consensus_values.security_threat_level) + n_min).round() as usize;
-
         self.ldd_state.recent_blocks.clear();
     }
 
@@ -696,17 +548,11 @@ impl Blockchain {
                     if let Some(current_proposal) = self.governance.proposals.get_mut(&proposal.id) {
                         current_proposal.state = ProposalState::Executed;
                         match &proposal.payload {
-                            ProposalPayload::UpdateTargetBlockTime(new_time) => {
-                                Arc::make_mut(&mut self.consensus_params).target_block_time = *new_time;
-                            }
+                            ProposalPayload::UpdateTargetBlockTime(new_time) => { Arc::make_mut(&mut self.consensus_params).target_block_time = *new_time; }
                             _ => {}
                         }
                     }
-                } else {
-                    if let Some(p) = self.governance.proposals.get_mut(&proposal.id) {
-                        p.state = ProposalState::Failed;
-                    }
-                }
+                } else { if let Some(p) = self.governance.proposals.get_mut(&proposal.id) { p.state = ProposalState::Failed; } }
             }
         }
     }
@@ -724,11 +570,4 @@ impl Blockchain {
         }
         Ok(())
     }
-}
-
-fn xor_hashes(h1: sha256d::Hash, h2: sha256d::Hash) -> sha256d::Hash {
-    let mut b1 = h1.to_byte_array();
-    let b2 = h2.to_byte_array();
-    for i in 0..32 { b1[i] ^= b2[i]; }
-    sha256d::Hash::from_byte_array(b1)
 }

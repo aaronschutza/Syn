@@ -2,7 +2,7 @@
 name = "synergeia-node"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"  # Add this line
+license = "MIT"
 
 [dependencies]
 # Asynchronous Runtime and Networking
@@ -16,18 +16,21 @@ serde_with = "3.8.1"
 sled = "0.34"
 
 # Cryptography and Blockchain Data Structures
-# ADDED: Add primitive-types for U256 math
 primitive-types = "0.14.0"
 bitcoin = { version = "0.31", features = ["serde"] }
 bitcoin_hashes = "0.13"
-secp256k1 = { version = "0.28", features = ["rand-std", "recovery"] }
+secp256k1 = { version = "0.28", features = ["rand-std", "recovery", "global-context"] }
 hex = "0.4"
 bs58 = "0.5.0"
 base64 = "0.22"
 
+# Post-Quantum Cryptography (NIST ML-DSA / Dilithium)
+# Using a pure-rust or high-level wrapper for Dilithium3
+pqcrypto-dilithium = "0.5"
+pqcrypto-traits = "0.3"
+
 # Deterministic Arithmetic (Consensus Critical)
 fixed = "1.27"
-# REMOVED 'math' feature, as it does not exist. Pow comes from num-traits.
 bigdecimal = { version = "0.4.3", features = ["serde"] } 
 num-bigint = "0.4"
 num-traits = { version = "0.2", features = ["std"] }
@@ -53,4 +56,3 @@ clap = { version = "4.5", features = ["derive"] }
 
 # Configuration Management
 config = { version = "0.14", features = ["toml"] }
-
