@@ -1,4 +1,4 @@
-// src/tests/advanced_feature_tests.rs - Fixed test generation for adaptive features
+// src/tests/advanced_feature_tests.rs
 
 #[cfg(test)]
 mod tests {
@@ -12,18 +12,18 @@ mod tests {
         params::{ParamManager, ConsensusParams},
         stk_module::{StakingModule, BankModule},
         gov_module::GovernanceModule,
-        storage::GovernanceStore,
+        storage::{GovernanceStore, HeaderStore},
         difficulty::DynamicDifficultyManager,
         crypto::{hash_pubkey, address_from_pubkey_hash},
+        client::SpvClientState,
     };
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use chrono::Utc;
     use num_bigint::BigUint;
     use secp256k1::PublicKey;
-    use log::info; // Added missing macro import to resolve compilation errors
+    use log::info;
 
-    // Helper to setup test environment
     fn setup_test_env(test_name: &str) -> (Arc<Mutex<Blockchain>>, Wallet, NodeConfig) {
         let db_path = format!("test_adv_db_{}", test_name);
         let wallet_file = format!("test_adv_wallet_{}", test_name);
@@ -31,9 +31,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&db_path);
         let _ = std::fs::remove_file(&wallet_file);
 
-        let mut config = config::load("synergeia.toml").unwrap_or_else(|_| {
-            panic!("synergeia.toml must exist for tests");
-        });
+        let mut config = config::load("synergeia.toml").unwrap();
         
         config.consensus.target_block_time = 1; 
         config.consensus.adjustment_window = 5; 
@@ -50,6 +48,9 @@ mod tests {
         let governance_module = Arc::new(GovernanceModule::new(param_manager.clone(), staking_module.clone(), governance_store));
         let difficulty_manager = Arc::new(DynamicDifficultyManager::new(param_manager.clone()));
         
+        let header_store = HeaderStore::new(db.clone());
+        let spv_state = Arc::new(SpvClientState::new(header_store));
+
         let consensus_engine = ConsensusEngine::new(
             param_manager.clone(),
             staking_module.clone(),
@@ -63,6 +64,8 @@ mod tests {
             Arc::new(config.consensus),
             Arc::new(config.fees),
             Arc::new(config.governance),
+            Arc::new(config.progonos),
+            spv_state,
             Arc::new(config.database),
             consensus_engine,
         ).unwrap();
@@ -78,7 +81,6 @@ mod tests {
         let _ = std::fs::remove_file(&node_config.wallet_file);
     }
 
-    /// Optimized helper to apply beacon rewards to block templates.
     fn apply_test_bounties(coinbase: &mut Transaction, reward: u64, beacons: &[Beacon]) {
         if beacons.is_empty() { return; }
         let pool = (reward * 1) / 100;
@@ -95,7 +97,6 @@ mod tests {
         }
     }
 
-    // Helper to mine a block manually with valid reward distribution
     async fn mine_block(bc_arc: Arc<Mutex<Blockchain>>, wallet: &Wallet) {
         let mut bc = bc_arc.lock().await;
         let height = bc.headers.len() as u32;

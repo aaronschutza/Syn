@@ -1,8 +1,8 @@
-// src/blockchain.rs - State Commitment with Deterministic Hardening
+// src/blockchain.rs - State Commitment with Progonos Bridge & Deterministic Hardening
 
 use crate::{
     block::{Block, BlockHeader, Beacon},
-    config::{ConsensusConfig, DatabaseConfig, FeeConfig, GovernanceConfig},
+    config::{ConsensusConfig, DatabaseConfig, FeeConfig, GovernanceConfig, ProgonosConfig},
     dcs::DecentralizedConsensusService,
     burst::BurstFinalityManager,
     cdf::{FinalityGadget, FinalityVote}, 
@@ -11,6 +11,8 @@ use crate::{
     transaction::{Transaction, TxOut},
     engine::ConsensusEngine,
     crypto::{hash_pubkey, address_from_pubkey_hash},
+    spv::{self, DepositProofRequest},
+    client::SpvClientState,
 };
 use anyhow::{anyhow, bail, Result};
 use bitcoin_hashes::{sha256d, Hash};
@@ -96,6 +98,7 @@ pub struct Blockchain {
     pub utxo_tree: sled::Tree,
     pub addr_utxo_tree: sled::Tree, 
     pub tx_index_tree: sled::Tree,
+    pub btc_txid_tree: sled::Tree, // Nullifier map for Progonos Bridge
     pub meta_tree: sled::Tree,
 
     pub tip: sha256d::Hash,
@@ -106,6 +109,8 @@ pub struct Blockchain {
     pub consensus_params: Arc<ConsensusConfig>,
     pub fee_params: Arc<FeeConfig>,
     pub governance_params: Arc<GovernanceConfig>,
+    pub progonos_config: Arc<ProgonosConfig>,
+    pub spv_state: Arc<SpvClientState>,
     pub total_staked: u64,
     pub governance: Governance,
     pub db_config: Arc<DatabaseConfig>,
@@ -130,6 +135,8 @@ impl Blockchain {
         consensus_params: Arc<ConsensusConfig>,
         fee_params: Arc<FeeConfig>,
         governance_params: Arc<GovernanceConfig>,
+        progonos_config: Arc<ProgonosConfig>,
+        spv_state: Arc<SpvClientState>,
         db_config: Arc<DatabaseConfig>,
         consensus_engine: ConsensusEngine,
     ) -> Result<Self> {
@@ -137,6 +144,7 @@ impl Blockchain {
         let utxo_tree = db.open_tree(&db_config.utxo_tree)?;
         let addr_utxo_tree = db.open_tree("addr_utxo_index")?;
         let tx_index_tree = db.open_tree(&db_config.tx_index_tree)?;
+        let btc_txid_tree = db.open_tree("progonos_used_btc_txids")?;
         let meta_tree = db.open_tree("chain_metadata")?;
 
         let mut ldd_state = LddState::default();
@@ -147,11 +155,11 @@ impl Blockchain {
         ldd_state.current_burn_rate = fee_params.min_burn_rate;
 
         let mut bc = Blockchain {
-            db, blocks_tree, utxo_tree, addr_utxo_tree, tx_index_tree, meta_tree,
+            db, blocks_tree, utxo_tree, addr_utxo_tree, tx_index_tree, btc_txid_tree, meta_tree,
             tip: sha256d::Hash::all_zeros(),
             total_work: 0, mempool: HashMap::new(), beacon_mempool: Vec::new(),
             ldd_state, consensus_params, fee_params: fee_params.clone(),
-            governance_params, total_staked: 0, governance: Governance::new(),
+            governance_params, progonos_config, spv_state, total_staked: 0, governance: Governance::new(),
             db_config, headers: Vec::new(),
             utxo_cache: HashMap::with_capacity(MAX_UTXO_CACHE_SIZE),
             pos_block_count: 0, bootstrap_phase_complete: false,
@@ -192,22 +200,30 @@ impl Blockchain {
         let mut utxo_batch = Batch::default();
         let mut addr_batch = Batch::default();
         let mut index_batch = Batch::default();
+        let mut btc_tx_batch = Batch::default();
         let mut rolling_muhash = self.get_muhash_root()?;
         let pqc_enforced = block.height >= PQC_ENFORCEMENT_HEIGHT;
 
         for tx in &block.transactions {
             let mut prev_txs = HashMap::new();
             if !tx.is_coinbase() {
-                for vin in &tx.vin {
-                    let prev_tx = self.get_transaction(&vin.prev_txid)?.ok_or_else(|| anyhow!("Input tx missing"))?;
-                    prev_txs.insert(vin.prev_txid, prev_tx);
+                let is_bridge_mint = tx.vin.len() == 1 && tx.vin[0].prev_txid == sha256d::Hash::all_zeros() && tx.vin[0].script_sig.starts_with(b"{");
+
+                if is_bridge_mint {
+                    self.validate_progonos_mint(tx, &mut btc_tx_batch)?;
+                } else {
+                    for vin in &tx.vin {
+                        let prev_tx = self.get_transaction(&vin.prev_txid)?.ok_or_else(|| anyhow!("Input tx missing"))?;
+                        prev_txs.insert(vin.prev_txid, prev_tx);
+                    }
+                    tx.verify_hybrid(&prev_txs, pqc_enforced)?;
                 }
-                tx.verify_hybrid(&prev_txs, pqc_enforced)?;
             }
 
             let txid = tx.id();
-            if !tx.is_coinbase() {
+            if !tx.is_coinbase() && !tx.vin.is_empty() {
                 for vin in &tx.vin {
+                    if vin.prev_txid == sha256d::Hash::all_zeros() { continue; } // Skip bridge mint pseudo-inputs
                     let mut utxo_key = Vec::with_capacity(36);
                     utxo_key.extend_from_slice(vin.prev_txid.as_ref());
                     utxo_key.extend_from_slice(&vin.prev_vout.to_be_bytes());
@@ -242,8 +258,40 @@ impl Blockchain {
             }
             index_batch.insert(txid.as_ref() as &[u8], block.header.hash().as_ref() as &[u8]);
         }
-        self.utxo_tree.apply_batch(utxo_batch)?; self.addr_utxo_tree.apply_batch(addr_batch)?; self.tx_index_tree.apply_batch(index_batch)?;
+        self.utxo_tree.apply_batch(utxo_batch)?; 
+        self.addr_utxo_tree.apply_batch(addr_batch)?; 
+        self.tx_index_tree.apply_batch(index_batch)?;
+        self.btc_txid_tree.apply_batch(btc_tx_batch)?; 
         self.meta_tree.insert("utxo_muhash_root", rolling_muhash.to_bytes_be().as_slice())?;
+        Ok(())
+    }
+
+    /// Validates a Progonos sBTC Mint transaction by checking the SPV proof and preventing double-minting.
+    fn validate_progonos_mint(&self, tx: &Transaction, btc_tx_batch: &mut Batch) -> Result<()> {
+        let binding = tx.vin.get(0).map(|v| v.script_sig.clone()).unwrap_or_default();
+        let proof_json = String::from_utf8_lossy(&binding);
+        let request: DepositProofRequest = serde_json::from_str(&proof_json)
+            .map_err(|_| anyhow!("Invalid Progonos Proof Metadata"))?;
+
+        // 1. Nullifier Check: Ensure this Bitcoin Tx hasn't been used yet
+        if self.btc_txid_tree.contains_key(request.expected_txid.as_bytes())? {
+            bail!("Double-Mint Attempt: Bitcoin TXID {} already used.", request.expected_txid);
+        }
+
+        // 2. SPV Verification: Check proof against synchronized Bitcoin headers
+        let btc_header = spv::verify_deposit_proof(request.clone(), &self.spv_state)
+            .map_err(|e| anyhow!("SPV Verification Failed: {}", e))?;
+
+        // 3. Confirmations Check: Verify Bitcoin maturity (k_btc)
+        let _btc_tip_hash = self.spv_state.get_tip_hash().map_err(|e| anyhow!("BTC SPV Storage error: {:?}", e))?;
+        // verify the block exists in our synchronized set
+        self.spv_state.get_header_by_hash(&btc_header.block_hash())
+            .map_err(|_| anyhow!("Bitcoin block not found in synchronized chain"))?;
+
+        // 4. Record the nullifier to prevent double-minting
+        btc_tx_batch.insert(request.expected_txid.as_bytes(), &[]);
+        
+        info!("Progonos Bridge: Validated Mint for BTC TXID {}", request.expected_txid);
         Ok(())
     }
 
@@ -320,16 +368,11 @@ impl Blockchain {
         } else {
             let block_reward = self.consensus_params.coinbase_reward;
             let total_fees = self.calculate_total_fees(block);
-            
-            // Deterministic ASW Calculation using Fixed Point
             let econ_value = Fixed::from_integer(block_reward + total_fees);
             let alpha = Fixed::from_f64(0.4); 
-            
             let vrf_hash = sha256d::Hash::hash(vrf_opt.as_ref().unwrap());
-            // Deterministic Entropy bonus: 1.0 + (first_byte / 256)
             let entropy_scaled = (vrf_hash.to_byte_array()[0] as u128) << (64 - 8);
             let entropy_bonus = Fixed( (1u128 << 64) + entropy_scaled );
-            
             let commitment = alpha * econ_value * entropy_bonus;
             block.synergistic_work = (commitment.0 >> 64) as u64;
         }
@@ -398,7 +441,6 @@ impl Blockchain {
         let fees = self.calculate_total_fees(&block);
 
         if !is_pow {
-            // Deterministic Hardened Burn Verification using Fixed arithmetic instead of f64
             let fees_fixed = Fixed::from_integer(fees);
             let burn_rate_fixed = Fixed::from_f64(self.ldd_state.current_burn_rate);
             let required_burn = ((fees_fixed * burn_rate_fixed).0 >> 64) as u64;

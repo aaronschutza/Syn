@@ -1,7 +1,5 @@
 // src/main.rs
 
-// This file defines the Synergeia library and its modules.
-
 pub mod block;
 pub mod blockchain;
 pub mod btc_p2p;
@@ -11,7 +9,7 @@ pub mod consensus;
 pub mod crypto;
 pub mod dcs;
 pub mod burst;
-pub mod cdf; // ADDED: Chromo-Dynamic Finality
+pub mod cdf;
 pub mod fixed_point;
 pub mod governance;
 pub mod p2p;
@@ -33,7 +31,6 @@ pub mod difficulty;
 pub mod sync;
 pub mod runtime;
 
-
 use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -42,16 +39,13 @@ use p2p::P2PMessage;
 use btc_p2p::BtcP2PMessage;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
-// Added missing imports for engine initialization
 use crate::params::{ParamManager, ConsensusParams};
 use crate::stk_module::{StakingModule, BankModule};
 use crate::gov_module::GovernanceModule;
-use crate::storage::GovernanceStore;
+use crate::storage::{GovernanceStore, HeaderStore};
 use crate::difficulty::DynamicDifficultyManager;
 use crate::engine::ConsensusEngine;
 use crate::client::SpvClientState;
-use crate::storage::HeaderStore;
-
 
 const CHANNEL_CAPACITY: usize = 100;
 
@@ -69,7 +63,6 @@ async fn main() -> Result<()> {
             println!("New wallet created and saved to {}", config.node.wallet_file);
             println!("Address: {}", wallet.get_address());
         }
-        // CORRECTED: Added `data_dir` to the pattern match.
         Commands::StartNode { mode, config, data_dir, mine_to_address } => {
             let loaded_config = config::load(&config)?;
             
@@ -90,7 +83,7 @@ async fn main() -> Result<()> {
                 ConsensusParams::new(),
             );
 
-            // --- Blockchain and other modules ---
+            // --- Configuration Params ---
             let fee_params = Arc::new(loaded_config.fees.clone());
             let governance_params = Arc::new(loaded_config.governance.clone());
             let db_config = Arc::new(loaded_config.database.clone());
@@ -100,27 +93,30 @@ async fn main() -> Result<()> {
 
             let p2p_config = Arc::new(loaded_config.p2p.clone());
             let progonos_config = Arc::new(loaded_config.progonos.clone());
-			let consensus_params = Arc::new(loaded_config.consensus.clone());
+            let consensus_params = Arc::new(loaded_config.consensus.clone());
 
+            // --- SPV State Initialization (Required for Blockchain) ---
+            let header_store = HeaderStore::new(db_for_gov.clone());
+            let spv_state = Arc::new(SpvClientState::new(header_store));
+            let spv_client = Arc::new(Mutex::new(progonos::SpvClient::new(&progonos_config)));
+
+            // --- Blockchain Initialization (Fixed E0061: Added missing arguments) ---
             let bc = Arc::new(Mutex::new(blockchain::Blockchain::new_with_db(
                 db_for_gov.clone(),
                 consensus_params.clone(),
                 fee_params,
                 governance_params.clone(),
+                progonos_config.clone(), // New argument 5
+                spv_state.clone(),       // New argument 6
                 db_config,
-                consensus_engine, // Pass the engine
+                consensus_engine, 
             )?));
 
-            let spv_client = Arc::new(Mutex::new(progonos::SpvClient::new(&progonos_config)));
-            let header_store = HeaderStore::new(db_for_gov.clone());
-            let spv_state = Arc::new(SpvClientState::new(header_store));
             let peer_manager = Arc::new(Mutex::new(peer_manager::PeerManager::new(p2p_config.clone())));
 
             let (p2p_tx, _p2p_rx) = mpsc::channel::<P2PMessage>(CHANNEL_CAPACITY);
             let (broadcast_tx, _) = broadcast::channel::<P2PMessage>(CHANNEL_CAPACITY);
-            
             let (_btc_p2p_tx, btc_p2p_rx) = mpsc::channel::<BtcP2PMessage>(CHANNEL_CAPACITY);
-            
             let (to_consensus_tx, consensus_rx) = mpsc::channel(CHANNEL_CAPACITY);
             let (shutdown_tx, _) = broadcast::channel(1);
 
@@ -136,13 +132,13 @@ async fn main() -> Result<()> {
 
             let p2p_handle = tokio::spawn(p2p::start_server(
                 bc.clone(),
-                to_consensus_tx.clone(), // Clone for P2P
+                to_consensus_tx.clone(),
                 broadcast_tx.clone(),
                 peer_manager,
                 p2p_config.clone(),
                 node_config.clone(),
-                consensus_params.clone(), // Pass consensus params
-                shutdown_tx.subscribe(), // FIX: Changed shutdown_rx to shutdown_tx
+                consensus_params.clone(),
+                shutdown_tx.subscribe(),
             ));
             
             let rpc_handle = tokio::spawn(rpc::start_rpc_server(
@@ -156,7 +152,6 @@ async fn main() -> Result<()> {
                 shutdown_tx.subscribe(),
             ));
             
-            // FIX: Pass spv_state as the second argument to match start_btc_p2p_client signature
             let btc_p2p_handle = tokio::spawn(btc_p2p::start_btc_p2p_client(
                 spv_client.clone(),
                 spv_state,
