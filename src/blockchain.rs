@@ -1,4 +1,4 @@
-// src/blockchain.rs - State Commitment with Corrected Error Handling
+// src/blockchain.rs - State Commitment with Deterministic Hardening
 
 use crate::{
     block::{Block, BlockHeader, Beacon},
@@ -320,12 +320,18 @@ impl Blockchain {
         } else {
             let block_reward = self.consensus_params.coinbase_reward;
             let total_fees = self.calculate_total_fees(block);
-            let economic_value = Fixed::from_integer(block_reward + total_fees);
+            
+            // Deterministic ASW Calculation using Fixed Point
+            let econ_value = Fixed::from_integer(block_reward + total_fees);
             let alpha = Fixed::from_f64(0.4); 
+            
             let vrf_hash = sha256d::Hash::hash(vrf_opt.as_ref().unwrap());
-            let entropy_bonus = 1.0 + (vrf_hash.to_byte_array()[0] as f64 / 255.0); 
-            let pos_commitment = alpha * economic_value * Fixed::from_f64(entropy_bonus);
-            block.synergistic_work = (pos_commitment.0 / (1 << 64)) as u64;
+            // Deterministic Entropy bonus: 1.0 + (first_byte / 256)
+            let entropy_scaled = (vrf_hash.to_byte_array()[0] as u128) << (64 - 8);
+            let entropy_bonus = Fixed( (1u128 << 64) + entropy_scaled );
+            
+            let commitment = alpha * econ_value * entropy_bonus;
+            block.synergistic_work = (commitment.0 >> 64) as u64;
         }
     }
 
@@ -387,16 +393,28 @@ impl Blockchain {
         if self.veto_manager.blacklisted_blocks.contains(&hash) { bail!("Vetoed block."); }
         self.verify_dcs_metadata(&block)?;
         if !block.beacons.is_empty() { self.validate_beacon_bounties(&block)?; }
+        
         let is_pow = block.header.vrf_proof.is_none();
         let fees = self.calculate_total_fees(&block);
+
         if !is_pow {
-            let required = (fees as f64 * self.ldd_state.current_burn_rate) as u64;
+            // Deterministic Hardened Burn Verification using Fixed arithmetic instead of f64
+            let fees_fixed = Fixed::from_integer(fees);
+            let burn_rate_fixed = Fixed::from_f64(self.ldd_state.current_burn_rate);
+            let required_burn = ((fees_fixed * burn_rate_fixed).0 >> 64) as u64;
+
             let burned = block.transactions.get(0).map_or(0, |tx| {
-                tx.vout.iter().filter(|o| o.script_pub_key == vec![0x6a]).map(|o| o.value).sum::<u64>()
+                tx.vout.iter()
+                    .filter(|o| o.script_pub_key == vec![0x6a])
+                    .map(|o| o.value)
+                    .sum::<u64>()
             });
-            // FIX: Restore error string exactly for test parity
-            if burned < required { bail!("Insufficient Proof-of-Burn commitment."); }
+
+            if burned < required_burn { 
+                bail!("Insufficient Proof-of-Burn commitment."); 
+            }
         }
+
         let prev = self.get_block(&block.header.prev_blockhash).ok_or(anyhow!("Orphan block"))?;
         self.calculate_synergistic_work(&mut block);
         block.total_work = prev.total_work + block.synergistic_work;
