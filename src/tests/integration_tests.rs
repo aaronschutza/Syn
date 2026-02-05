@@ -17,6 +17,7 @@ mod tests {
         storage::{GovernanceStore, HeaderStore},
         difficulty::DynamicDifficultyManager,
         client::SpvClientState,
+        cdf::{FinalityVote, Color},
     };
     use anyhow::Result;
     use bitcoin_hashes::{sha256d, Hash};
@@ -603,5 +604,56 @@ mod tests {
         assert_ne!(consensus_engine.params.max_slope_change_per_block, initial_slope);
         let node_config = NodeConfig { rpc_port: 0, rpc_host: "127.0.0.1".to_string(), p2p_port: 0, db_path: db_path.to_string(), wallet_file: "".to_string(), rpc_auth_token: None };
         cleanup_test_env(node_config).await;
+    }
+
+    #[tokio::test]
+    async fn test_5_cdf_irreversibility_enforcement() -> Result<()> {
+        let test_name = "5";
+        let (bc_arc, miner_wallet, node_config, _g) = setup_test_env(test_name);
+        let address = miner_wallet.get_address();
+
+        // Establish a base
+        mine_next_block(bc_arc.clone(), address.clone()).await?;
+        let checkpoint_hash = {
+            let bc = bc_arc.lock().await;
+            bc.tip
+        };
+
+        // Ratify finality via the CDF gadget
+        {
+            let mut bc = bc_arc.lock().await;
+            bc.total_staked = 1000;
+            let votes = vec![
+                FinalityVote { voter_public_key: vec![1], checkpoint_hash, color: Color::Red, signature: vec![] },
+                FinalityVote { voter_public_key: vec![2], checkpoint_hash, color: Color::Green, signature: vec![] },
+                FinalityVote { voter_public_key: vec![3], checkpoint_hash, color: Color::Blue, signature: vec![] },
+            ];
+            bc.finality_gadget.activate(checkpoint_hash, 1000);
+            bc.finality_gadget.work_threshold = 0; // Force work quorum for test
+            for v in votes { bc.finality_gadget.process_vote(&v, 400); }
+            
+            if bc.finality_gadget.check_finality() {
+                bc.last_finalized_checkpoint = Some(checkpoint_hash);
+            }
+        }
+
+        // Attempt a deep reorg that reverts the finalized checkpoint (parallel genesis)
+        let mut fork_block = Block::create_genesis_block(
+            5000000000, 1672531200, 0x1e0ffff0, "Evil Fork".into(), 
+            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".into(), 1, 1
+        );
+        fork_block.synergistic_work = 1000000; 
+
+        let result = {
+            let mut bc = bc_arc.lock().await;
+            bc.add_block(fork_block)
+        };
+
+        assert!(result.is_err(), "Fork reverting a finalized block should be rejected.");
+        assert!(result.unwrap_err().to_string().contains("Irreversibility Violation"), 
+            "Error message should indicate finality violation.");
+
+        cleanup_test_env(node_config).await;
+        Ok(())
     }
 }

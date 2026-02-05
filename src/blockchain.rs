@@ -1,4 +1,4 @@
-// src/blockchain.rs - State Commitment with Progonos Bridge & Deterministic Hardening
+// src/blockchain.rs - State Commitment with Progonos Bridge & CDF Irreversibility
 
 use crate::{
     block::{Block, BlockHeader, Beacon},
@@ -17,7 +17,6 @@ use crate::{
 use anyhow::{anyhow, bail, Result};
 use bitcoin_hashes::{sha256d, Hash};
 use chrono::Utc;
-use log::info;
 use num_traits::{ToPrimitive, Zero};
 use num_bigint::BigUint;
 use std::collections::{HashMap, HashSet};
@@ -98,7 +97,7 @@ pub struct Blockchain {
     pub utxo_tree: sled::Tree,
     pub addr_utxo_tree: sled::Tree, 
     pub tx_index_tree: sled::Tree,
-    pub btc_txid_tree: sled::Tree, // Nullifier map for Progonos Bridge
+    pub btc_txid_tree: sled::Tree, 
     pub meta_tree: sled::Tree,
 
     pub tip: sha256d::Hash,
@@ -125,6 +124,7 @@ pub struct Blockchain {
     pub dcs: DecentralizedConsensusService,
     pub burst_manager: BurstFinalityManager,
     pub finality_gadget: FinalityGadget,
+    pub last_finalized_checkpoint: Option<sha256d::Hash>,
     pub metrics: LocalMetrics,
     pub veto_manager: VetoManager,
 }
@@ -166,7 +166,8 @@ impl Blockchain {
             last_pow_block_hash: sha256d::Hash::all_zeros(),
             consensus_engine, dcs: DecentralizedConsensusService::new(),
             burst_manager: BurstFinalityManager::new(fee_params.k_burst, fee_params.fee_burst_threshold), 
-            finality_gadget: FinalityGadget::new(), metrics: LocalMetrics::default(),
+            finality_gadget: FinalityGadget::new(), last_finalized_checkpoint: None,
+            metrics: LocalMetrics::default(),
             veto_manager: VetoManager::default(),
         };
 
@@ -223,7 +224,7 @@ impl Blockchain {
             let txid = tx.id();
             if !tx.is_coinbase() && !tx.vin.is_empty() {
                 for vin in &tx.vin {
-                    if vin.prev_txid == sha256d::Hash::all_zeros() { continue; } // Skip bridge mint pseudo-inputs
+                    if vin.prev_txid == sha256d::Hash::all_zeros() { continue; } 
                     let mut utxo_key = Vec::with_capacity(36);
                     utxo_key.extend_from_slice(vin.prev_txid.as_ref());
                     utxo_key.extend_from_slice(&vin.prev_vout.to_be_bytes());
@@ -266,32 +267,26 @@ impl Blockchain {
         Ok(())
     }
 
-    /// Validates a Progonos sBTC Mint transaction by checking the SPV proof and preventing double-minting.
     fn validate_progonos_mint(&self, tx: &Transaction, btc_tx_batch: &mut Batch) -> Result<()> {
         let binding = tx.vin.get(0).map(|v| v.script_sig.clone()).unwrap_or_default();
         let proof_json = String::from_utf8_lossy(&binding);
         let request: DepositProofRequest = serde_json::from_str(&proof_json)
             .map_err(|_| anyhow!("Invalid Progonos Proof Metadata"))?;
 
-        // 1. Nullifier Check: Ensure this Bitcoin Tx hasn't been used yet
         if self.btc_txid_tree.contains_key(request.expected_txid.as_bytes())? {
             bail!("Double-Mint Attempt: Bitcoin TXID {} already used.", request.expected_txid);
         }
 
-        // 2. SPV Verification: Check proof against synchronized Bitcoin headers
         let btc_header = spv::verify_deposit_proof(request.clone(), &self.spv_state)
             .map_err(|e| anyhow!("SPV Verification Failed: {}", e))?;
 
-        // 3. Confirmations Check: Verify Bitcoin maturity (k_btc)
         let _btc_tip_hash = self.spv_state.get_tip_hash().map_err(|e| anyhow!("BTC SPV Storage error: {:?}", e))?;
-        // verify the block exists in our synchronized set
         self.spv_state.get_header_by_hash(&btc_header.block_hash())
             .map_err(|_| anyhow!("Bitcoin block not found in synchronized chain"))?;
 
-        // 4. Record the nullifier to prevent double-minting
         btc_tx_batch.insert(request.expected_txid.as_bytes(), &[]);
         
-        info!("Progonos Bridge: Validated Mint for BTC TXID {}", request.expected_txid);
+        log::info!("Progonos Bridge: Validated Mint for BTC TXID {}", request.expected_txid);
         Ok(())
     }
 
@@ -363,8 +358,10 @@ impl Blockchain {
         let vrf_opt = &block.header.vrf_proof;
         if vrf_opt.is_none() {
             let easiest = BlockHeader::calculate_target(0x207fffff);
+            let easiest_val = if easiest.is_zero() { BigUint::from(1u32) } else { easiest };
             let target = BlockHeader::calculate_target(block.header.bits);
-            block.synergistic_work = if target.is_zero() { 1 } else { (&easiest / &target).to_u64().unwrap_or(1) };
+            let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
+            block.synergistic_work = (easiest_val / target_val).to_u64().unwrap_or(1);
         } else {
             let block_reward = self.consensus_params.coinbase_reward;
             let total_fees = self.calculate_total_fees(block);
@@ -394,7 +391,14 @@ impl Blockchain {
         if let Ok(pk) = PublicKey::from_slice(&vote.voter_public_key) {
             let addr = address_from_pubkey_hash(&hash_pubkey(&pk));
             let stake = self.consensus_engine.staking_module.get_voting_power(&addr);
-            if stake > 0 { self.finality_gadget.process_vote(&vote, stake as u64); }
+            if stake > 0 { 
+                self.finality_gadget.process_vote(&vote, stake as u64); 
+                if self.finality_gadget.check_finality() {
+                    let finalized_hash = self.finality_gadget.target_checkpoint.unwrap();
+                    log::info!("🛡️ CDF FINALITY RATIFIED: Block {} is now IRREVERSIBLE.", finalized_hash);
+                    self.last_finalized_checkpoint = Some(finalized_hash);
+                }
+            }
         }
     }
 
@@ -457,9 +461,23 @@ impl Blockchain {
             }
         }
 
-        let prev = self.get_block(&block.header.prev_blockhash).ok_or(anyhow!("Orphan block"))?;
-        self.calculate_synergistic_work(&mut block);
-        block.total_work = prev.total_work + block.synergistic_work;
+        // Handle Genesis Replacement/Parallel Forks starting from null parent
+        let is_parallel_genesis = block.header.prev_blockhash == sha256d::Hash::all_zeros();
+        
+        if is_parallel_genesis {
+            // For blocks with no parent in DB, we must still check finality violation
+            if let Some(_finalized) = self.last_finalized_checkpoint {
+                log::warn!("🚨 ATTEMPTED REORG REVERTING FINALITY (Genesis): Rejected chain tip {}.", hash);
+                bail!("Irreversibility Violation: Fork reverts a CDF-finalized block.");
+            }
+            self.calculate_synergistic_work(&mut block);
+            block.total_work = block.synergistic_work;
+        } else {
+            let prev = self.get_block(&block.header.prev_blockhash).ok_or(anyhow!("Orphan block"))?;
+            self.calculate_synergistic_work(&mut block);
+            block.total_work = prev.total_work + block.synergistic_work;
+        }
+
         self.blocks_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
         if block.total_work > self.total_work {
             if block.header.prev_blockhash != self.tip { self.handle_reorganization(hash)?; }
@@ -511,6 +529,12 @@ impl Blockchain {
 
     fn handle_reorganization(&mut self, new_block_hash: sha256d::Hash) -> Result<()> {
         let ancestor = self.find_common_ancestor(self.tip, new_block_hash)?;
+        if let Some(finalized) = self.last_finalized_checkpoint {
+            if !self.is_block_in_path(finalized, new_block_hash)? {
+                log::warn!("🚨 ATTEMPTED REORG REVERTING FINALITY: Rejected chain tip {}.", new_block_hash);
+                bail!("Irreversibility Violation: Fork reverts a CDF-finalized block.");
+            }
+        }
         let mut curr = self.tip;
         while curr != ancestor { let block = self.get_block(&curr).ok_or(anyhow!("Reorg fail"))?; self.rollback_utxo_set(&block)?; curr = block.header.prev_blockhash; }
         let mut curr = new_block_hash;
@@ -519,6 +543,16 @@ impl Blockchain {
         for block in new_path.into_iter().rev() { self.update_utxo_set(&block)?; }
         self.tip = new_block_hash;
         Ok(())
+    }
+
+    fn is_block_in_path(&self, target: sha256d::Hash, tip: sha256d::Hash) -> Result<bool> {
+        let mut curr = tip;
+        while curr != sha256d::Hash::all_zeros() {
+            if curr == target { return Ok(true); }
+            let block = self.get_block(&curr).ok_or(anyhow!("Ancestry missing"))?;
+            curr = block.header.prev_blockhash;
+        }
+        Ok(false)
     }
 
     fn rollback_utxo_set(&mut self, block: &Block) -> Result<()> {
@@ -623,7 +657,7 @@ impl Blockchain {
             let current_weight = self.veto_manager.weight.entry(hash).or_default();
             *current_weight += stake;
             if *current_weight >= (self.total_staked * VETO_THRESHOLD_PERCENT / 100) {
-                info!("⚠️ BLOCK VETOED: {} blacklisted.", hash);
+                log::info!("⚠️ BLOCK VETOED: {} blacklisted.", hash);
                 self.veto_manager.blacklisted_blocks.insert(hash);
                 self.metrics.orphan_count += 1;
             }
