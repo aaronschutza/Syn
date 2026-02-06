@@ -85,7 +85,7 @@ pub async fn start_server(
                     let mut subnets = active_subnets.lock().await;
                     let count = *subnets.get(&subnet).unwrap_or(&0);
                     
-                    if count >= 4 { continue; } 
+                    if count >= 6 { continue; } 
                     if peer_manager.lock().await.is_banned(&addr) { continue; }
 
                     subnets.insert(subnet.clone(), count + 1);

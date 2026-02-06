@@ -55,6 +55,8 @@ for ($i = 1; $i -le $numMiners; $i++) {
     $configContent = $configContent -replace 'wallet_file = ".*"', "wallet_file = `"$walletPath`""
     $configContent = $configContent -replace 'bootstrap_nodes = .*', "bootstrap_nodes = $bootstrapStr"
     $configContent = $configContent -replace 'coinbase_maturity = \d+', 'coinbase_maturity = 1'
+    # Reduce reconnect delay for faster testnet convergence
+    $configContent = $configContent -replace 'reconnect_delay_secs = \d+', 'reconnect_delay_secs = 5'
     
     $nodeConfigFile = Join-Path -Path $nodeDir -ChildPath "config.toml"
     Set-Content -Path $nodeConfigFile -Value $configContent
@@ -83,6 +85,8 @@ for ($i = 1; $i -le $numStakers; $i++) {
     $configContent = $configContent -replace 'wallet_file = ".*"', "wallet_file = `"$walletPath`""
     $configContent = $configContent -replace 'bootstrap_nodes =.*', "bootstrap_nodes = $bootstrapNodesStr"
     $configContent = $configContent -replace 'coinbase_maturity = \d+', 'coinbase_maturity = 1'
+    # Reduce reconnect delay for faster testnet convergence
+    $configContent = $configContent -replace 'reconnect_delay_secs = \d+', 'reconnect_delay_secs = 5'
     
     $nodeConfigFile = Join-Path -Path $nodeDir -ChildPath "config.toml"
     Set-Content -Path $nodeConfigFile -Value $configContent
@@ -117,7 +121,6 @@ $miner1ConfigFile = Join-Path -Path $miner1NodeDir -ChildPath "config.toml"
 
 # Construct the command for Miner 1 to run in a separate visible window
 # We use Tee-Object to display logs live in the window AND save them to node.log
-# Removed -Encoding UTF8 for compatibility with PowerShell 5.1
 $miner1Cmd = "Set-Location '$miner1NodeDir'; & '$nodeBin' --config '$miner1ConfigFile' start-node --mode miner --mine-to-address '$miner1Address' 2>&1 | Tee-Object -FilePath 'node.log'"
 
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "$miner1Cmd"
@@ -166,8 +169,14 @@ for ($i = 1; $i -le $numStakers; $i++) {
     while ((Get-ChainHeight -port 20001) -le $h) { Start-Sleep -Seconds 3 }
 }
 
-Write-Host "Starting staker nodes..."
-for ($i = 1; $i -le $numStakers; $i++) {
+Write-Host "Starting Staker 1 in a new window..."
+$staker1NodeDir = Join-Path -Path $testnetDir -ChildPath "staker1"
+$staker1ConfigFile = Join-Path -Path $staker1NodeDir -ChildPath "config.toml"
+$staker1Cmd = "Set-Location '$staker1NodeDir'; & '$nodeBin' --config '$staker1ConfigFile' start-node --mode staker 2>&1 | Tee-Object -FilePath 'node.log'"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "$staker1Cmd"
+
+Write-Host "Starting remaining staker nodes..."
+for ($i = 2; $i -le $numStakers; $i++) {
     $dir = Join-Path -Path $testnetDir -ChildPath "staker$i"
     $conf = Join-Path -Path $dir -ChildPath "config.toml"
     # Background jobs for stakers
