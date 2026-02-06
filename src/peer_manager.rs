@@ -1,7 +1,7 @@
 // src/peer_manager.rs - Overhauled Peer Rotation and Churn Logic
 
 use crate::config::P2PConfig;
-use log::{info, warn, debug};
+use log::{info, warn};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -107,6 +107,11 @@ impl PeerManager {
 
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// Returns the addresses of all currently connected peers.
+    pub fn get_active_addresses(&self) -> Vec<SocketAddr> {
+        self.peers.keys().cloned().collect()
     }
 
     /// Returns a candidate for eviction to facilitate network churn.
