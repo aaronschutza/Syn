@@ -117,10 +117,15 @@ async fn main() -> Result<()> {
             )?));
 
             let peer_manager = Arc::new(Mutex::new(peer_manager::PeerManager::new(p2p_config.clone())));
-            let (p2p_tx, _p2p_rx) = mpsc::channel::<P2PMessage>(CHANNEL_CAPACITY);
-            let (broadcast_tx, _) = broadcast::channel::<P2PMessage>(CHANNEL_CAPACITY);
-            let (_btc_p2p_tx, btc_p2p_rx) = mpsc::channel::<BtcP2PMessage>(CHANNEL_CAPACITY);
+            
+            // Channels
+            // to_consensus_tx: P2P -> Consensus (Blocks, Beacons, Votes, incoming txs)
             let (to_consensus_tx, consensus_rx) = mpsc::channel(CHANNEL_CAPACITY);
+            // broadcast_tx: Consensus/RPC -> P2P (Outbound gossiping)
+            let (broadcast_tx, _) = broadcast::channel::<P2PMessage>(CHANNEL_CAPACITY);
+            // btc_p2p: Bridge communication
+            let (_btc_p2p_tx, btc_p2p_rx) = mpsc::channel::<BtcP2PMessage>(CHANNEL_CAPACITY);
+            // shutdown
             let (shutdown_tx, _) = broadcast::channel(1);
 
             let consensus_handle = tokio::spawn(consensus::start_consensus_loop(
@@ -144,10 +149,14 @@ async fn main() -> Result<()> {
                 shutdown_tx.subscribe(),
             ));
             
+            // RPC Server needs:
+            // - Access to P2P tx channel to broadcast new transactions (send, faucet)
+            // - Previously we passed a useless MPSC channel. Now we pass the Broadcast sender.
+            // - We removed `p2p_tx` MPSC entirely as it wasn't connected to P2P.
             let rpc_handle = tokio::spawn(rpc::start_rpc_server(
                 bc.clone(),
                 spv_client.clone(),
-                p2p_tx,
+                broadcast_tx.clone(), // Corrected: Broadcast Sender
                 governance_params.clone(),
                 progonos_config.clone(),
                 node_config.clone(),

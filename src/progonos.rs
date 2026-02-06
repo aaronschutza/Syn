@@ -111,6 +111,7 @@ fn verify_merkle_proof(txid: &Txid, merkle_proof: &[u8], header: &BitcoinHeader)
 }
 
 /// Verifies a Bitcoin deposit proof and mints the corresponding amount of sBTC.
+/// RETURNS: The created mint transaction so it can be broadcast.
 pub async fn verify_and_mint_sbtc(
     bc: &mut Blockchain,
     spv_client: &SpvClient,
@@ -118,7 +119,7 @@ pub async fn verify_and_mint_sbtc(
     mint_to_address: String,
     amount: u64,
     progonos_config: &ProgonosConfig,
-) -> Result<(), String> {
+) -> Result<Transaction, String> {
 
     let (tx_block_height, btc_header) = match spv_client.get_header_by_hash(&proof.btc_block_hash) {
         Some((height, header)) => (height, header),
@@ -144,8 +145,8 @@ pub async fn verify_and_mint_sbtc(
         vout: vec![TxOut::new(amount, mint_to_address)],
         lock_time: 0,
     };
-    bc.mempool.insert(mint_tx.id(), mint_tx);
-    Ok(())
+    bc.mempool.insert(mint_tx.id(), mint_tx.clone());
+    Ok(mint_tx)
 }
 
 /// Creates a partially signed Bitcoin transaction (PSBT) for a withdrawal.
@@ -170,4 +171,3 @@ pub fn create_withdrawal_transaction(
 
     Ok(general_purpose::STANDARD.encode(psbt.serialize()))
 }
-

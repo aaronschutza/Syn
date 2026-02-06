@@ -37,7 +37,10 @@ fn f_delta(delta: u64, f_a: Fixed, psi: u32, gamma: u32) -> Fixed {
 pub fn is_eligible_to_stake(wallet: &Wallet, bc: &Blockchain, current_slot: u64) -> Option<([u8; 64], u64)> {
     let last_block = bc.get_block(&bc.tip)?;
     let parent_slot = last_block.header.time as u64;
+    
+    // Ensure we are ahead of the tip
     if current_slot <= parent_slot { return None; }
+    
     let delta = current_slot - parent_slot;
 
     let mut seed_data = Vec::new();
@@ -48,9 +51,14 @@ pub fn is_eligible_to_stake(wallet: &Wallet, bc: &Blockchain, current_slot: u64)
     let (y, pi) = vrf_eval(seed_msg.as_ref(), &wallet.secret_key);
     let f_d = f_delta(delta, bc.ldd_state.f_a_pos, bc.ldd_state.current_psi, bc.ldd_state.current_gamma);
 
-    let total_stake = Fixed::from_integer(bc.total_staked);
+    // FIXED: Use the staking module as the source of truth for total bonded supply
+    let total_bonded_supply = bc.consensus_engine.staking_module.get_total_bonded_supply() as u64;
+    let total_stake = Fixed::from_integer(total_bonded_supply);
+    
     if total_stake.0 == 0 { return None; }
-    let alpha_i = Fixed::from_integer(wallet.stake_info.as_ref().map_or(0, |s| s.amount)) / total_stake;
+    
+    let amount = wallet.stake_info.as_ref().map_or(0, |s| s.amount);
+    let alpha_i = Fixed::from_integer(amount) / total_stake;
 
     let phi = match bc.consensus_params.pos_precision.as_str() {
         "test" => Fixed::from_f64(0.99),

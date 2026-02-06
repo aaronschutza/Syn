@@ -289,7 +289,8 @@ mod tests {
         {
             let mut bc_lock = bc_arc.lock().await;
             bc_lock.total_staked = stake_amount;
-            // FIXED: Removed call to non-existent field bootstrap_phase_complete
+            // FIXED: Explicitly process the stake in the StakingModule so it is visible to pos::is_eligible_to_stake
+            bc_lock.consensus_engine.staking_module.process_stake(staker_address.clone(), stake_amount as u128).unwrap();
         }
 
         let mut pow_blocks_produced = 0;

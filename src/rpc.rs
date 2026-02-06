@@ -1,6 +1,15 @@
 // src/rpc.rs - Fixed syntax, filter arguments, and allowed unauthed print_chain
 
-use crate::{blockchain::Blockchain, config::{GovernanceConfig, NodeConfig, ProgonosConfig}, governance::{Proposal, ProposalPayload}, p2p::P2PMessage, progonos, transaction::{Transaction, TxIn, TxOut}, wallet};
+use crate::{
+    blockchain::Blockchain, 
+    config::{GovernanceConfig, NodeConfig, ProgonosConfig}, 
+    governance::{Proposal, ProposalPayload}, 
+    p2p::P2PMessage, 
+    progonos, 
+    transaction::{Transaction, TxIn, TxOut}, 
+    wallet::{self, Wallet}, 
+    stk_module::StakeInfo,
+};
 use anyhow::Result;
 use bitcoin::{Address, BlockHash, Txid};
 use log::{info, warn};
@@ -8,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, Mutex};
 use warp::{http::StatusCode, Filter, Rejection, Reply};
 use bitcoin_hashes::{sha256d, Hash};
 
@@ -75,7 +84,7 @@ async fn handle_request(
     req: RpcRequest,
     blockchain: Arc<Mutex<Blockchain>>,
     spv_client: Arc<Mutex<progonos::SpvClient>>,
-    p2p_tx: mpsc::Sender<P2PMessage>,
+    p2p_tx: broadcast::Sender<P2PMessage>, // CHANGED: mpsc -> broadcast
     governance_config: Arc<GovernanceConfig>,
     progonos_config: Arc<ProgonosConfig>,
     node_config: Arc<NodeConfig>,
@@ -106,13 +115,13 @@ async fn handle_request(
         "get_block" => get_block(req, blockchain).await,
         "get_transaction" => get_transaction(req, blockchain).await,
         "get_mempool_info" => get_mempool_info(req, blockchain).await,
-        "initiate_withdrawal" => initiate_withdrawal(req, blockchain, node_config, progonos_config).await,
-        "submit_deposit_proof" => submit_deposit_proof(req, blockchain, spv_client, node_config, progonos_config).await,
+        "initiate_withdrawal" => initiate_withdrawal(req, blockchain, p2p_tx, node_config, progonos_config).await, // Passed p2p_tx
+        "submit_deposit_proof" => submit_deposit_proof(req, blockchain, spv_client, p2p_tx, node_config, progonos_config).await, // Passed p2p_tx
         "create_proposal" => create_proposal(req, blockchain, node_config, governance_config).await,
         "list_proposals" => list_proposals(req, blockchain).await,
         "vote" => vote(req, blockchain, node_config).await,
-        "faucet" => faucet_coins(req, blockchain).await,
-        "stake" => rpc_stake(req, blockchain).await,
+        "faucet" => faucet_coins(req, blockchain, p2p_tx).await, // Passed p2p_tx
+        "stake" => rpc_stake(req, blockchain, node_config).await,
         _ => Ok(Box::new(warp::reply::json(&RpcError {
             jsonrpc: "2.0".to_string(),
             error: json!({"code": -32601, "message": "Method not found"}),
@@ -121,25 +130,43 @@ async fn handle_request(
     }
 }
 
-async fn rpc_stake(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -> RpcResult {
+async fn rpc_stake(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, node_config: Arc<NodeConfig>) -> RpcResult {
     if req.params.len() != 2 {
         return create_error_reply(req.id, -32602, "Invalid params: expected [asset, amount]");
     }
-    let _asset = req.params[0].as_str().unwrap_or("SYN");
+    let asset = req.params[0].as_str().unwrap_or("SYN").to_string();
     let amount = match req.params[1].as_u64() {
         Some(n) => n,
         None => return create_error_reply(req.id, -32602, "Amount must be integer"),
     };
 
-    let _bc = blockchain.lock().await;
-    Ok(Box::new(warp::reply::json(&RpcResponse {
-        jsonrpc: "2.0".to_string(),
-        result: json!(format!("Stake of {} SYN processed internally.", amount)),
-        id: req.id,
-    })))
+    // 1. Update Wallet File (so pos.rs knows we are staking)
+    let mut wallet = match Wallet::load_from_file(&node_config) {
+        Ok(w) => w,
+        Err(e) => return create_error_reply(req.id, -1, &format!("Wallet load error: {}", e)),
+    };
+    
+    wallet.stake_info = Some(StakeInfo { asset, amount });
+    if let Err(e) = wallet.save_to_file(&node_config) {
+        return create_error_reply(req.id, -1, &format!("Wallet save error: {}", e));
+    }
+
+    // 2. Update Chain State (so eligibility math works)
+    let bc = blockchain.lock().await;
+    match bc.consensus_engine.staking_module.process_stake(wallet.get_address(), amount as u128) {
+        Ok(_) => {
+            info!("Stake registered: {} SYN for {}", amount, wallet.get_address());
+            Ok(Box::new(warp::reply::json(&RpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: json!(format!("Stake of {} SYN processed and wallet updated.", amount)),
+                id: req.id,
+            })))
+        },
+        Err(e) => create_error_reply(req.id, -1, &format!("Staking failed: {}", e)),
+    }
 }
 
-async fn faucet_coins(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -> RpcResult {
+async fn faucet_coins(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, p2p_tx: broadcast::Sender<P2PMessage>) -> RpcResult {
     if req.params.len() != 2 {
         return create_error_reply(req.id, -32602, "Invalid params: expected [address, amount]");
     }
@@ -177,6 +204,12 @@ async fn faucet_coins(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -> Rp
     let txid = faucet_tx.id();
     
     bc_lock.mempool.insert(txid, faucet_tx.clone());
+    
+    // GOSSIP THE FAUCET TX
+    if p2p_tx.send(P2PMessage::NewTransaction(faucet_tx)).is_err() {
+        warn!("Failed to broadcast faucet transaction");
+    }
+
     info!("Faucet dispensed {} coins to {}. TXID: {}", amount, to_address, txid);
 
     Ok(Box::new(warp::reply::json(&RpcResponse {
@@ -217,7 +250,7 @@ async fn get_balance(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -> Rpc
     })))
 }
 
-async fn send(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, p2p_tx: mpsc::Sender<P2PMessage>, node_config: Arc<NodeConfig>) -> RpcResult {
+async fn send(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, p2p_tx: broadcast::Sender<P2PMessage>, node_config: Arc<NodeConfig>) -> RpcResult {
     if req.params.len() != 2 {
         return create_error_reply(req.id, -32602, "Invalid params: expected [to_address, amount]");
     }
@@ -242,7 +275,9 @@ async fn send(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, p2p_tx: mpsc:
             let txid = tx.id();
             bc_lock.mempool.insert(txid, tx.clone());
             
-            if p2p_tx.send(P2PMessage::NewTransaction(tx)).await.is_err() {
+            // Broadcast::send returns the number of receivers, or error if channel closed.
+            // We ignore the count.
+            if p2p_tx.send(P2PMessage::NewTransaction(tx)).is_err() {
                  warn!("Failed to broadcast transaction to P2P network");
                  return create_error_reply(req.id, -1, "Failed to broadcast transaction to P2P network");
             }
@@ -321,7 +356,7 @@ async fn get_mempool_info(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -
     })))
 }
 
-async fn initiate_withdrawal(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, node_config: Arc<NodeConfig>, _progonos_config: Arc<ProgonosConfig>) -> RpcResult {
+async fn initiate_withdrawal(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, p2p_tx: broadcast::Sender<P2PMessage>, node_config: Arc<NodeConfig>, _progonos_config: Arc<ProgonosConfig>) -> RpcResult {
     let btc_address_str = req.params.get(0).and_then(|v| v.as_str()).unwrap_or_default();
     let amount = req.params.get(1).and_then(|v| v.as_u64()).unwrap_or_default();
 
@@ -342,6 +377,11 @@ async fn initiate_withdrawal(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>
     let txid = burn_tx.id();
     bc_lock.mempool.insert(txid, burn_tx.clone());
 
+    // GOSSIP
+    if p2p_tx.send(P2PMessage::NewTransaction(burn_tx)).is_err() {
+        warn!("Failed to broadcast withdrawal transaction");
+    }
+
     info!("Withdrawal initiated. Burn transaction {} broadcast.", txid);
     Ok(Box::new(warp::reply::json(&RpcResponse {
         jsonrpc: "2.0".to_string(),
@@ -354,7 +394,7 @@ async fn initiate_withdrawal(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>
 }
 
 
-async fn submit_deposit_proof(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, spv_client: Arc<Mutex<progonos::SpvClient>>, node_config: Arc<NodeConfig>, progonos_config: Arc<ProgonosConfig>) -> RpcResult {
+async fn submit_deposit_proof(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, spv_client: Arc<Mutex<progonos::SpvClient>>, p2p_tx: broadcast::Sender<P2PMessage>, node_config: Arc<NodeConfig>, progonos_config: Arc<ProgonosConfig>) -> RpcResult {
     let btc_txid_str = req.params.get(0).and_then(|v| v.as_str()).unwrap_or_default();
     let btc_block_hash_str = req.params.get(1).and_then(|v| v.as_str()).unwrap_or_default();
     let merkle_proof_str = req.params.get(2).and_then(|v| v.as_str()).unwrap_or_default();
@@ -385,11 +425,18 @@ async fn submit_deposit_proof(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>
     let mint_to_address = wallet.get_address();
 
     match progonos::verify_and_mint_sbtc(&mut bc, &spv, proof, mint_to_address, amount, &progonos_config).await {
-        Ok(_) => Ok(Box::new(warp::reply::json(&RpcResponse {
-            jsonrpc: "2.0".to_string(),
-            result: json!("sBTC minting transaction created and sent to mempool."),
-            id: req.id,
-        }))),
+        Ok(mint_tx) => {
+            // GOSSIP MINT TX
+            if p2p_tx.send(P2PMessage::NewTransaction(mint_tx)).is_err() {
+                warn!("Failed to broadcast mint transaction");
+            }
+            
+            Ok(Box::new(warp::reply::json(&RpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: json!("sBTC minting transaction created and sent to mempool."),
+                id: req.id,
+            })))
+        },
         Err(e) => create_error_reply(req.id, -1, &e.to_string()),
     }
 }
@@ -443,7 +490,7 @@ async fn vote(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, node_config: 
 pub async fn start_rpc_server(
     blockchain: Arc<Mutex<Blockchain>>,
     spv_client: Arc<Mutex<progonos::SpvClient>>,
-    p2p_tx: mpsc::Sender<P2PMessage>,
+    p2p_tx: broadcast::Sender<P2PMessage>, // CHANGED: mpsc -> broadcast
     governance_config: Arc<GovernanceConfig>,
     progonos_config: Arc<ProgonosConfig>,
     node_config: Arc<NodeConfig>,
