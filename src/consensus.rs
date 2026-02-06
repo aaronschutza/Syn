@@ -5,7 +5,7 @@ use crate::{
     blockchain::Blockchain, 
     config::NodeConfig, 
     p2p::P2PMessage, 
-    transaction::TxOut, 
+    transaction::{Transaction, TxOut}, // FIXED: Import Transaction
     wallet::Wallet,
     crypto::{hash_pubkey, address_from_pubkey_hash},
     cdf::Color,
@@ -64,7 +64,20 @@ pub async fn start_consensus_loop(
                     let delta = now.saturating_sub(last_block_time);
                     if delta >= bc_lock.ldd_state.current_psi {
                         let reward = bc_lock.consensus_params.coinbase_reward;
-                        if let Ok(mut block) = bc_lock.create_block_template(vec![], 1) {
+                        
+                        // FIX: Retrieve txs from mempool and create proper coinbase
+                        let mempool_txs = bc_lock.get_mempool_txs();
+                        let coinbase = Transaction::new_coinbase(
+                            "Mined by Synergeia".to_string(),
+                            wallet.get_address(),
+                            reward,
+                            bc_lock.consensus_params.transaction_version
+                        );
+                        
+                        let mut txs = vec![coinbase];
+                        txs.extend(mempool_txs);
+
+                        if let Ok(mut block) = bc_lock.create_block_template(txs, 1) {
                             // Fix E0502: Clone beacons into local variable to separate borrows
                             let beacons = block.beacons.clone();
                             apply_beacon_rewards(&mut block, reward, &beacons);

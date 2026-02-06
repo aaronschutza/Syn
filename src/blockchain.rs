@@ -511,6 +511,12 @@ impl Blockchain {
         if block.total_work > self.total_work {
             if block.header.prev_blockhash != self.tip { self.handle_reorganization(hash)?; }
             else { self.tip = hash; self.update_utxo_set(&block)?; }
+            
+            // Clean mempool: Remove transactions that are included in this new block
+            for tx in &block.transactions {
+                self.mempool.remove(&tx.id());
+            }
+
             self.total_work = block.total_work;
             self.headers.push(block.header.clone());
             self.dcs.process_beacons(&block.beacons);
@@ -627,7 +633,11 @@ impl Blockchain {
         bail!("No common ancestor")
     }
 
-    pub fn get_mempool_txs(&mut self) -> Vec<Transaction> { let txs = self.mempool.values().cloned().collect(); self.mempool.clear(); txs }
+    // UPDATED: Now returns cloned transactions WITHOUT clearing the mempool.
+    // This allows repeated mining attempts on the same transactions if mining fails.
+    pub fn get_mempool_txs(&mut self) -> Vec<Transaction> { 
+        self.mempool.values().cloned().collect()
+    }
 
     pub fn adjust_ldd(&mut self) {
         let consensus_values = self.dcs.calculate_consensus();
