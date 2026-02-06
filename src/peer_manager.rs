@@ -1,4 +1,4 @@
-// src/peer_manager.rs - Reputation-based protection against network attacks
+// src/peer_manager.rs - Overhauled Peer Rotation and Churn Logic
 
 use crate::config::P2PConfig;
 use log::{info, warn, debug};
@@ -7,15 +7,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Represents a single peer in the network with reputation tracking.
+/// Represents a single peer in the network with reputation and connection metadata.
 pub struct Peer {
     pub score: i32,
     pub banned_until: Option<Instant>,
     pub last_seen: Instant,
+    pub connected_at: Instant,
     pub is_outbound: bool,
 }
 
-/// Manages reputation and connection hygiene to mitigate Eclipse and DoS attacks.
 pub struct PeerManager {
     peers: HashMap<SocketAddr, Peer>,
     config: Arc<P2PConfig>,
@@ -31,12 +31,14 @@ impl PeerManager {
         }
     }
 
-    /// Records a new connection and initializes score.
+    /// Records a new connection and initializes score and connection time.
     pub fn on_connect(&mut self, addr: SocketAddr, is_outbound: bool) {
+        let now = Instant::now();
         self.peers.entry(addr).or_insert(Peer {
             score: self.config.initial_score,
             banned_until: None,
-            last_seen: Instant::now(),
+            last_seen: now,
+            connected_at: now,
             is_outbound,
         });
         if is_outbound {
@@ -44,40 +46,38 @@ impl PeerManager {
         }
     }
 
-    /// Records a disconnection.
+    /// Records a disconnection and updates outbound counts.
     pub fn on_disconnect(&mut self, addr: &SocketAddr) {
-        if let Some(peer) = self.peers.get(addr) {
+        if let Some(peer) = self.peers.remove(addr) {
             if peer.is_outbound {
                 self.outbound_count = self.outbound_count.saturating_sub(1);
             }
         }
     }
 
-    /// Report misbehavior (e.g., sending invalid blocks, script failures).
     pub fn report_misbehavior(&mut self, addr: SocketAddr, penalty: i32) {
         let peer = self.peers.entry(addr).or_insert(Peer {
             score: self.config.initial_score,
             banned_until: None,
             last_seen: Instant::now(),
+            connected_at: Instant::now(),
             is_outbound: false,
         });
 
         peer.score -= penalty;
-        warn!("Peer {} misbehaved (-{}). Current score: {}", addr, penalty, peer.score);
+        warn!("Peer {} misbehaved (-{}). Score: {}", addr, penalty, peer.score);
 
         if peer.score <= self.config.ban_threshold {
             let duration = Duration::from_secs(self.config.ban_duration_secs);
-            info!("Banning peer {} for {} seconds due to low score.", addr, duration.as_secs());
+            info!("Banning peer {} for {}s.", addr, duration.as_secs());
             peer.banned_until = Some(Instant::now() + duration);
         }
     }
 
-    /// Reward good behavior (e.g., providing a valid block tip).
     pub fn reward_peer(&mut self, addr: &SocketAddr, reward: i32) {
         if let Some(peer) = self.peers.get_mut(addr) {
-            peer.score = (peer.score + reward).min(200); // Cap score at 200
+            peer.score = (peer.score + reward).min(200);
             peer.last_seen = Instant::now();
-            debug!("Peer {} rewarded (+{}). New score: {}", addr, reward, peer.score);
         }
     }
 
@@ -87,7 +87,6 @@ impl PeerManager {
                 if Instant::now() < banned_until {
                     return true;
                 } else {
-                    info!("Ban expired for peer {}. Resetting reputation.", addr);
                     peer.banned_until = None;
                     peer.score = self.config.initial_score;
                 }
@@ -96,8 +95,34 @@ impl PeerManager {
         false
     }
 
-    /// Returns whether the node should attempt more outbound connections.
+    /// Synergeia Overhaul: Target 4 outbound peers for ideal network density.
     pub fn needs_outbound(&self) -> bool {
-        self.outbound_count < 8 // Target 8 stable outbound peers
+        self.outbound_count < 4
+    }
+
+    /// Synergeia Overhaul: Max total peers allowed is 6.
+    pub fn can_accept_inbound(&self) -> bool {
+        self.peers.len() < 6
+    }
+
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Returns a candidate for eviction to facilitate network churn.
+    /// Prioritizes peers with the lowest score, then oldest peers if scores are tied.
+    pub fn get_eviction_candidate(&self) -> Option<SocketAddr> {
+        if self.peers.is_empty() { return None; }
+        
+        let mut candidates: Vec<_> = self.peers.iter()
+            .map(|(addr, peer)| (addr, peer.score, peer.connected_at))
+            .collect();
+
+        // Sort by score ascending, then by age (older first)
+        candidates.sort_by(|a, b| {
+            a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2))
+        });
+
+        candidates.first().map(|(addr, _, _)| **addr)
     }
 }

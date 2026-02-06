@@ -1,4 +1,4 @@
-// src/p2p.rs - Robust Headers-First Synchronization with Type Annotations
+// src/p2p.rs - Robust Headers-First Synchronization with Peer Churn logic
 
 use crate::config::{ConsensusConfig, NodeConfig, P2PConfig};
 use crate::{
@@ -10,7 +10,7 @@ use crate::{
 };
 use anyhow::Result;
 use bitcoin_hashes::{sha256d, Hash}; 
-use log::{info, debug}; 
+use log::{info, debug, warn}; 
 use serde::{Serialize, Deserialize};
 use std::net::{SocketAddr, IpAddr};
 use std::sync::Arc;
@@ -18,6 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream}; 
 use tokio::sync::{broadcast, mpsc, Mutex};
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum P2PMessage {
@@ -55,33 +56,60 @@ pub async fn start_server(
 ) -> Result<()> {
     let listener_addr = format!("0.0.0.0:{}", node_config.p2p_port);
     let listener = TcpListener::bind(&listener_addr).await?;
-    info!("Synergeia P2P server active on {} [Headers-First Sync]", listener_addr);
+    info!("Synergeia P2P server active on {} [Target: 4, Max: 6]", listener_addr);
 
     let active_subnets: Arc<Mutex<HashMap<Vec<u8>, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    
+    // Local channel to trigger disconnections for churn/rotation
+    let (disconnect_tx, _) = broadcast::channel::<SocketAddr>(16);
 
     tokio::spawn(start_client(
         blockchain.clone(), to_consensus_tx.clone(), broadcast_tx.clone(),
         peer_manager.clone(), active_subnets.clone(), consensus_config.clone(), p2p_config.clone(),
-        node_config.clone() 
+        node_config.clone(), disconnect_tx.clone(),
     ));
+
+    // --- Overhaul: Peer Churn Monitor ---
+    // Periodic eviction ensures the node connects to different parts of the network over time.
+    let pm_churn = peer_manager.clone();
+    let dc_churn = disconnect_tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300)); // Rotate every 5 minutes
+        loop {
+            interval.tick().await;
+            let pm = pm_churn.lock().await;
+            if pm.peer_count() >= 4 {
+                if let Some(addr) = pm.get_eviction_candidate() {
+                    info!("Sync: Churning network. Rotating peer {} to facilitate bootstrapping.", addr);
+                    let _ = dc_churn.send(addr);
+                }
+            }
+        }
+    });
 
     loop {
         tokio::select! {
             res = listener.accept() => {
                 if let Ok((socket, addr)) = res {
+                    let mut pm = peer_manager.lock().await;
+                    if !pm.can_accept_inbound() || pm.is_banned(&addr) {
+                        continue;
+                    }
+
                     let subnet = get_subnet_id(addr.ip());
                     let mut subnets = active_subnets.lock().await;
                     let count = *subnets.get(&subnet).unwrap_or(&0);
-                    
-                    if count >= 6 || peer_manager.lock().await.is_banned(&addr) { continue; }
+                    if count >= 2 { continue; } // Limit peers per subnet for network health
 
                     subnets.insert(subnet.clone(), count + 1);
-                    peer_manager.lock().await.on_connect(addr, false);
+                    pm.on_connect(addr, false);
+                    drop(pm);
                     
                     tokio::spawn(handle_connection(
                         socket, addr, subnet, active_subnets.clone(), 
                         blockchain.clone(), to_consensus_tx.clone(),
                         broadcast_tx.subscribe(), peer_manager.clone(), p2p_config.clone(),
+                        disconnect_tx.subscribe(),
                     ));
                 }
             }
@@ -101,11 +129,11 @@ async fn handle_connection(
     mut broadcast_rx: broadcast::Receiver<P2PMessage>,
     peer_manager: Arc<Mutex<PeerManager>>,
     p2p_config: Arc<P2PConfig>,
+    mut disconnect_rx: broadcast::Receiver<SocketAddr>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(socket);
     let (peer_tx, mut peer_rx) = mpsc::channel::<P2PMessage>(100);
 
-    // Initial Handshake
     {
         let bc = blockchain.lock().await;
         let height = bc.headers.len() as u32;
@@ -131,7 +159,15 @@ async fn handle_connection(
     let read_task = tokio::spawn(async move {
         loop {
             let mut size_buf = [0u8; 4];
-            if reader.read_exact(&mut size_buf).await.is_err() { break; }
+            let read_res = tokio::select! {
+                res = reader.read_exact(&mut size_buf) => res,
+                Ok(target_addr) = disconnect_rx.recv() => {
+                    if target_addr == addr { break; } // Terminate connection for churn
+                    continue;
+                }
+            };
+
+            if read_res.is_err() { break; }
             let size = u32::from_be_bytes(size_buf) as usize;
             if size > p2p_config.max_message_size { break; }
 
@@ -145,9 +181,7 @@ async fn handle_connection(
                             let b = bc.lock().await; 
                             (b.headers.len() as u32, b.get_block_locator())
                         };
-                        
                         if peer_height > local_height {
-                            debug!("Sync: Peer {} height {} > local {}. Fetching headers...", addr, peer_height, local_height);
                             let _ = peer_tx.send(P2PMessage::GetHeaders { 
                                 version: 1, 
                                 block_locator_hashes: locator, 
@@ -156,10 +190,8 @@ async fn handle_connection(
                         }
                         let _ = peer_tx.send(P2PMessage::Verack).await;
                     }
-
                     P2PMessage::GetHeaders { block_locator_hashes, .. } => {
                         let b = bc.lock().await;
-                        // Find common ancestor based on locator
                         let mut start_idx = 0;
                         for hash in block_locator_hashes {
                             if let Some(pos) = b.headers.iter().position(|h| h.hash() == hash) {
@@ -167,37 +199,26 @@ async fn handle_connection(
                                 break;
                             }
                         }
-                        
                         let headers: Vec<BlockHeader> = b.headers.iter()
-                            .skip(start_idx)
-                            .take(2000) // standard Bitcoin header limit
-                            .cloned()
-                            .collect();
-                        
+                            .skip(start_idx).take(2000).cloned().collect();
                         let _ = peer_tx.send(P2PMessage::Headers(headers)).await;
                     }
-
                     P2PMessage::Headers(headers) => {
                         if headers.is_empty() { continue; }
-                        info!("Sync: Received {} headers from {}. Validating...", headers.len(), addr);
-                        
                         let mut missing_bodies = Vec::new();
                         {
                             let b = bc.lock().await;
                             for header in &headers {
                                 let hash = header.hash();
-                                // FIX: Use explicit type cast to resolve AsRef ambiguity
                                 if !b.blocks_tree.contains_key(hash.as_ref() as &[u8]).unwrap_or(false) {
                                     missing_bodies.push(hash);
                                 }
                             }
                         }
-
                         if !missing_bodies.is_empty() {
                             let _ = peer_tx.send(P2PMessage::GetData { hashes: missing_bodies }).await;
                         }
                     }
-
                     P2PMessage::GetData { hashes } => {
                         let b = bc.lock().await;
                         for hash in hashes {
@@ -206,11 +227,9 @@ async fn handle_connection(
                             }
                         }
                     }
-
                     P2PMessage::NewBlock(block) => {
                         let _ = to_consensus_tx.send(P2PMessage::NewBlock(block)).await;
                     }
-
                     _ => { let _ = to_consensus_tx.send(msg).await; }
                 }
             }
@@ -237,14 +256,15 @@ fn get_subnet_id(addr: IpAddr) -> Vec<u8> {
 }
 
 async fn start_client(
-    _bc: Arc<Mutex<Blockchain>>,
-    _to_consensus_tx: mpsc::Sender<P2PMessage>,
-    _broadcast_tx: broadcast::Sender<P2PMessage>,
+    blockchain: Arc<Mutex<Blockchain>>,
+    to_consensus_tx: mpsc::Sender<P2PMessage>,
+    broadcast_tx: broadcast::Sender<P2PMessage>,
     peer_manager: Arc<Mutex<PeerManager>>,
     active_subnets: Arc<Mutex<HashMap<Vec<u8>, usize>>>,
     consensus_config: Arc<ConsensusConfig>,
     p2p_config: Arc<P2PConfig>,
     node_config: Arc<NodeConfig>, 
+    disconnect_tx: broadcast::Sender<SocketAddr>,
 ) {
     loop {
         if peer_manager.lock().await.needs_outbound() {
@@ -256,13 +276,14 @@ async fn start_client(
                         peer_manager.lock().await.on_connect(addr, true);
                         tokio::spawn(handle_connection(
                             socket, addr, get_subnet_id(addr.ip()), active_subnets.clone(),
-                            _bc.clone(), _to_consensus_tx.clone(),
-                            _broadcast_tx.subscribe(), peer_manager.clone(), p2p_config.clone(),
+                            blockchain.clone(), to_consensus_tx.clone(),
+                            broadcast_tx.subscribe(), peer_manager.clone(), p2p_config.clone(),
+                            disconnect_tx.subscribe(),
                         ));
                     }
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(p2p_config.reconnect_delay_secs)).await;
+        tokio::time::sleep(Duration::from_secs(p2p_config.reconnect_delay_secs)).await;
     }
 }
