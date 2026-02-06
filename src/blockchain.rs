@@ -24,10 +24,11 @@ use std::sync::Arc;
 use secp256k1::PublicKey;
 use sled::Batch;
 use serde::{Serialize, Deserialize};
-use log::info;
+use log::{info, warn, debug};
 
 const MAX_BEACONS_PER_BLOCK: usize = 16;
 const MAX_UTXO_CACHE_SIZE: usize = 100000;
+const MAX_ORPHAN_BLOCKS: usize = 512;
 const BEACON_BOUNTY_POOL_PERCENT: u64 = 1;
 const PQC_ENFORCEMENT_HEIGHT: u32 = 100_000;
 
@@ -125,6 +126,7 @@ pub struct Blockchain {
     pub db_config: Arc<DatabaseConfig>,
     pub headers: Vec<BlockHeader>,
     pub utxo_cache: HashMap<(sha256d::Hash, u32), UtxoEntry>,
+    pub orphan_blocks: HashMap<sha256d::Hash, Block>,
     pub last_pow_block_hash: sha256d::Hash,
     pub consensus_engine: ConsensusEngine,
     pub dcs: DecentralizedConsensusService,
@@ -173,6 +175,7 @@ impl Blockchain {
             governance_params, progonos_config, spv_state, total_staked: 0, governance: Governance::new(),
             db_config, headers: Vec::new(),
             utxo_cache: HashMap::with_capacity(MAX_UTXO_CACHE_SIZE),
+            orphan_blocks: HashMap::new(),
             last_pow_block_hash: sha256d::Hash::all_zeros(),
             consensus_engine, 
             dcs: DecentralizedConsensusService::new(),
@@ -240,6 +243,18 @@ impl Blockchain {
         Ok(bc)
     }
 
+    /// Checks if the node is currently in catch-up sync mode.
+    pub fn is_syncing(&self) -> bool {
+        let current_height = self.headers.len() as u32;
+        if let Some(best_meta_bytes) = self.header_meta_tree.get(self.best_header_tip.as_ref() as &[u8]).ok().flatten() {
+            if let Ok(best_meta) = bincode::deserialize::<HeaderMetadata>(&best_meta_bytes) {
+                // If tip is more than 10 blocks behind the header tip, we are syncing.
+                return best_meta.height > current_height.saturating_add(10);
+            }
+        }
+        false
+    }
+
     pub fn validate_header(&self, header: &BlockHeader) -> Result<u64> {
         let prev_hash = header.prev_blockhash;
         if prev_hash == sha256d::Hash::all_zeros() { return Ok(1); } // Genesis work
@@ -260,8 +275,6 @@ impl Blockchain {
             return Ok((easiest_val / target_val).to_u64().unwrap_or(1));
         } else {
             // PoS Header-Only Validation (Optimistic)
-            // Full Synergistic Work requires transaction fees, which are in the body.
-            // For headers-first, we use a baseline PoS work value.
             return Ok(1); 
         }
     }
@@ -310,9 +323,19 @@ impl Blockchain {
         let mut rolling_muhash = self.get_muhash_root()?;
         let pqc_enforced = block.height >= PQC_ENFORCEMENT_HEIGHT;
 
+        // Optimization: Skip signatures for CDF-finalized blocks during deep sync
+        let skip_verify = if let Some(finalized_hash) = self.last_finalized_checkpoint {
+            // If block height is significantly below a finalized checkpoint, skip sigs
+            if let Some(f_meta_bytes) = self.header_meta_tree.get(finalized_hash.as_ref() as &[u8]).ok().flatten() {
+                if let Ok(f_meta) = bincode::deserialize::<HeaderMetadata>(&f_meta_bytes) {
+                    block.height < f_meta.height.saturating_sub(6)
+                } else { false }
+            } else { false }
+        } else { false };
+
         for tx in &block.transactions {
             let mut prev_txs = HashMap::new();
-            if !tx.is_coinbase() {
+            if !tx.is_coinbase() && !skip_verify {
                 let is_bridge_mint = tx.vin.len() == 1 && tx.vin[0].prev_txid == sha256d::Hash::all_zeros() && tx.vin[0].script_sig.starts_with(b"{");
 
                 if is_bridge_mint {
@@ -582,23 +605,31 @@ impl Blockchain {
 
     pub fn add_block(&mut self, mut block: Block) -> Result<()> {
         let hash = block.header.hash();
+        if self.blocks_tree.contains_key(hash.as_ref() as &[u8])? { return Ok(()); }
         if self.veto_manager.blacklisted_blocks.contains(&hash) { bail!("Vetoed block."); }
+
+        let is_parallel_genesis = block.header.prev_blockhash == sha256d::Hash::all_zeros();
+        
+        // --- Parent Check & Orphan Management ---
+        if !is_parallel_genesis && !self.headers_tree.contains_key(block.header.prev_blockhash.as_ref() as &[u8])? {
+            if self.orphan_blocks.len() < MAX_ORPHAN_BLOCKS {
+                debug!("Sync: Buffering orphan block {} (parent {} unknown)", hash, block.header.prev_blockhash);
+                self.orphan_blocks.insert(hash, block);
+                return Ok(());
+            } else {
+                bail!("Sync Fail: Orphan buffer full.");
+            }
+        }
+
         self.verify_dcs_metadata(&block)?;
         if !block.beacons.is_empty() { self.validate_beacon_bounties(&block)?; }
         
         let is_pow = block.header.vrf_proof.is_none();
         let fees = self.calculate_total_fees(&block);
-        let is_parallel_genesis = block.header.prev_blockhash == sha256d::Hash::all_zeros();
 
-        // Pre-calculate work and index lineage to ensure reorg discovery works
-        let synergistic_work = if is_parallel_genesis {
-            self.calculate_synergistic_work(&mut block);
-            block.synergistic_work
-        } else {
-            let _prev_block = self.get_block(&block.header.prev_blockhash).ok_or(anyhow!("Orphan block body missing"))?;
-            self.calculate_synergistic_work(&mut block);
-            block.synergistic_work
-        };
+        // Pre-calculate work and index lineage
+        self.calculate_synergistic_work(&mut block);
+        let synergistic_work = block.synergistic_work;
 
         let total_work = if is_parallel_genesis {
             synergistic_work
@@ -610,8 +641,7 @@ impl Blockchain {
         };
         block.total_work = total_work;
 
-        // CRITICAL: Insert header and metadata BEFORE fork-choice/reorg logic
-        // This ensures find_common_ancestor can see the lineage of this block.
+        // Persist header and metadata
         let meta = HeaderMetadata { height: block.height, total_work: block.total_work, synergistic_work: block.synergistic_work };
         self.headers_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block.header)?)?;
         self.header_meta_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&meta)?)?;
@@ -639,8 +669,10 @@ impl Blockchain {
             }
         }
 
+        // Commit block body
         self.blocks_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
         
+        // --- Fork Choice Rule (ASW) ---
         if block.total_work > self.total_work {
             if block.header.prev_blockhash != self.tip && !is_parallel_genesis { 
                 self.handle_reorganization(hash)?; 
@@ -656,17 +688,43 @@ impl Blockchain {
             }
 
             self.total_work = block.total_work;
-            
             self.dcs.process_beacons(&block.beacons);
             if self.burst_manager.check_and_activate(&block, fees) { self.finality_gadget.activate(hash, self.total_staked); }
             self.burst_manager.update_state(block.height);
-            self.ldd_state.recent_blocks.push((block.header.time, is_pow));
-            if self.ldd_state.recent_blocks.len() >= self.ldd_state.current_adjustment_window { self.adjust_ldd(); }
+
+            // Difficulty Stability Guard: Skip LDD adjustment during high-velocity catch-up
+            if !self.is_syncing() {
+                self.ldd_state.recent_blocks.push((block.header.time, is_pow));
+                if self.ldd_state.recent_blocks.len() >= self.ldd_state.current_adjustment_window { 
+                    self.adjust_ldd(); 
+                }
+            }
+
             self.update_and_execute_proposals();
             self.blocks_tree.insert(self.db_config.tip_key.as_str(), hash.as_ref() as &[u8])?;
             self.blocks_tree.insert(&self.db_config.total_work_key, &self.total_work.to_be_bytes() as &[u8])?;
+
+            // Recursively process any orphans that now have a parent
+            self.process_orphans(hash);
         }
         Ok(())
+    }
+
+    /// Recursively attempts to add buffered blocks that were waiting for this parent.
+    fn process_orphans(&mut self, parent_hash: sha256d::Hash) {
+        let children: Vec<sha256d::Hash> = self.orphan_blocks.iter()
+            .filter(|(_, b)| b.header.prev_blockhash == parent_hash)
+            .map(|(h, _)| *h)
+            .collect();
+
+        for child_hash in children {
+            if let Some(child_block) = self.orphan_blocks.remove(&child_hash) {
+                debug!("Sync: Processing child orphan block {}", child_hash);
+                if let Err(e) = self.add_block(child_block) {
+                    warn!("Sync: Failed to process orphan {}: {}", child_hash, e);
+                }
+            }
+        }
     }
 
     fn verify_dcs_metadata(&self, block: &Block) -> Result<()> {
@@ -762,6 +820,7 @@ impl Blockchain {
 
         self.tip = new_block_hash;
         
+        // Re-align headers vector
         if let Some(idx) = self.headers.iter().position(|h| h.hash() == ancestor) {
             self.headers.truncate(idx + 1);
             let mut headers_to_append = Vec::new();
