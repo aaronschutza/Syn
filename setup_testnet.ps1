@@ -110,16 +110,17 @@ function Get-ChainHeight {
     } catch { return -1 }
 }
 
-Write-Host "Starting Miner 1 (Bootstrap Node)..."
+Write-Host "Starting Miner 1 (Bootstrap Node) in a new window..."
 $miner1NodeDir = Join-Path -Path $testnetDir -ChildPath "miner1"
 $miner1Address = Get-Content -Path (Join-Path -Path $miner1NodeDir -ChildPath "address.txt")
 $miner1ConfigFile = Join-Path -Path $miner1NodeDir -ChildPath "config.toml"
 
-Start-Job -Name "Miner1" -ScriptBlock { 
-    param($dir, $conf, $addr, $bin) 
-    Set-Location $dir
-    & $bin --config $conf start-node --mode miner --mine-to-address $addr 2>&1 | Out-File "node.log" -Encoding UTF8
-} -ArgumentList $miner1NodeDir, $miner1ConfigFile, $miner1Address, $nodeBin
+# Construct the command for Miner 1 to run in a separate visible window
+# We use Tee-Object to display logs live in the window AND save them to node.log
+# Removed -Encoding UTF8 for compatibility with PowerShell 5.1
+$miner1Cmd = "Set-Location '$miner1NodeDir'; & '$nodeBin' --config '$miner1ConfigFile' start-node --mode miner --mine-to-address '$miner1Address' 2>&1 | Tee-Object -FilePath 'node.log'"
+
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "$miner1Cmd"
 
 Write-Host "Waiting for Miner 1 RPC (Port 20001)..."
 $timeout = 60
@@ -134,10 +135,12 @@ for ($i = 2; $i -le $numMiners; $i++) {
     $dir = Join-Path -Path $testnetDir -ChildPath "miner$i"
     $addr = Get-Content -Path (Join-Path -Path $dir -ChildPath "address.txt")
     $conf = Join-Path -Path $dir -ChildPath "config.toml"
+    # Background jobs for all other miners
     Start-Job -Name "Miner$i" -ScriptBlock { 
         param($d, $c, $a, $b) 
         Set-Location $d
-        & $b --config $c start-node --mode miner --mine-to-address $a 2>&1 | Out-File "node.log" -Encoding UTF8
+        # Redirect stderr to stdout using 2>&1
+        & $b --config $c start-node --mode miner --mine-to-address $a 2>&1 | Out-File "node.log"
     } -ArgumentList $dir, $conf, $addr, $nodeBin
 }
 
@@ -152,10 +155,8 @@ for ($i = 1; $i -le $numStakers; $i++) {
     $attempts = 0
     while ($attempts -lt 5) {
         $result = & $nodeBin --config "$miner1ConfigFile" faucet --address "$stakerAddr" --amount 100000 2>&1
-        # Check if output indicates success (contains "TXID")
         if ($result -like "*TXID*") { break }
-        
-        Write-Host "Mempool full or error, waiting for block... ($result)"
+        Write-Host "Mempool full, waiting for block..."
         while ((Get-ChainHeight -port 20001) -le $h) { Start-Sleep -Seconds 5 }
         $h = Get-ChainHeight -port 20001
         $attempts++
@@ -169,10 +170,12 @@ Write-Host "Starting staker nodes..."
 for ($i = 1; $i -le $numStakers; $i++) {
     $dir = Join-Path -Path $testnetDir -ChildPath "staker$i"
     $conf = Join-Path -Path $dir -ChildPath "config.toml"
+    # Background jobs for stakers
     Start-Job -Name "Staker$i" -ScriptBlock { 
         param($d, $c, $b) 
         Set-Location $d
-        & $b --config $c start-node --mode staker 2>&1 | Out-File "node.log" -Encoding UTF8
+        # Redirect stderr to stdout using 2>&1
+        & $b --config $c start-node --mode staker 2>&1 | Out-File "node.log"
     } -ArgumentList $dir, $conf, $nodeBin
 }
 
@@ -184,7 +187,6 @@ for ($i = 1; $i -le $numStakers; $i++) {
     
     # Wait for RPC
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    # Increased timeout from 20s to 90s for heavy load
     while ($sw.Elapsed.TotalSeconds -lt 90) {
         if ((Get-ChainHeight -port $port) -ge 0) { break }
         Start-Sleep -Seconds 2
@@ -213,4 +215,4 @@ Get-Process | Where-Object { ($_.ProcessName -eq "cargo") -or ($_.ProcessName -e
 Write-Host "Stopped."
 '@
 Set-Content -Path (Join-Path -Path $projectRoot -ChildPath "stop_testnet.ps1") -Value $stopScriptContent
-Write-Host "Done. Run '.\start_testnet.ps1'. Logs will be in 'local_testnet\minerX\node.log'."
+Write-Host "Done. Run '.\start_testnet.ps1'."

@@ -51,7 +51,11 @@ const CHANNEL_CAPACITY: usize = 100;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // FIX: Force logger to use Stdout to prevent PowerShell NativeCommandError artifacts
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Stdout) 
+        .init();
+
     let cli = Cli::parse();
     
     // Load config globally based on CLI flag
