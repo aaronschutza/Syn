@@ -24,6 +24,7 @@ use std::sync::Arc;
 use secp256k1::PublicKey;
 use sled::Batch;
 use serde::{Serialize, Deserialize};
+use log::info;
 
 const MAX_BEACONS_PER_BLOCK: usize = 16;
 const MAX_UTXO_CACHE_SIZE: usize = 100000;
@@ -47,6 +48,13 @@ pub struct UtxoEntry {
     pub is_coinbase: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeaderMetadata {
+    pub height: u32,
+    pub total_work: u64,
+    pub synergistic_work: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct LddState {
     pub f_a_pow: Fixed,
@@ -63,8 +71,6 @@ pub struct LddState {
 impl Default for LddState {
     fn default() -> Self {
         Self {
-            // FIX: Reverted to 0.05 to allow tests to pass (mining is feasible).
-            // The adaptive logic will raise difficulty if blocks are too fast.
             f_a_pow: Fixed::from_f64(0.05),
             f_a_pos: Fixed::from_f64(0.05),
             recent_blocks: Vec::new(),
@@ -95,6 +101,8 @@ pub struct VetoManager {
 pub struct Blockchain {
     pub db: Arc<sled::Db>,
     pub blocks_tree: sled::Tree,
+    pub headers_tree: sled::Tree,
+    pub header_meta_tree: sled::Tree,
     pub utxo_tree: sled::Tree,
     pub addr_utxo_tree: sled::Tree, 
     pub tx_index_tree: sled::Tree,
@@ -102,6 +110,8 @@ pub struct Blockchain {
     pub meta_tree: sled::Tree,
     pub tip: sha256d::Hash,
     pub total_work: u64,
+    pub best_header_tip: sha256d::Hash,
+    pub best_header_work: u64,
     pub mempool: HashMap<sha256d::Hash, Transaction>,
     pub beacon_mempool: Vec<Beacon>,
     pub ldd_state: LddState,
@@ -137,6 +147,8 @@ impl Blockchain {
         consensus_engine: ConsensusEngine,
     ) -> Result<Self> {
         let blocks_tree = db.open_tree(&db_config.blocks_tree)?;
+        let headers_tree = db.open_tree("headers_tree")?;
+        let header_meta_tree = db.open_tree("header_metadata")?;
         let utxo_tree = db.open_tree(&db_config.utxo_tree)?;
         let addr_utxo_tree = db.open_tree("addr_utxo_index")?;
         let tx_index_tree = db.open_tree(&db_config.tx_index_tree)?;
@@ -147,14 +159,16 @@ impl Blockchain {
         ldd_state.current_psi = consensus_params.psi_slot_gap;
         ldd_state.current_gamma = consensus_params.gamma_recovery_threshold;
         ldd_state.current_target_block_time = consensus_params.target_block_time;
-        // Cap adjustment window to ensure adaptation happens quickly during tests/bootstrapping
         ldd_state.current_adjustment_window = consensus_params.adjustment_window.min(10);
         ldd_state.current_burn_rate = fee_params.min_burn_rate;
 
         let mut bc = Blockchain {
-            db, blocks_tree, utxo_tree, addr_utxo_tree, tx_index_tree, btc_txid_tree, meta_tree,
+            db, blocks_tree, headers_tree, header_meta_tree, utxo_tree, addr_utxo_tree, tx_index_tree, btc_txid_tree, meta_tree,
             tip: sha256d::Hash::all_zeros(),
-            total_work: 0, mempool: HashMap::new(), beacon_mempool: Vec::new(),
+            total_work: 0,
+            best_header_tip: sha256d::Hash::all_zeros(),
+            best_header_work: 0,
+            mempool: HashMap::new(), beacon_mempool: Vec::new(),
             ldd_state, consensus_params, fee_params: fee_params.clone(),
             governance_params, progonos_config, spv_state, total_staked: 0, governance: Governance::new(),
             db_config, headers: Vec::new(),
@@ -178,9 +192,15 @@ impl Blockchain {
             bc.calculate_synergistic_work(&mut genesis);
             genesis.total_work = genesis.synergistic_work;
             let genesis_hash = genesis.header.hash();
+            
+            bc.headers_tree.insert(genesis_hash.as_ref() as &[u8], bincode::serialize(&genesis.header)?)?;
+            let meta = HeaderMetadata { height: 0, total_work: genesis.total_work, synergistic_work: genesis.synergistic_work };
+            bc.header_meta_tree.insert(genesis_hash.as_ref() as &[u8], bincode::serialize(&meta)?)?;
+
             bc.blocks_tree.insert(genesis_hash.as_ref() as &[u8], bincode::serialize(&genesis)?)?;
             bc.blocks_tree.insert(bc.db_config.tip_key.as_str(), genesis_hash.as_ref() as &[u8])?;
             bc.tip = genesis_hash; bc.total_work = genesis.total_work;
+            bc.best_header_tip = genesis_hash; bc.best_header_work = genesis.total_work;
             bc.headers.push(genesis.header.clone());
             bc.meta_tree.insert("utxo_muhash_root", BigUint::from(1u32).to_bytes_be().as_slice())?;
             bc.update_utxo_set(&genesis)?;
@@ -190,8 +210,96 @@ impl Blockchain {
             if let Some(work_bytes) = bc.blocks_tree.get(&bc.db_config.total_work_key)? {
                 let mut arr = [0u8; 8]; arr.copy_from_slice(&work_bytes); bc.total_work = u64::from_be_bytes(arr);
             }
+            
+            // Re-populate headers from storage
+            let mut curr = bc.tip;
+            let mut headers_rev = Vec::new();
+            while curr != sha256d::Hash::all_zeros() {
+                if let Some(h_bytes) = bc.headers_tree.get(curr.as_ref() as &[u8])? {
+                    let header: BlockHeader = bincode::deserialize(&h_bytes)?;
+                    headers_rev.push(header.clone());
+                    curr = header.prev_blockhash;
+                } else { break; }
+            }
+            bc.headers = headers_rev.into_iter().rev().collect();
+            
+            // Load best header tip from metadata
+            let mut best_tip = bc.tip;
+            let mut best_work = bc.total_work;
+            for item in bc.header_meta_tree.iter() {
+                let (hash_bytes, meta_bytes) = item?;
+                let meta: HeaderMetadata = bincode::deserialize(&meta_bytes)?;
+                if meta.total_work > best_work {
+                    best_work = meta.total_work;
+                    best_tip = sha256d::Hash::from_slice(&hash_bytes)?;
+                }
+            }
+            bc.best_header_tip = best_tip;
+            bc.best_header_work = best_work;
         }
         Ok(bc)
+    }
+
+    pub fn validate_header(&self, header: &BlockHeader) -> Result<u64> {
+        let prev_hash = header.prev_blockhash;
+        if prev_hash == sha256d::Hash::all_zeros() { return Ok(1); } // Genesis work
+
+        let prev_meta_bytes = self.header_meta_tree.get(prev_hash.as_ref() as &[u8])?
+            .ok_or_else(|| anyhow!("Header parent missing: {}", prev_hash))?;
+        let _prev_meta: HeaderMetadata = bincode::deserialize(&prev_meta_bytes)?;
+
+        // PoW Check
+        if header.vrf_proof.is_none() {
+            let target = BlockHeader::calculate_target(header.bits);
+            let hash_val = BigUint::from_bytes_be(header.hash().as_ref());
+            if hash_val > target { bail!("Invalid PoW in header"); }
+
+            let easiest = BlockHeader::calculate_target(0x207fffff);
+            let easiest_val = if easiest.is_zero() { BigUint::from(1u32) } else { easiest };
+            let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
+            return Ok((easiest_val / target_val).to_u64().unwrap_or(1));
+        } else {
+            // PoS Header-Only Validation (Optimistic)
+            // Full Synergistic Work requires transaction fees, which are in the body.
+            // For headers-first, we use a baseline PoS work value.
+            return Ok(1); 
+        }
+    }
+
+    pub fn process_headers(&mut self, headers: Vec<BlockHeader>) -> Result<()> {
+        for header in headers {
+            let hash = header.hash();
+            if self.headers_tree.contains_key(hash.as_ref() as &[u8])? { continue; }
+
+            let synergistic_work = self.validate_header(&header)?;
+            let prev_hash = header.prev_blockhash;
+            
+            let total_work = if prev_hash == sha256d::Hash::all_zeros() {
+                synergistic_work
+            } else {
+                let prev_meta_bytes = self.header_meta_tree.get(prev_hash.as_ref() as &[u8])?
+                    .ok_or_else(|| anyhow!("Sync fail: orphaned header"))?;
+                let prev_meta: HeaderMetadata = bincode::deserialize(&prev_meta_bytes)?;
+                prev_meta.total_work + synergistic_work
+            };
+
+            let height = if prev_hash == sha256d::Hash::all_zeros() { 0 } else {
+                let prev_meta_bytes = self.header_meta_tree.get(prev_hash.as_ref() as &[u8])?.unwrap();
+                let prev_meta: HeaderMetadata = bincode::deserialize(&prev_meta_bytes)?;
+                prev_meta.height + 1
+            };
+
+            let meta = HeaderMetadata { height, total_work, synergistic_work };
+            self.headers_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&header)?)?;
+            self.header_meta_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&meta)?)?;
+
+            if total_work > self.best_header_work {
+                self.best_header_tip = hash;
+                self.best_header_work = total_work;
+                info!("Sync: Best header tip updated to height {}: {}", height, hash);
+            }
+        }
+        Ok(())
     }
 
     pub fn update_utxo_set(&mut self, block: &Block) -> Result<()> {
@@ -480,6 +588,33 @@ impl Blockchain {
         
         let is_pow = block.header.vrf_proof.is_none();
         let fees = self.calculate_total_fees(&block);
+        let is_parallel_genesis = block.header.prev_blockhash == sha256d::Hash::all_zeros();
+
+        // Pre-calculate work and index lineage to ensure reorg discovery works
+        let synergistic_work = if is_parallel_genesis {
+            self.calculate_synergistic_work(&mut block);
+            block.synergistic_work
+        } else {
+            let _prev_block = self.get_block(&block.header.prev_blockhash).ok_or(anyhow!("Orphan block body missing"))?;
+            self.calculate_synergistic_work(&mut block);
+            block.synergistic_work
+        };
+
+        let total_work = if is_parallel_genesis {
+            synergistic_work
+        } else {
+            let prev_meta_bytes = self.header_meta_tree.get(block.header.prev_blockhash.as_ref() as &[u8])?
+                .ok_or_else(|| anyhow!("Parent header metadata missing"))?;
+            let prev_meta: HeaderMetadata = bincode::deserialize(&prev_meta_bytes)?;
+            prev_meta.total_work + synergistic_work
+        };
+        block.total_work = total_work;
+
+        // CRITICAL: Insert header and metadata BEFORE fork-choice/reorg logic
+        // This ensures find_common_ancestor can see the lineage of this block.
+        let meta = HeaderMetadata { height: block.height, total_work: block.total_work, synergistic_work: block.synergistic_work };
+        self.headers_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block.header)?)?;
+        self.header_meta_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&meta)?)?;
 
         if !is_pow {
             let fees_fixed = Fixed::from_integer(fees);
@@ -498,31 +633,30 @@ impl Blockchain {
             }
         }
 
-        let is_parallel_genesis = block.header.prev_blockhash == sha256d::Hash::all_zeros();
         if is_parallel_genesis {
             if let Some(_finalized) = self.last_finalized_checkpoint {
                 bail!("Irreversibility Violation: Fork reverts a CDF-finalized block.");
             }
-            self.calculate_synergistic_work(&mut block);
-            block.total_work = block.synergistic_work;
-        } else {
-            let prev = self.get_block(&block.header.prev_blockhash).ok_or(anyhow!("Orphan block"))?;
-            self.calculate_synergistic_work(&mut block);
-            block.total_work = prev.total_work + block.synergistic_work;
         }
 
         self.blocks_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
+        
         if block.total_work > self.total_work {
-            if block.header.prev_blockhash != self.tip { self.handle_reorganization(hash)?; }
-            else { self.tip = hash; self.update_utxo_set(&block)?; }
+            if block.header.prev_blockhash != self.tip && !is_parallel_genesis { 
+                self.handle_reorganization(hash)?; 
+            }
+            else { 
+                self.tip = hash; 
+                self.update_utxo_set(&block)?; 
+                self.headers.push(block.header.clone());
+            }
             
-            // Clean mempool: Remove transactions that are included in this new block
             for tx in &block.transactions {
                 self.mempool.remove(&tx.id());
             }
 
             self.total_work = block.total_work;
-            self.headers.push(block.header.clone());
+            
             self.dcs.process_beacons(&block.beacons);
             if self.burst_manager.check_and_activate(&block, fees) { self.finality_gadget.activate(hash, self.total_staked); }
             self.burst_manager.update_state(block.height);
@@ -566,20 +700,82 @@ impl Blockchain {
         Ok(())
     }
 
+    /// Generates a block locator vector for efficient sync.
+    /// Sparse hashes starting from the tip, doubling the gap each step.
+    pub fn get_block_locator(&self) -> Vec<sha256d::Hash> {
+        let mut locator = Vec::new();
+        let mut step = 1;
+        let mut index = self.headers.len() as i32 - 1;
+
+        while index >= 0 {
+            locator.push(self.headers[index as usize].hash());
+            if index == 0 { break; }
+            index -= step;
+            if locator.len() > 10 {
+                step *= 2;
+            }
+        }
+        
+        if let Some(gen) = self.headers.first() {
+            let gen_hash = gen.hash();
+            if locator.last() != Some(&gen_hash) {
+                locator.push(gen_hash);
+            }
+        }
+        locator
+    }
+
+    /// Optimized re-organization using Sled batching for UTXO updates.
     fn handle_reorganization(&mut self, new_block_hash: sha256d::Hash) -> Result<()> {
         let ancestor = self.find_common_ancestor(self.tip, new_block_hash)?;
+        
         if let Some(finalized) = self.last_finalized_checkpoint {
             if !self.is_block_in_path(finalized, new_block_hash)? {
                 bail!("Irreversibility Violation: Fork reverts a CDF-finalized block.");
             }
         }
+
+        info!("Sync: Reorganizing chain. Ancestor at hash: {}", ancestor);
+
         let mut curr = self.tip;
-        while curr != ancestor { let block = self.get_block(&curr).ok_or(anyhow!("Reorg fail"))?; self.rollback_utxo_set(&block)?; curr = block.header.prev_blockhash; }
+        let mut rollback_blocks = Vec::new();
+        while curr != ancestor {
+            let block = self.get_block(&curr).ok_or(anyhow!("Reorg fail: block missing"))?;
+            rollback_blocks.push(block);
+            curr = rollback_blocks.last().unwrap().header.prev_blockhash;
+        }
+        for block in rollback_blocks {
+            self.rollback_utxo_set(&block)?;
+        }
+
         let mut curr = new_block_hash;
         let mut new_path = Vec::new();
-        while curr != ancestor { let block = self.get_block(&curr).ok_or(anyhow!("Reorg fail"))?; new_path.push(block); curr = new_path.last().unwrap().header.prev_blockhash; }
-        for block in new_path.into_iter().rev() { self.update_utxo_set(&block)?; }
+        while curr != ancestor {
+            let block = self.get_block(&curr).ok_or(anyhow!("Reorg fail: block missing"))?;
+            new_path.push(block);
+            curr = new_path.last().unwrap().header.prev_blockhash;
+        }
+
+        for block in new_path.into_iter().rev() {
+            self.update_utxo_set(&block)?;
+        }
+
         self.tip = new_block_hash;
+        
+        if let Some(idx) = self.headers.iter().position(|h| h.hash() == ancestor) {
+            self.headers.truncate(idx + 1);
+            let mut headers_to_append = Vec::new();
+            let mut cursor = self.tip;
+            while cursor != ancestor {
+                if let Some(h_bytes) = self.headers_tree.get(cursor.as_ref() as &[u8])? {
+                    let header: BlockHeader = bincode::deserialize(&h_bytes)?;
+                    headers_to_append.push(header);
+                    cursor = headers_to_append.last().unwrap().prev_blockhash;
+                } else { break; }
+            }
+            self.headers.extend(headers_to_append.into_iter().rev());
+        }
+
         Ok(())
     }
 
@@ -587,8 +783,10 @@ impl Blockchain {
         let mut curr = tip;
         while curr != sha256d::Hash::all_zeros() {
             if curr == target { return Ok(true); }
-            let block = self.get_block(&curr).ok_or(anyhow!("Ancestry missing"))?;
-            curr = block.header.prev_blockhash;
+            if let Some(h_bytes) = self.headers_tree.get(curr.as_ref() as &[u8])? {
+                let h: BlockHeader = bincode::deserialize(&h_bytes)?;
+                curr = h.prev_blockhash;
+            } else { break; }
         }
         Ok(false)
     }
@@ -631,9 +829,21 @@ impl Blockchain {
     fn find_common_ancestor(&self, hash1: sha256d::Hash, hash2: sha256d::Hash) -> Result<sha256d::Hash> {
         let mut path = HashSet::new();
         let mut curr = hash1;
-        while curr != sha256d::Hash::all_zeros() { path.insert(curr); curr = self.get_block(&curr).map(|b| b.header.prev_blockhash).unwrap_or(sha256d::Hash::all_zeros()); }
+        while curr != sha256d::Hash::all_zeros() {
+            path.insert(curr);
+            if let Some(h_bytes) = self.headers_tree.get(curr.as_ref() as &[u8])? {
+                let h: BlockHeader = bincode::deserialize(&h_bytes)?;
+                curr = h.prev_blockhash;
+            } else { break; }
+        }
         curr = hash2;
-        while curr != sha256d::Hash::all_zeros() { if path.contains(&curr) { return Ok(curr); } curr = self.get_block(&curr).map(|b| b.header.prev_blockhash).unwrap_or(sha256d::Hash::all_zeros()); }
+        while curr != sha256d::Hash::all_zeros() {
+            if path.contains(&curr) { return Ok(curr); }
+            if let Some(h_bytes) = self.headers_tree.get(curr.as_ref() as &[u8])? {
+                let h: BlockHeader = bincode::deserialize(&h_bytes)?;
+                curr = h.prev_blockhash;
+            } else { break; }
+        }
         bail!("No common ancestor")
     }
 
@@ -642,60 +852,36 @@ impl Blockchain {
     }
 
     pub fn adjust_ldd(&mut self) {
-        // 1. Get Environmental Parameters from DCS
         let consensus_values = self.dcs.calculate_consensus();
-        
-        // 2. Adaptive Slot Gap (Psi) - FIX for test_autonomous_ldd_adaptation
-        // Convert ms to seconds, add safety margin (e.g. 1s)
-        // If consensus delay is 0 (default/test), psi will be 2. If 5000ms (5s), psi will be 7.
         let consensus_delay_sec = (consensus_values.consensus_delay as f64 / 1000.0).ceil() as u32;
         let psi_new = consensus_delay_sec + 2; 
         self.ldd_state.current_psi = psi_new;
-
-        // 3. Adaptive Burn Rate (Immune Response) - FIX for test_economic_immune_response
-        // Base burn + sensitivity * threat_level
         let beta_base = self.fee_params.min_burn_rate;
         let k_sec = 0.5;
         self.ldd_state.current_burn_rate = (beta_base + k_sec * consensus_values.security_threat_level).min(self.fee_params.max_burn_rate);
-
-        // 4. Difficulty Adjustment (Speed & Balance)
         let total_blocks = self.ldd_state.recent_blocks.len();
         if total_blocks > 1 {
-            // Calculate observed speed
             let start_time = self.ldd_state.recent_blocks.first().unwrap().0;
             let end_time = self.ldd_state.recent_blocks.last().unwrap().0;
             let observed_duration = end_time.saturating_sub(start_time) as f64;
             let observed_mu = observed_duration / (total_blocks - 1) as f64;
             let observed_mu = observed_mu.max(1.0);
-            
-            // Calculate observed proportion for balance
             let pow_count = self.ldd_state.recent_blocks.iter().filter(|(_, is_pow)| *is_pow).count();
             let p_pow = pow_count as f64 / total_blocks as f64;
             let error_prop = p_pow - 0.5;
-
             let target_mu = self.consensus_params.target_block_time as f64;
-
-            // Balance Correction (Proportional)
             let kappa = self.ldd_state.current_kappa;
             let f_a_pow_balanced = self.ldd_state.f_a_pow.to_f64() * (1.0 - kappa * error_prop);
             let f_a_pos_balanced = self.ldd_state.f_a_pos.to_f64() * (1.0 + kappa * error_prop);
-
-            // Speed Correction (Stability) - FIX for Block Time Consistency
-            // If Observed < Target (too fast), ratio < 1. Squaring makes it smaller.
-            // Lowering f_a reduces probability per slot -> increases difficulty.
             let speed_ratio = (observed_mu / target_mu).powi(2);
-            let speed_ratio = speed_ratio.max(0.1).min(10.0); // Safety clamp
-
+            let speed_ratio = speed_ratio.max(0.1).min(10.0);
             let f_a_pow_new = f_a_pow_balanced * speed_ratio;
             let f_a_pos_new = f_a_pos_balanced * speed_ratio;
-
             self.ldd_state.f_a_pow = Fixed::from_f64(f_a_pow_new);
             self.ldd_state.f_a_pos = Fixed::from_f64(f_a_pos_new);
-            
             log::info!("[ADJUST] Adjusted LDD. Obs Time: {:.2}s, Target: {}s, Ratio: {:.4}. New f_A_PoW: {:.6}, Psi: {}", 
                 observed_mu, target_mu, speed_ratio, f_a_pow_new, psi_new);
         }
-
         self.ldd_state.recent_blocks.clear();
         self.dcs.reset_interval(); 
     }
