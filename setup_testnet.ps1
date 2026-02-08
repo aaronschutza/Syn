@@ -143,6 +143,19 @@ Start-Process powershell -ArgumentList "-NoExit", "-Command", "$m1Cmd"
 
 if (!(Wait-For-RPC -port 20001 -name "Miner 1")) { exit 1 }
 
+# CRITICAL FIX: The bootstrap miner must first confirm its first block 
+# to have a balance to stake. This prevents the LDD system from 
+# entering a PoW-only deadlock.
+Write-Host "Waiting for Miner 1 to confirm its first reward..."
+$h = -1
+while ($h -lt 1) {
+    Start-Sleep -Seconds 3
+    $h = Get-ChainHeight -port 20001
+}
+
+Write-Host "Registering Initial Stake for Miner 1 to bootstrap PoS..."
+& "$nodeBin" --config "$m1Conf" stake --asset SYN --amount 5000000000 | Out-Null
+
 # 2. START BOOTSTRAP STAKER 1
 Write-Host "`n[PHASE 2] Instantiating Bootstrap Staker 1..." -ForegroundColor Cyan
 $s1Dir = Join-Path -Path $testnetDir -ChildPath "staker1"
@@ -151,7 +164,7 @@ $s1Conf = Join-Path -Path $s1Dir -ChildPath "config.toml"
 
 # Fund Staker 1 via Miner 1
 $h = Get-ChainHeight -port 20001
-$res = & $nodeBin --config "$m1Conf" faucet --address "$s1Addr" --amount 1000000 2>&1
+$res = & "$nodeBin" --config "$m1Conf" faucet --address "$s1Addr" --amount 1000000 2>&1
 Write-Host "Funding Staker 1... TXID: $res"
 Wait-For-Block -port 20001 -currentHeight $h
 
@@ -162,7 +175,7 @@ Start-Process powershell -ArgumentList "-NoExit", "-Command", "$s1Cmd"
 $s1Rpc = 20000 + $numMiners + 1
 if (Wait-For-RPC -port $s1Rpc -name "Staker 1") {
     Write-Host "Registering stake for Staker 1..."
-    & $nodeBin --config $s1Conf stake --asset SYN --amount 1000000 | Out-Null
+    & "$nodeBin" --config "$s1Conf" stake --asset SYN --amount 1000000 | Out-Null
     Write-Host "Staker 1 fully operational." -ForegroundColor Green
 }
 
@@ -198,7 +211,7 @@ for ($i = 2; $i -le $maxCount; $i++) {
         
         Write-Host ">>> PHASE 3.$i.B: Funding Staker $i..."
         $h = Get-ChainHeight -port 20001
-        & $nodeBin --config "$m1Conf" faucet --address "$sAddr" --amount 1000000 2>&1 | Out-Null
+        & "$nodeBin" --config "$m1Conf" faucet --address "$sAddr" --amount 1000000 2>&1 | Out-Null
         Wait-For-Block -port 20001 -currentHeight $h
 
         Write-Host ">>> PHASE 3.$i.C: Starting Staker $i..."
@@ -210,7 +223,7 @@ for ($i = 2; $i -le $maxCount; $i++) {
 
         if (Wait-For-RPC -port $sRpc -name "Staker $i") {
             Write-Host ">>> PHASE 3.$i.D: Registering stake for Staker $i..."
-            & $nodeBin --config $sConf stake --asset SYN --amount 1000000 | Out-Null
+            & "$nodeBin" --config "$sConf" stake --asset SYN --amount 1000000 | Out-Null
             Write-Host "Staker $i initialized." -ForegroundColor Green
         }
     }

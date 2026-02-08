@@ -60,7 +60,7 @@ pub async fn start_consensus_loop(
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
                 // 1. Gather Chain Statistics (Brief Lock)
-                let (last_height, delta, psi, _last_block_time, mempool_len) = {
+                let (last_height, delta, psi, bc_state, mempool_len) = {
                     let bc_lock = bc.lock().await;
                     let tip_hash = bc_lock.tip;
                     let last_block = bc_lock.get_block(&tip_hash);
@@ -69,15 +69,16 @@ pub async fn start_consensus_loop(
                     let now_ts = Utc::now().timestamp() as u32;
                     let d = now_ts.saturating_sub(l_time);
                     let p = bc_lock.ldd_state.current_psi;
+                    let l_state = bc_lock.ldd_state.clone();
                     let m_len = bc_lock.mempool.len();
-                    (l_height, d, p, l_time, m_len)
+                    (l_height, d, p, l_state, m_len)
                 };
 
-                // Heartbeat Logging for ALL modes (Miner and Staker)
+                // Heartbeat Logging with LDD Amplitudes to diagnose stalls
                 let now_u32 = Utc::now().timestamp() as u32;
                 if now_u32 > last_slot_log {
-                    info!("[SLOT] Time: {} | Height: {} | Delta: {}s / {}s (Psi) | Mempool: {}", 
-                        now_u32, last_height, delta, psi, mempool_len);
+                    info!("[SLOT] H: {} | Delta: {}s/{}s | Amplitudes (PoW: {:.4}, PoS: {:.4}) | Burn: {:.2} | Mempool: {}", 
+                        last_height, delta, psi, bc_state.f_a_pow.to_f64(), bc_state.f_a_pos.to_f64(), bc_state.current_burn_rate, mempool_len);
                     last_slot_log = now_u32;
                 }
 
@@ -105,7 +106,7 @@ pub async fn start_consensus_loop(
                                 if BigUint::from_bytes_be(block.header.hash().as_ref()) <= target {
                                     let hash = block.header.hash();
                                     if bc_lock.add_block(block.clone()).is_ok() {
-                                        info!("[MINED] Block {} (Hash: {}..) - Broadcasted", 
+                                        info!("[MINED PoW] Block {} (Hash: {}..) - Broadcasted", 
                                             block.height, 
                                             hash.to_string().get(0..8).unwrap_or(""));
                                         let _ = p2p_tx.send(P2PMessage::NewBlock(Box::new(block)));
@@ -128,7 +129,7 @@ pub async fn start_consensus_loop(
                                 let hash = block.header.hash();
                                 let height = block.height;
                                 if bc_lock.add_block(block.clone()).is_ok() {
-                                    info!("[MINED POS] Block {} (Hash: {}..) - Validator: {}", 
+                                    info!("[MINED PoS] Block {} (Hash: {}..) - Validator: {}", 
                                         height, 
                                         hash.to_string().get(0..8).unwrap_or(""), 
                                         wallet.get_address());
@@ -161,8 +162,6 @@ pub async fn start_consensus_loop(
                     }
                 }
             }
-            // CRITICAL FIX: The loop was sometimes selecting sleep over receiver. 
-            // We prioritize the message receiver to ensure blocks are never dropped.
             Some(msg) = p2p_rx.recv() => {
                 match msg {
                     P2PMessage::NewBlock(block) => { 
@@ -175,20 +174,19 @@ pub async fn start_consensus_loop(
                         
                         let old_work = bc_lock.total_work;
                         let block_height = block.height;
+                        let is_pos = block.header.vrf_proof.is_some();
 
                         match bc_lock.add_block(*block.clone()) {
                             Ok(_) => {
-                                // SYNC LOGIC: Relaying blocks that extend total work ensures the entire network catches up.
                                 if bc_lock.total_work > old_work {
-                                    info!("[PEER] Ingested Block {} (Hash: {}..) - Relaying", block_height, block_hash.to_string().get(0..8).unwrap_or(""));
+                                    let type_label = if is_pos { "PoS" } else { "PoW" };
+                                    info!("[PEER {}] Block {} (Hash: {}..) - Relaying", type_label, block_height, block_hash.to_string().get(0..8).unwrap_or(""));
                                     let _ = p2p_tx.send(P2PMessage::NewBlock(block));
                                 } else {
                                     debug!("[PEER] Processed side-chain block {} at height {}", block_hash.to_string().get(0..8).unwrap_or(""), block_height);
                                 }
                             },
                             Err(e) => {
-                                // If it's an orphan block, add_block returns an error. 
-                                // We keep the debug log to see if synchronization is failing due to missing parents.
                                 debug!("[SYNC] Block {} rejected: {}", block_height, e);
                             }
                         }

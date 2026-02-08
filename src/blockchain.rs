@@ -263,8 +263,6 @@ impl Blockchain {
             let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
             return Ok((easiest_val / target_val).to_u64().unwrap_or(1));
         } else {
-            // PoS blocks provide a standard work unit equivalent to the target PoW difficulty
-            // to ensure they are properly weighted in the Accumulated Synergistic Work metric.
             let pow_target_bits = self.consensus_params.max_target_bits;
             let easiest = BlockHeader::calculate_target(0x207fffff);
             let target = BlockHeader::calculate_target(pow_target_bits);
@@ -308,6 +306,13 @@ impl Blockchain {
             }
         }
         Ok(())
+    }
+
+    /// Synchronizes the internal total_staked tracker with the Staking Module's state.
+    /// This ensures that the LDD eligibility math and DCS beacons use current data.
+    pub fn sync_staking_totals(&mut self) {
+        let actual_bonded = self.consensus_engine.staking_module.get_total_bonded_supply();
+        self.total_staked = actual_bonded as u64;
     }
 
     pub fn update_utxo_set(&mut self, block: &Block) -> Result<()> {
@@ -485,15 +490,12 @@ impl Blockchain {
     pub fn calculate_synergistic_work(&self, block: &mut Block) {
         let vrf_opt = &block.header.vrf_proof;
         if vrf_opt.is_none() {
-            // PoW work calculation: H / target
             let easiest = BlockHeader::calculate_target(0x207fffff);
             let target = BlockHeader::calculate_target(block.header.bits);
             let easiest_val = if easiest.is_zero() { BigUint::from(1u32) } else { easiest };
             let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
             block.synergistic_work = (easiest_val / target_val).to_u64().unwrap_or(1);
         } else {
-            // PoS work calculation: Normalize work to target difficulty to prevent PoS blocks 
-            // from over-weighting the chain during bootstrap.
             let pow_target_bits = self.consensus_params.max_target_bits;
             let easiest = BlockHeader::calculate_target(0x207fffff);
             let target = BlockHeader::calculate_target(pow_target_bits);
@@ -502,10 +504,9 @@ impl Blockchain {
             
             let base_pos_work = (easiest_val / target_val).to_u64().unwrap_or(1);
 
-            // Commit economic value bonus (deterministically derived from VRF entropy)
             let entropy_bonus = if let Some(p) = &block.header.vrf_proof {
                  let vrf_hash = sha256d::Hash::hash(p);
-                 (vrf_hash.to_byte_array()[0] as u64) % 10 // Max 10% bonus
+                 (vrf_hash.to_byte_array()[0] as u64) % 10 
             } else { 0 };
 
             block.synergistic_work = base_pos_work + (base_pos_work * entropy_bonus / 100);
@@ -579,26 +580,29 @@ impl Blockchain {
         let now = Utc::now().timestamp() as u32;
         let delta = now.saturating_sub(prev.header.time);
         let bits = self.get_next_work_required(true, delta);
+        
         let total_reward = self.consensus_params.coinbase_reward;
-        let bounty_pool = (total_reward * BEACON_BOUNTY_POOL_PERCENT) / 100;
+        let total_bounty_pool = (total_reward * BEACON_BOUNTY_POOL_PERCENT) / 100;
         let beacons = self.beacon_mempool.clone();
         let beacons_to_include = if beacons.len() > MAX_BEACONS_PER_BLOCK { &beacons[0..MAX_BEACONS_PER_BLOCK] } else { &beacons };
-        if ! beacons_to_include.is_empty() {
-            let per_beacon = bounty_pool / beacons_to_include.len() as u64;
-            if per_beacon > 0 {
+
+        if !beacons_to_include.is_empty() {
+            let reward_per_beacon = total_bounty_pool / beacons_to_include.len() as u64;
+            if reward_per_beacon > 0 {
                 if let Some(coinbase) = transactions.get_mut(0) {
-                    if coinbase.vout[0].value >= bounty_pool {
-                        coinbase.vout[0].value -= bounty_pool;
+                    if !coinbase.vout.is_empty() && coinbase.vout[0].value >= total_bounty_pool {
+                        coinbase.vout[0].value -= total_bounty_pool;
                         for beacon in beacons_to_include {
                             if let Ok(pk) = PublicKey::from_slice(&beacon.public_key) {
                                 let addr = address_from_pubkey_hash(&hash_pubkey(&pk));
-                                coinbase.vout.push(TxOut::new(per_beacon, addr));
+                                coinbase.vout.push(TxOut::new(reward_per_beacon, addr));
                             }
                         }
                     }
                 }
             }
         }
+        
         let mut block = Block::new(now, transactions, self.tip, bits, prev.height + 1, version);
         block.beacons = beacons_to_include.to_vec();
         block.header.utxo_root = self.calculate_utxo_root()?;
@@ -682,8 +686,6 @@ impl Blockchain {
 
         self.blocks_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
         
-        // FORK CHOICE RULE: Greater than OR Equal for height/work tie-breaking
-        // This allows nodes to track side-forks and converge more easily during bootstrap.
         if block.total_work >= self.total_work {
             if block.header.prev_blockhash != self.tip && !is_parallel_genesis { 
                 info!("Sync: Block {} (Work: {}) triggers reorganization from {}.", hash, block.total_work, self.tip);
@@ -698,6 +700,9 @@ impl Blockchain {
                 self.headers.push(block.header.clone());
             }
             
+            // CRITICAL FIX: Sync staking totals after state transition
+            self.sync_staking_totals();
+
             for tx in &block.transactions {
                 self.mempool.remove(&tx.id());
             }
