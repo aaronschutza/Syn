@@ -1,4 +1,4 @@
-// src/p2p.rs - Robust Networking with Explicit Handshake Logging
+// src/p2p.rs - Robust Networking with Explicit Handshake and Sync Logic
 
 use crate::config::{ConsensusConfig, NodeConfig, P2PConfig};
 use crate::{
@@ -173,7 +173,6 @@ async fn handle_connection(
                     P2PMessage::Version { best_height: peer_height, listener_port, .. } => {
                         info!("P2P: Handshake from {} [Height: {}, Port: {}]", addr, peer_height, listener_port);
                         
-                        // Update gossip address book with the actual listening port
                         let mut listen_addr = addr;
                         listen_addr.set_port(listener_port);
                         pm.lock().await.add_known_addresses(vec![listen_addr]);
@@ -184,7 +183,7 @@ async fn handle_connection(
                         };
 
                         if peer_height > local_height {
-                            info!("P2P: {} is ahead ({} > {}). Syncing headers...", addr, peer_height, local_height);
+                            info!("P2P: Peer {} is ahead ({} > {}). Syncing headers...", addr, peer_height, local_height);
                             let _ = _tx_keeper.send(P2PMessage::GetHeaders { 
                                 version: 1, 
                                 block_locator_hashes: locator, 
@@ -193,16 +192,37 @@ async fn handle_connection(
                         }
                         let _ = _tx_keeper.send(P2PMessage::Verack).await;
                     }
-                    P2PMessage::Verack => {
-                        debug!("P2P: Verack from {}", addr);
-                        let _ = _tx_keeper.send(P2PMessage::GetAddr).await;
-                    }
-                    P2PMessage::GetAddr => {
-                        let known = pm.lock().await.get_gossip_addresses();
-                        let _ = _tx_keeper.send(P2PMessage::Addr(known)).await;
-                    }
-                    P2PMessage::Addr(addrs) => {
-                        pm.lock().await.add_known_addresses(addrs);
+                    P2PMessage::GetHeaders { block_locator_hashes, hash_stop, .. } => {
+                        let b = bc.lock().await;
+                        let mut headers = Vec::new();
+                        let mut start_found = false;
+                        
+                        // Find the common ancestor in our local chain
+                        for locator_hash in block_locator_hashes {
+                            if let Some(pos) = b.headers.iter().position(|h| h.hash() == locator_hash) {
+                                // Start from the block immediately after the locator
+                                for header in b.headers.iter().skip(pos + 1).take(2000) {
+                                    let h_hash = header.hash();
+                                    headers.push(header.clone());
+                                    if h_hash == hash_stop { break; }
+                                }
+                                start_found = true;
+                                break;
+                            }
+                        }
+
+                        // If no ancestor found, start from genesis
+                        if !start_found {
+                            for header in b.headers.iter().take(2000) {
+                                headers.push(header.clone());
+                                if header.hash() == hash_stop { break; }
+                            }
+                        }
+
+                        if !headers.is_empty() {
+                            debug!("P2P: Sending {} headers to {}", headers.len(), addr);
+                            let _ = _tx_keeper.send(P2PMessage::Headers(headers)).await;
+                        }
                     }
                     P2PMessage::Headers(headers) => {
                         if headers.is_empty() { continue; }
@@ -210,17 +230,19 @@ async fn handle_connection(
                         let mut missing_bodies = Vec::new();
                         {
                             let mut b = bc.lock().await;
-                            if b.process_headers(headers.clone()).is_ok() {
-                                for header in &headers {
-                                    let hash = header.hash();
-                                    if !b.blocks_tree.contains_key(hash.as_ref() as &[u8]).unwrap_or(false) {
-                                        missing_bodies.push(hash);
-                                    }
+                            if let Err(e) = b.process_headers(headers.clone()) {
+                                error!("P2P: Failed to process headers from {}: {}", addr, e);
+                                continue;
+                            }
+                            
+                            for header in &headers {
+                                let hash = header.hash();
+                                if !b.blocks_tree.contains_key(hash.as_ref() as &[u8]).unwrap_or(false) {
+                                    missing_bodies.push(hash);
                                 }
-                            } else {
-                                error!("P2P: Failed to process headers from {}.", addr);
                             }
                         }
+
                         if !missing_bodies.is_empty() {
                             info!("P2P: Requesting {} block bodies from {}...", missing_bodies.len(), addr);
                             let _ = _tx_keeper.send(P2PMessage::GetData { hashes: missing_bodies }).await;
@@ -235,9 +257,18 @@ async fn handle_connection(
                         }
                     }
                     P2PMessage::NewBlock(block) => {
-                        // REVERT TO BLOCKING SEND: During sync, we must ensure blocks are not dropped
-                        // to maintain UTXO set continuity.
                         let _ = to_consensus_tx.send(P2PMessage::NewBlock(block)).await;
+                    }
+                    P2PMessage::Verack => {
+                        debug!("P2P: Verack from {}", addr);
+                        let _ = _tx_keeper.send(P2PMessage::GetAddr).await;
+                    }
+                    P2PMessage::GetAddr => {
+                        let known = pm.lock().await.get_gossip_addresses();
+                        let _ = _tx_keeper.send(P2PMessage::Addr(known)).await;
+                    }
+                    P2PMessage::Addr(addrs) => {
+                        pm.lock().await.add_known_addresses(addrs);
                     }
                     P2PMessage::NewTransaction(tx) => {
                         let _ = to_consensus_tx.try_send(P2PMessage::NewTransaction(tx));
