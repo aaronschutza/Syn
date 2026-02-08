@@ -1,4 +1,4 @@
-// src/consensus.rs - Mining and Beaconing Loop
+// src/consensus.rs - Mining and Beaconing Loop with Robust Lock Handling
 
 use crate::{
     block::{BeaconData, Beacon},
@@ -9,7 +9,7 @@ use crate::{
     wallet::Wallet,
     crypto::{hash_pubkey, address_from_pubkey_hash},
     cdf::Color,
-    pos, // ADDED: Import pos module
+    pos,
 };
 use anyhow::Result;
 use chrono::Utc;
@@ -61,13 +61,12 @@ pub async fn start_consensus_loop(
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
                 let mut bc_lock = bc.lock().await;
                 
-                // --- PoW Logic ---
+                // PoW Logic
                 if mode == "miner" || mode == "full" {
                     let tip_hash = bc_lock.tip;
                     let last_block = bc_lock.get_block(&tip_hash);
                     let last_block_time = last_block.as_ref().map(|b| b.header.time).unwrap_or(0);
                     let last_height = last_block.as_ref().map(|b| b.height).unwrap_or(0);
-                    let mempool_size = bc_lock.mempool.len();
                     
                     let now = Utc::now().timestamp() as u32;
                     let delta = now.saturating_sub(last_block_time);
@@ -75,13 +74,12 @@ pub async fn start_consensus_loop(
 
                     if now > last_slot_log {
                         info!("[SLOT] Time: {} | Height: {} | Delta: {}s / {}s (Psi) | Mempool: {}", 
-                            now, last_height, delta, psi, mempool_size);
+                            now, last_height, delta, psi, bc_lock.mempool.len());
                         last_slot_log = now;
                     }
                     
                     if delta >= psi {
                         let reward = bc_lock.consensus_params.coinbase_reward;
-                        let mempool_txs = bc_lock.get_mempool_txs();
                         let coinbase = Transaction::new_coinbase(
                             "Mined by Synergeia".to_string(),
                             wallet.get_address(),
@@ -90,7 +88,7 @@ pub async fn start_consensus_loop(
                         );
                         
                         let mut txs = vec![coinbase];
-                        txs.extend(mempool_txs);
+                        txs.extend(bc_lock.get_mempool_txs());
 
                         if let Ok(mut block) = bc_lock.create_block_template(txs, 1) {
                             let beacons = block.beacons.clone();
@@ -98,12 +96,12 @@ pub async fn start_consensus_loop(
                             let target = bc_lock.get_next_pow_target(delta);
                             for _ in 0..2000 {
                                 if BigUint::from_bytes_be(block.header.hash().as_ref()) <= target {
+                                    let hash = block.header.hash();
                                     if bc_lock.add_block(block.clone()).is_ok() {
                                         info!("[MINED] Block {} (Hash: {}..) - TxCount: {}", 
                                             block.height, 
-                                            block.header.hash().to_string().get(0..8).unwrap_or(""), 
+                                            hash.to_string().get(0..8).unwrap_or(""), 
                                             block.transactions.len());
-                                        // Broadcast mined block
                                         p2p_tx.send(P2PMessage::NewBlock(Box::new(block))).ok();
                                     }
                                     break;
@@ -114,23 +112,19 @@ pub async fn start_consensus_loop(
                     }
                 }
 
-                // --- PoS Logic (ADDED) ---
+                // PoS Logic
                 if mode == "staker" || mode == "full" {
                     let now = Utc::now().timestamp() as u64;
-                    // Only attempt to stake if we haven't already processed this slot
                     if now as u32 > last_slot_log {
-                        // Check if we are eligible to produce a block in this slot
                         if let Some((proof, delta)) = pos::is_eligible_to_stake(&wallet, &bc_lock, now) {
-                            debug!("Selected as PoS Leader for slot {}!", now);
-                            
                             match pos::create_pos_block(&mut bc_lock, &wallet, proof, delta as u32, now as u32) {
                                 Ok(block) => {
+                                    let hash = block.header.hash();
                                     if bc_lock.add_block(block.clone()).is_ok() {
                                         info!("[MINED POS] Block {} (Hash: {}..) - Validator: {}", 
                                             block.height, 
-                                            block.header.hash().to_string().get(0..8).unwrap_or(""), 
+                                            hash.to_string().get(0..8).unwrap_or(""), 
                                             wallet.get_address());
-                                        
                                         p2p_tx.send(P2PMessage::NewBlock(Box::new(block))).ok();
                                     }
                                 }
@@ -144,7 +138,6 @@ pub async fn start_consensus_loop(
                 let mut bc_lock = bc.lock().await;
                 let metrics = bc_lock.get_and_reset_metrics();
                 if let Ok(b) = wallet.sign_beacon(BeaconData::Time(Utc::now().timestamp() as u64)) { 
-                    info!("[BEACON] Broadcasting Time Beacon");
                     p2p_tx.send(P2PMessage::Beacon(b)).ok(); 
                 }
                 if let Ok(b) = wallet.sign_beacon(BeaconData::Security(metrics.orphan_count, metrics.max_reorg_depth)) { p2p_tx.send(P2PMessage::Beacon(b)).ok(); }
@@ -162,19 +155,27 @@ pub async fn start_consensus_loop(
                 match msg {
                     P2PMessage::NewBlock(block) => { 
                         let mut bc_lock = bc.lock().await;
-                        // Simple duplicate check to prevent infinite broadcast loops
-                        if bc_lock.blocks_tree.contains_key(block.header.hash().as_ref() as &[u8]).unwrap_or(false) {
+                        let block_hash = block.header.hash();
+                        if bc_lock.blocks_tree.contains_key(block_hash.as_ref() as &[u8]).unwrap_or(false) {
                             continue;
                         }
 
+                        let old_tip = bc_lock.tip;
+                        let block_height = block.height;
+
                         match bc_lock.add_block(*block.clone()) {
                             Ok(_) => {
-                                info!("[PEER] Accepted Block {} (Hash: {}..)", block.height, block.header.hash().to_string().get(0..8).unwrap_or(""));
-                                // Rebroadcast accepted blocks to ensure propagation
-                                p2p_tx.send(P2PMessage::NewBlock(block)).ok();
+                                // GOSSIP HARDENING: Only rebroadcast if this block is actually useful 
+                                // (becomes the tip or is the head of a known branch)
+                                if bc_lock.tip != old_tip && bc_lock.tip == block_hash {
+                                    info!("[PEER] Accepted Block {} (Hash: {}..) - NEW TIP", block_height, block_hash.to_string().get(0..8).unwrap_or(""));
+                                    p2p_tx.send(P2PMessage::NewBlock(block)).ok();
+                                }
                             },
                             Err(e) => {
-                                warn!("[REJECT] Block {} Rejected: {}", block.height, e);
+                                if !e.to_string().contains("already exists") {
+                                    debug!("[REJECT] Block {} Rejected: {}", block_height, e);
+                                }
                             }
                         }
                     }
@@ -186,15 +187,11 @@ pub async fn start_consensus_loop(
                         let mut bc_lock = bc.lock().await;
                         bc_lock.process_finality_vote(vote); 
                     }
-                    // ADDED: Handle NewTransaction messages
                     P2PMessage::NewTransaction(tx) => {
-                        let mut bc_lock = bc.lock().await;
+                        let mut bc_lock = bc.lock().await; 
                         let txid = tx.id();
                         if !bc_lock.mempool.contains_key(&txid) {
-                            // Basic validation could happen here, for now we just insert
-                            info!("[MEMPOOL] Received new transaction: {}", txid);
                             bc_lock.mempool.insert(txid, tx.clone());
-                            // Gossip to other peers
                             p2p_tx.send(P2PMessage::NewTransaction(tx)).ok();
                         }
                     }

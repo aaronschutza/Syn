@@ -47,7 +47,7 @@ use crate::difficulty::DynamicDifficultyManager;
 use crate::engine::ConsensusEngine;
 use crate::client::SpvClientState;
 
-const CHANNEL_CAPACITY: usize = 100;
+const CHANNEL_CAPACITY: usize = 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {

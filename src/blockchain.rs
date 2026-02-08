@@ -24,7 +24,7 @@ use std::sync::Arc;
 use secp256k1::PublicKey;
 use sled::Batch;
 use serde::{Serialize, Deserialize};
-use log::{info, warn, debug};
+use log::{info, warn, debug, error};
 
 const MAX_BEACONS_PER_BLOCK: usize = 16;
 const MAX_UTXO_CACHE_SIZE: usize = 100000;
@@ -263,7 +263,14 @@ impl Blockchain {
             let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
             return Ok((easiest_val / target_val).to_u64().unwrap_or(1));
         } else {
-            return Ok(1); 
+            // PoS blocks provide a standard work unit equivalent to the target PoW difficulty
+            // to ensure they are properly weighted in the Accumulated Synergistic Work metric.
+            let pow_target_bits = self.consensus_params.max_target_bits;
+            let easiest = BlockHeader::calculate_target(0x207fffff);
+            let target = BlockHeader::calculate_target(pow_target_bits);
+            let easiest_val = if easiest.is_zero() { BigUint::from(1u32) } else { easiest };
+            let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
+            return Ok((easiest_val / target_val).to_u64().unwrap_or(1));
         }
     }
 
@@ -478,26 +485,30 @@ impl Blockchain {
     pub fn calculate_synergistic_work(&self, block: &mut Block) {
         let vrf_opt = &block.header.vrf_proof;
         if vrf_opt.is_none() {
+            // PoW work calculation: H / target
             let easiest = BlockHeader::calculate_target(0x207fffff);
-            let easiest_val = if easiest.is_zero() { BigUint::from(1u32) } else { easiest };
             let target = BlockHeader::calculate_target(block.header.bits);
+            let easiest_val = if easiest.is_zero() { BigUint::from(1u32) } else { easiest };
             let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
             block.synergistic_work = (easiest_val / target_val).to_u64().unwrap_or(1);
         } else {
-            // Optimization for sync: use header-estimated work if parents are missing
-            if self.is_syncing() {
-                 block.synergistic_work = 1;
-                 return;
-            }
-            let block_reward = self.consensus_params.coinbase_reward;
-            let total_fees = self.calculate_total_fees(block);
-            let econ_value = Fixed::from_integer(block_reward + total_fees);
-            let alpha = Fixed::from_f64(0.4); 
-            let vrf_hash = sha256d::Hash::hash(vrf_opt.as_ref().unwrap());
-            let entropy_scaled = (vrf_hash.to_byte_array()[0] as u128) << (64 - 8);
-            let entropy_bonus = Fixed( (1u128 << 64) + entropy_scaled );
-            let commitment = alpha * econ_value * entropy_bonus;
-            block.synergistic_work = (commitment.0 >> 64) as u64;
+            // PoS work calculation: Normalize work to target difficulty to prevent PoS blocks 
+            // from over-weighting the chain during bootstrap.
+            let pow_target_bits = self.consensus_params.max_target_bits;
+            let easiest = BlockHeader::calculate_target(0x207fffff);
+            let target = BlockHeader::calculate_target(pow_target_bits);
+            let easiest_val = if easiest.is_zero() { BigUint::from(1u32) } else { easiest };
+            let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
+            
+            let base_pos_work = (easiest_val / target_val).to_u64().unwrap_or(1);
+
+            // Commit economic value bonus (deterministically derived from VRF entropy)
+            let entropy_bonus = if let Some(p) = &block.header.vrf_proof {
+                 let vrf_hash = sha256d::Hash::hash(p);
+                 (vrf_hash.to_byte_array()[0] as u64) % 10 // Max 10% bonus
+            } else { 0 };
+
+            block.synergistic_work = base_pos_work + (base_pos_work * entropy_bonus / 100);
         }
     }
 
@@ -596,8 +607,13 @@ impl Blockchain {
 
     pub fn add_block(&mut self, mut block: Block) -> Result<()> {
         let hash = block.header.hash();
-        if self.blocks_tree.contains_key(hash.as_ref() as &[u8])? { return Ok(()); }
-        if self.veto_manager.blacklisted_blocks.contains(&hash) { bail!("Vetoed block."); }
+        if self.blocks_tree.contains_key(hash.as_ref() as &[u8])? { 
+            return Ok(()); 
+        }
+        
+        if self.veto_manager.blacklisted_blocks.contains(&hash) { 
+            bail!("Rejection: Block {} has been vetoed by governance.", hash); 
+        }
 
         let is_parallel_genesis = block.header.prev_blockhash == sha256d::Hash::all_zeros();
         
@@ -607,12 +623,19 @@ impl Blockchain {
                 self.orphan_blocks.insert(hash, block);
                 return Ok(());
             } else {
-                bail!("Sync Fail: Orphan buffer full.");
+                bail!("Rejection: Orphan buffer full. Cannot accept block {} without parent {}.", hash, block.header.prev_blockhash);
             }
         }
 
-        self.verify_dcs_metadata(&block)?;
-        if !block.beacons.is_empty() { self.validate_beacon_bounties(&block)?; }
+        if let Err(e) = self.verify_dcs_metadata(&block) {
+            bail!("Rejection: Block {} failed DCS telemetry verification: {}", hash, e);
+        }
+
+        if !block.beacons.is_empty() { 
+            if let Err(e) = self.validate_beacon_bounties(&block) {
+                bail!("Rejection: Block {} has invalid beacon reward distribution: {}", hash, e);
+            }
+        }
         
         let is_pow = block.header.vrf_proof.is_none();
         let fees = self.calculate_total_fees(&block);
@@ -624,7 +647,7 @@ impl Blockchain {
             synergistic_work
         } else {
             let prev_meta_bytes = self.header_meta_tree.get(block.header.prev_blockhash.as_ref() as &[u8])?
-                .ok_or_else(|| anyhow!("Parent header metadata missing"))?;
+                .ok_or_else(|| anyhow!("Parent header metadata missing for block {}", hash))?;
             let prev_meta: HeaderMetadata = bincode::deserialize(&prev_meta_bytes)?;
             prev_meta.total_work + synergistic_work
         };
@@ -647,25 +670,31 @@ impl Blockchain {
             });
 
             if burned < required_burn { 
-                bail!("Insufficient Proof-of-Burn commitment."); 
+                bail!("Insufficient Proof-of-Burn commitment for block {} (Required: {}, Found: {}).", hash, required_burn, burned); 
             }
         }
 
         if is_parallel_genesis {
             if let Some(_finalized) = self.last_finalized_checkpoint {
-                bail!("Irreversibility Violation: Fork reverts a CDF-finalized block.");
+                bail!("Irreversibility Violation: Parallel genesis fork attempts to revert a CDF-finalized checkpoint.");
             }
         }
 
         self.blocks_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
         
-        if block.total_work > self.total_work {
+        // FORK CHOICE RULE: Greater than OR Equal for height/work tie-breaking
+        // This allows nodes to track side-forks and converge more easily during bootstrap.
+        if block.total_work >= self.total_work {
             if block.header.prev_blockhash != self.tip && !is_parallel_genesis { 
+                info!("Sync: Block {} (Work: {}) triggers reorganization from {}.", hash, block.total_work, self.tip);
                 self.handle_reorganization(hash)?; 
             }
             else { 
                 self.tip = hash; 
-                self.update_utxo_set(&block)?; 
+                if let Err(e) = self.update_utxo_set(&block) {
+                    error!("CRITICAL: Block {} rejected during UTXO state transition: {}", hash, e);
+                    return Err(e);
+                }
                 self.headers.push(block.header.clone());
             }
             
@@ -690,6 +719,9 @@ impl Blockchain {
             self.blocks_tree.insert(&self.db_config.total_work_key, &self.total_work.to_be_bytes() as &[u8])?;
 
             self.process_orphans(hash);
+        } else {
+             debug!("Sync: Block {} accepted into database but does not extend current best chain ({} < {}).", 
+                hash, block.total_work, self.total_work);
         }
         Ok(())
     }

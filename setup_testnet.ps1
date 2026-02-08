@@ -46,6 +46,7 @@ for ($i = 1; $i -le $numMiners; $i++) {
     $minerP2pAddresses += "`"127.0.0.1:$p2pPort`""
     $dbPath = ($nodeDir + "/miner.db").Replace('\', '/')
     $walletPath = ($nodeDir + "/wallet.dat").Replace('\', '/')
+    # Everyone connects to Miner 1
     $bootstrapStr = if ($i -eq 1) { "[]" } else { "[$($minerP2pAddresses[0])]" }
 
     $configContent = Get-Content -Path (Join-Path -Path $projectRoot -ChildPath "miner.toml") -Raw
@@ -55,7 +56,6 @@ for ($i = 1; $i -le $numMiners; $i++) {
     $configContent = $configContent -replace 'wallet_file = ".*"', "wallet_file = `"$walletPath`""
     $configContent = $configContent -replace 'bootstrap_nodes = .*', "bootstrap_nodes = $bootstrapStr"
     $configContent = $configContent -replace 'coinbase_maturity = \d+', 'coinbase_maturity = 1'
-    # Reduce reconnect delay for faster testnet convergence
     $configContent = $configContent -replace 'reconnect_delay_secs = \d+', 'reconnect_delay_secs = 5'
     
     $nodeConfigFile = Join-Path -Path $nodeDir -ChildPath "config.toml"
@@ -85,7 +85,6 @@ for ($i = 1; $i -le $numStakers; $i++) {
     $configContent = $configContent -replace 'wallet_file = ".*"', "wallet_file = `"$walletPath`""
     $configContent = $configContent -replace 'bootstrap_nodes =.*', "bootstrap_nodes = $bootstrapNodesStr"
     $configContent = $configContent -replace 'coinbase_maturity = \d+', 'coinbase_maturity = 1'
-    # Reduce reconnect delay for faster testnet convergence
     $configContent = $configContent -replace 'reconnect_delay_secs = \d+', 'reconnect_delay_secs = 5'
     
     $nodeConfigFile = Join-Path -Path $nodeDir -ChildPath "config.toml"
@@ -95,7 +94,7 @@ for ($i = 1; $i -le $numStakers; $i++) {
     Set-Content (Join-Path -Path $nodeDir -ChildPath "address.txt") -Value $capturedAddr
 }
 
-# --- Generate Start Script ---
+# --- Generate Start Script with Interleaved Bootstrapping ---
 Write-Host "Generating start_testnet.ps1..."
 $startScriptContent = @'
 #!/usr/bin/env powershell
@@ -114,102 +113,113 @@ function Get-ChainHeight {
     } catch { return -1 }
 }
 
-Write-Host "Starting Miner 1 (Bootstrap Node) in a new window..."
-$miner1NodeDir = Join-Path -Path $testnetDir -ChildPath "miner1"
-$miner1Address = Get-Content -Path (Join-Path -Path $miner1NodeDir -ChildPath "address.txt")
-$miner1ConfigFile = Join-Path -Path $miner1NodeDir -ChildPath "config.toml"
-
-# Construct the command for Miner 1 to run in a separate visible window
-# We use Tee-Object to display logs live in the window AND save them to node.log
-$miner1Cmd = "Set-Location '$miner1NodeDir'; & '$nodeBin' --config '$miner1ConfigFile' start-node --mode miner --mine-to-address '$miner1Address' 2>&1 | Tee-Object -FilePath 'node.log'"
-
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "$miner1Cmd"
-
-Write-Host "Waiting for Miner 1 RPC (Port 20001)..."
-$timeout = 60
-$sw = [System.Diagnostics.Stopwatch]::StartNew()
-while ($sw.Elapsed.TotalSeconds -lt $timeout) {
-    if ((Get-ChainHeight -port 20001) -ge 0) { break }
-    Start-Sleep -Seconds 2
-}
-
-Write-Host "Starting remaining miners..."
-for ($i = 2; $i -le $numMiners; $i++) {
-    $dir = Join-Path -Path $testnetDir -ChildPath "miner$i"
-    $addr = Get-Content -Path (Join-Path -Path $dir -ChildPath "address.txt")
-    $conf = Join-Path -Path $dir -ChildPath "config.toml"
-    # Background jobs for all other miners
-    Start-Job -Name "Miner$i" -ScriptBlock { 
-        param($d, $c, $a, $b) 
-        Set-Location $d
-        # Redirect stderr to stdout using 2>&1
-        & $b --config $c start-node --mode miner --mine-to-address $a 2>&1 | Out-File "node.log"
-    } -ArgumentList $dir, $conf, $addr, $nodeBin
-}
-
-Write-Host "Sequentially funding stakers via Miner 1..."
-for ($i = 1; $i -le $numStakers; $i++) {
-    $stakerDir = Join-Path -Path $testnetDir -ChildPath "staker$i"
-    $stakerAddr = Get-Content -Path (Join-Path -Path $stakerDir -ChildPath "address.txt")
-    
-    $h = Get-ChainHeight -port 20001
-    Write-Host "Funding Staker $i ($stakerAddr)..."
-    
-    $attempts = 0
-    while ($attempts -lt 5) {
-        $result = & $nodeBin --config "$miner1ConfigFile" faucet --address "$stakerAddr" --amount 100000 2>&1
-        if ($result -like "*TXID*") { break }
-        Write-Host "Mempool full, waiting for block..."
-        while ((Get-ChainHeight -port 20001) -le $h) { Start-Sleep -Seconds 5 }
-        $h = Get-ChainHeight -port 20001
-        $attempts++
-    }
-
-    Write-Host "Waiting for confirmation block..."
-    while ((Get-ChainHeight -port 20001) -le $h) { Start-Sleep -Seconds 3 }
-}
-
-Write-Host "Starting Staker 1 in a new window..."
-$staker1NodeDir = Join-Path -Path $testnetDir -ChildPath "staker1"
-$staker1ConfigFile = Join-Path -Path $staker1NodeDir -ChildPath "config.toml"
-$staker1Cmd = "Set-Location '$staker1NodeDir'; & '$nodeBin' --config '$staker1ConfigFile' start-node --mode staker 2>&1 | Tee-Object -FilePath 'node.log'"
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "$staker1Cmd"
-
-Write-Host "Starting remaining staker nodes..."
-for ($i = 2; $i -le $numStakers; $i++) {
-    $dir = Join-Path -Path $testnetDir -ChildPath "staker$i"
-    $conf = Join-Path -Path $dir -ChildPath "config.toml"
-    # Background jobs for stakers
-    Start-Job -Name "Staker$i" -ScriptBlock { 
-        param($d, $c, $b) 
-        Set-Location $d
-        # Redirect stderr to stdout using 2>&1
-        & $b --config $c start-node --mode staker 2>&1 | Out-File "node.log"
-    } -ArgumentList $dir, $conf, $nodeBin
-}
-
-Write-Host "Configuring on-chain stake for stakers..."
-for ($i = 1; $i -le $numStakers; $i++) {
-    $dir = Join-Path -Path $testnetDir -ChildPath "staker$i"
-    $conf = Join-Path -Path $dir -ChildPath "config.toml"
-    $port = 20000 + $numMiners + $i
-    
-    # Wait for RPC
+function Wait-For-RPC {
+    param($port, $name, $timeout = 60)
+    Write-Host "Waiting for $name RPC on port $port..."
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($sw.Elapsed.TotalSeconds -lt 90) {
-        if ((Get-ChainHeight -port $port) -ge 0) { break }
+    while ($sw.Elapsed.TotalSeconds -lt $timeout) {
+        if ((Get-ChainHeight -port $port) -ge 0) { return $true }
         Start-Sleep -Seconds 2
     }
+    Write-Error "Timeout waiting for $name RPC."
+    return $false
+}
 
-    if ((Get-ChainHeight -port $port) -ge 0) {
-        & $nodeBin --config $conf stake --asset SYN --amount 100000
-        Write-Host "Staker $i configured."
-    } else {
-        Write-Error "Staker $i RPC on port $port not responding."
+function Wait-For-Block {
+    param($port, $currentHeight)
+    Write-Host "Waiting for a new block on port $port (Current: $currentHeight)..."
+    while ((Get-ChainHeight -port $port) -le $currentHeight) {
+        Start-Sleep -Seconds 3
     }
 }
 
-Write-Host "Testnet active. Total: 32 nodes."
+# 1. START BOOTSTRAP MINER 1
+Write-Host "`n[PHASE 1] Instantiating Bootstrap Miner 1..." -ForegroundColor Cyan
+$m1Dir = Join-Path -Path $testnetDir -ChildPath "miner1"
+$m1Addr = Get-Content -Path (Join-Path -Path $m1Dir -ChildPath "address.txt")
+$m1Conf = Join-Path -Path $m1Dir -ChildPath "config.toml"
+$m1Cmd = "Set-Location '$m1Dir'; & '$nodeBin' --config '$m1Conf' start-node --mode miner --mine-to-address '$m1Addr' 2>&1 | Tee-Object -FilePath 'node.log'"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "$m1Cmd"
+
+if (!(Wait-For-RPC -port 20001 -name "Miner 1")) { exit 1 }
+
+# 2. START BOOTSTRAP STAKER 1
+Write-Host "`n[PHASE 2] Instantiating Bootstrap Staker 1..." -ForegroundColor Cyan
+$s1Dir = Join-Path -Path $testnetDir -ChildPath "staker1"
+$s1Addr = Get-Content -Path (Join-Path -Path $s1Dir -ChildPath "address.txt")
+$s1Conf = Join-Path -Path $s1Dir -ChildPath "config.toml"
+
+# Fund Staker 1 via Miner 1
+$h = Get-ChainHeight -port 20001
+$res = & $nodeBin --config "$m1Conf" faucet --address "$s1Addr" --amount 1000000 2>&1
+Write-Host "Funding Staker 1... TXID: $res"
+Wait-For-Block -port 20001 -currentHeight $h
+
+# Start Staker 1 in a window
+$s1Cmd = "Set-Location '$s1Dir'; & '$nodeBin' --config '$s1Conf' start-node --mode staker 2>&1 | Tee-Object -FilePath 'node.log'"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "$s1Cmd"
+
+$s1Rpc = 20000 + $numMiners + 1
+if (Wait-For-RPC -port $s1Rpc -name "Staker 1") {
+    Write-Host "Registering stake for Staker 1..."
+    & $nodeBin --config $s1Conf stake --asset SYN --amount 1000000 | Out-Null
+    Write-Host "Staker 1 fully operational." -ForegroundColor Green
+}
+
+# 3. INTERLEAVED BACKGROUND EXPANSION (PAIR BY PAIR)
+Write-Host "`n[PHASE 3] Expanding Testnet: Strictly Interleaving Miner/Staker pairs..." -ForegroundColor Cyan
+$maxCount = [math]::Max($numMiners, $numStakers)
+
+for ($i = 2; $i -le $maxCount; $i++) {
+    
+    # Start Miner i
+    if ($i -le $numMiners) {
+        $mDir = Join-Path -Path $testnetDir -ChildPath "miner$i"
+        $mAddr = Get-Content -Path (Join-Path -Path $mDir -ChildPath "address.txt")
+        $mConf = Join-Path -Path $mDir -ChildPath "config.toml"
+        $mRpc = 20000 + $i
+        
+        Write-Host ">>> PHASE 3.$i.A: Starting Miner $i..."
+        Start-Job -Name "Miner$i" -ScriptBlock { 
+            param($d, $c, $a, $b) 
+            Set-Location $d
+            & $b --config $c start-node --mode miner --mine-to-address $a 2>&1 | Out-File "node.log"
+        } -ArgumentList $mDir, $mConf, $mAddr, $nodeBin
+        
+        Wait-For-RPC -port $mRpc -name "Miner $i" | Out-Null
+    }
+
+    # Start Staker i
+    if ($i -le $numStakers) {
+        $sDir = Join-Path -Path $testnetDir -ChildPath "staker$i"
+        $sAddr = Get-Content -Path (Join-Path -Path $sDir -ChildPath "address.txt")
+        $sConf = Join-Path -Path $sDir -ChildPath "config.toml"
+        $sRpc = 20000 + $numMiners + $i
+        
+        Write-Host ">>> PHASE 3.$i.B: Funding Staker $i..."
+        $h = Get-ChainHeight -port 20001
+        & $nodeBin --config "$m1Conf" faucet --address "$sAddr" --amount 1000000 2>&1 | Out-Null
+        Wait-For-Block -port 20001 -currentHeight $h
+
+        Write-Host ">>> PHASE 3.$i.C: Starting Staker $i..."
+        Start-Job -Name "Staker$i" -ScriptBlock { 
+            param($d, $c, $b) 
+            Set-Location $d
+            & $b --config $c start-node --mode staker 2>&1 | Out-File "node.log"
+        } -ArgumentList $sDir, $sConf, $nodeBin
+
+        if (Wait-For-RPC -port $sRpc -name "Staker $i") {
+            Write-Host ">>> PHASE 3.$i.D: Registering stake for Staker $i..."
+            & $nodeBin --config $sConf stake --asset SYN --amount 1000000 | Out-Null
+            Write-Host "Staker $i initialized." -ForegroundColor Green
+        }
+    }
+    
+    Write-Host "Cooldown for synchronization (15s)..."
+    Start-Sleep -Seconds 15
+}
+
+Write-Host "`nTestnet setup complete. Total nodes: $((($numMiners + $numStakers)))" -ForegroundColor Green
 '@
 $startScriptContent = $startScriptContent -replace '__BINARY_PATH__', $binaryPath.Replace('\', '\\')
 $startScriptContent = $startScriptContent -replace '__NUM_MINERS__', $numMiners
@@ -221,7 +231,7 @@ $stopScriptContent = @'
 Get-Job | Stop-Job -ErrorAction SilentlyContinue
 Get-Job | Remove-Job -Force -ErrorAction SilentlyContinue
 Get-Process | Where-Object { ($_.ProcessName -eq "cargo") -or ($_.ProcessName -eq "synergeia-node") -or ($_.CommandLine -like "*synergeia*") } | Stop-Process -Force -ErrorAction SilentlyContinue
-Write-Host "Stopped."
+Write-Host "Stopped all testnet nodes."
 '@
 Set-Content -Path (Join-Path -Path $projectRoot -ChildPath "stop_testnet.ps1") -Value $stopScriptContent
-Write-Host "Done. Run '.\start_testnet.ps1'."
+Write-Host "Done. Run '.\start_testnet.ps1' to begin interleaved bootstrap."

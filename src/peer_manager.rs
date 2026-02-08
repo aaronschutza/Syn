@@ -1,8 +1,8 @@
-// src/peer_manager.rs - Overhauled Peer Rotation and Churn Logic
+// src/peer_manager.rs - Overhauled with Address Book for Gossip
 
 use crate::config::P2PConfig;
-use log::{info, warn};
-use std::collections::HashMap;
+use log::{warn, debug};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,6 +18,8 @@ pub struct Peer {
 
 pub struct PeerManager {
     peers: HashMap<SocketAddr, Peer>,
+    /// Known addresses discovered via gossip (Address Book)
+    known_addresses: HashSet<SocketAddr>,
     config: Arc<P2PConfig>,
     outbound_count: usize,
 }
@@ -26,12 +28,36 @@ impl PeerManager {
     pub fn new(config: Arc<P2PConfig>) -> Self {
         PeerManager {
             peers: HashMap::new(),
+            known_addresses: HashSet::new(),
             config,
             outbound_count: 0,
         }
     }
 
-    /// Records a new connection and initializes score and connection time.
+    /// Adds new addresses to the address book (Gossip)
+    pub fn add_known_addresses(&mut self, addrs: Vec<SocketAddr>) {
+        for addr in addrs {
+            if !self.known_addresses.contains(&addr) {
+                debug!("Gossip: Learned new peer address {}", addr);
+                self.known_addresses.insert(addr);
+            }
+        }
+    }
+
+    /// Returns a list of known addresses to share with others
+    pub fn get_gossip_addresses(&self) -> Vec<SocketAddr> {
+        // Return up to 10 known addresses
+        self.known_addresses.iter().take(10).cloned().collect()
+    }
+
+    /// Returns addresses from the book that we are NOT currently connected to
+    pub fn get_potential_targets(&self) -> Vec<SocketAddr> {
+        self.known_addresses.iter()
+            .filter(|a| !self.peers.contains_key(a))
+            .cloned()
+            .collect()
+    }
+
     pub fn on_connect(&mut self, addr: SocketAddr, is_outbound: bool) {
         let now = Instant::now();
         self.peers.entry(addr).or_insert(Peer {
@@ -41,12 +67,14 @@ impl PeerManager {
             connected_at: now,
             is_outbound,
         });
+        // Ensure this is in our known list
+        self.known_addresses.insert(addr);
+        
         if is_outbound {
             self.outbound_count += 1;
         }
     }
 
-    /// Records a disconnection and updates outbound counts.
     pub fn on_disconnect(&mut self, addr: &SocketAddr) {
         if let Some(peer) = self.peers.remove(addr) {
             if peer.is_outbound {
@@ -65,19 +93,10 @@ impl PeerManager {
         });
 
         peer.score -= penalty;
-        warn!("Peer {} misbehaved (-{}). Score: {}", addr, penalty, peer.score);
-
         if peer.score <= self.config.ban_threshold {
             let duration = Duration::from_secs(self.config.ban_duration_secs);
-            info!("Banning peer {} for {}s.", addr, duration.as_secs());
+            warn!("Banning peer {} for {}s due to low score.", addr, duration.as_secs());
             peer.banned_until = Some(Instant::now() + duration);
-        }
-    }
-
-    pub fn reward_peer(&mut self, addr: &SocketAddr, reward: i32) {
-        if let Some(peer) = self.peers.get_mut(addr) {
-            peer.score = (peer.score + reward).min(200);
-            peer.last_seen = Instant::now();
         }
     }
 
@@ -95,39 +114,28 @@ impl PeerManager {
         false
     }
 
-    /// Synergeia Overhaul: Target 4 outbound peers for ideal network density.
     pub fn needs_outbound(&self) -> bool {
         self.outbound_count < 4
     }
 
-    /// Synergeia Overhaul: Max total peers allowed is 6.
     pub fn can_accept_inbound(&self) -> bool {
-        self.peers.len() < 6
+        self.peers.len() < 8 // Increased for better mesh stability
     }
 
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
 
-    /// Returns the addresses of all currently connected peers.
     pub fn get_active_addresses(&self) -> Vec<SocketAddr> {
         self.peers.keys().cloned().collect()
     }
 
-    /// Returns a candidate for eviction to facilitate network churn.
-    /// Prioritizes peers with the lowest score, then oldest peers if scores are tied.
     pub fn get_eviction_candidate(&self) -> Option<SocketAddr> {
         if self.peers.is_empty() { return None; }
-        
         let mut candidates: Vec<_> = self.peers.iter()
             .map(|(addr, peer)| (addr, peer.score, peer.connected_at))
             .collect();
-
-        // Sort by score ascending, then by age (older first)
-        candidates.sort_by(|a, b| {
-            a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2))
-        });
-
+        candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
         candidates.first().map(|(addr, _, _)| **addr)
     }
 }

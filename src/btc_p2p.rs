@@ -212,7 +212,11 @@ async fn read_raw_message(stream: &mut TcpStream, _network: Network) -> Result<R
     
     let payload_size = match deserialize_partial::<bitcoin::p2p::message::RawNetworkMessage>(&header_buf) {
         Ok((_, size)) => size,
-        Err(_) => bail!("Invalid Bitcoin P2P header length"),
+        Err(_) => {
+            // DEMOTED: This error happens when connecting to a Synergeia node instead of a Bitcoin node.
+            debug!("Bitcoin P2P: Invalid header length from peer. Likely a non-Bitcoin node.");
+            bail!("Invalid Bitcoin P2P header length");
+        }
     };
     
     let mut payload_buf = vec![0u8; payload_size];
