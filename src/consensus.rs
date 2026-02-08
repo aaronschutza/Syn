@@ -60,7 +60,7 @@ pub async fn start_consensus_loop(
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
                 // 1. Gather Chain Statistics (Brief Lock)
-                let (last_height, delta, psi, last_block_time, mempool_len) = {
+                let (last_height, delta, psi, _last_block_time, mempool_len) = {
                     let bc_lock = bc.lock().await;
                     let tip_hash = bc_lock.tip;
                     let last_block = bc_lock.get_block(&tip_hash);
@@ -172,8 +172,7 @@ pub async fn start_consensus_loop(
                         if bc_lock.blocks_tree.contains_key(block_hash.as_ref() as &[u8]).unwrap_or(false) {
                             continue;
                         }
-
-                        let old_tip = bc_lock.tip;
+                        
                         let old_work = bc_lock.total_work;
                         let block_height = block.height;
 
