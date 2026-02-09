@@ -1,4 +1,4 @@
-// src/engine.rs - Fully Deterministic Consensus Logic
+// src/engine.rs - Fully Deterministic Consensus Logic with Parity Fixes
 
 use crate::params::{ParamManager, ConsensusParams};
 use crate::stk_module::{StakingModule};
@@ -7,6 +7,7 @@ use crate::difficulty::DynamicDifficultyManager;
 use crate::fixed_point::Fixed;
 use std::sync::Arc;
 use num_bigint::BigUint;
+use log::info;
 
 #[derive(Debug)]
 pub enum ConsensusError {
@@ -16,7 +17,6 @@ pub enum ConsensusError {
 
 use crate::block::Block;
 
-// Resolve E0382 by implementing Clone
 #[derive(Clone)]
 pub struct ConsensusEngine {
     _param_manager: Arc<ParamManager>,
@@ -63,6 +63,7 @@ impl ConsensusEngine {
         self.params.max_slope_change_per_block = new_slope;
     }
 
+    /// Point 1 & 3: Unified eligibility logic using dynamic timing parameters.
     pub fn check_pos_eligibility(
         &self,
         stakeholder_address: &String,
@@ -75,11 +76,12 @@ impl ConsensusEngine {
         let total_stake = self.staking_module.get_total_bonded_supply();
         if total_stake == 0 { return false; }
         
-        let alpha_i = Fixed::from_integer(stake as u64) / Fixed::from_integer(total_stake as u64);
+        let alpha = Fixed::from_integer(stake as u64) / Fixed::from_integer(total_stake as u64);
     
+        // Fixed: Reading synced LDD context from manager instead of hardcoding.
         let diff_state = self.difficulty_manager.get_state();
-        let psi = Fixed::from_integer(5); 
-        let gamma = Fixed::from_integer(45);
+        let psi = Fixed::from_integer(diff_state.psi as u64); 
+        let gamma = Fixed::from_integer(diff_state.gamma as u64);
         
         let f_a = Fixed::from_f64(diff_state.f_a_pos.to_num::<f64>());
         let delta = Fixed::from_integer(delta_seconds as u64);
@@ -92,17 +94,20 @@ impl ConsensusEngine {
             f_a / Fixed::from_integer(10)
         };
 
-        let threshold = f_delta.pow_approx(alpha_i);
+        // Step A: Full Threshold Function (phi = 1 - (1-f)^alpha)
+        let phi = f_delta.pow_approx(alpha);
+
+        // Step B: Scale to U256 Target
+        let max_u256 = BigUint::from(1u32) << 256;
+        let phi_bits = BigUint::from(phi.0);
+        let target = (max_u256 * phi_bits) >> 64;
 
         let vrf_val = BigUint::from_bytes_be(vrf_output);
-        let max_vrf = BigUint::from(1u32) << 256;
-        
-        let numerator: BigUint = vrf_val << 64;
-        let division_result: BigUint = numerator / max_vrf;
-        
-        let normalized_bits: u128 = division_result.try_into().unwrap_or(u128::MAX);
-        let normalized_vrf = Fixed(normalized_bits);
 
-        normalized_vrf < threshold
+        // Step 3: Heartbeat Logging
+        info!("[POS CHECK] Slot: {}, Delta: {}, f(d): {:.6}, Alpha: {:.6}, Phi: {:.6}, Target: {:x}", 
+            delta_seconds, delta_seconds, f_delta.to_f64(), alpha.to_f64(), phi.to_f64(), target);
+
+        vrf_val < target
     }
 }

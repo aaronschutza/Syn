@@ -1,18 +1,20 @@
-// src/blockchain.rs - Full Audited Implementation with Reorganization & LDD Recovery
+// src/blockchain.rs - Full Audited Implementation with Sync Fixes
 
 use crate::{
     block::{Block, BlockHeader, Beacon},
     config::{ConsensusConfig, DatabaseConfig, FeeConfig, GovernanceConfig, ProgonosConfig},
-    dcs::DecentralizedConsensusService,
+    dcs::{DecentralizedConsensusService, ConsensusOracle}, 
     burst::BurstFinalityManager,
     cdf::{FinalityGadget, FinalityVote}, 
     fixed_point::Fixed,
     governance::{Governance, ProposalState, ProposalPayload},
-    transaction::{Transaction, TxOut},
+    transaction::{Transaction, TxOut}, 
     engine::ConsensusEngine,
     crypto::{hash_pubkey, address_from_pubkey_hash},
     spv::{self, DepositProofRequest},
     client::SpvClientState,
+    difficulty::calculate_next_difficulty, 
+    units::{LddParams, SlotDuration, Probability},
 };
 use anyhow::{anyhow, bail, Result};
 use bitcoin_hashes::{sha256d, Hash};
@@ -24,7 +26,7 @@ use std::sync::Arc;
 use secp256k1::PublicKey;
 use sled::Batch;
 use serde::{Serialize, Deserialize};
-use log::{info, warn, debug};
+use log::info;
 
 const MAX_BEACONS_PER_BLOCK: usize = 16;
 const MAX_UTXO_CACHE_SIZE: usize = 100000;
@@ -50,6 +52,20 @@ pub struct HeaderMetadata {
     pub synergistic_work: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct LocalMetrics {
+    pub orphan_count: u32,
+    pub max_reorg_depth: u32,
+    pub beacon_providers: HashSet<Vec<u8>>,
+}
+
+#[derive(Debug, Default)]
+pub struct VetoManager {
+    pub votes: HashMap<sha256d::Hash, HashSet<Vec<u8>>>,
+    pub weight: HashMap<sha256d::Hash, u64>,
+    pub blacklisted_blocks: HashSet<sha256d::Hash>,
+}
+
 #[derive(Clone, Debug)]
 pub struct LddState {
     pub f_a_pow: Fixed,
@@ -61,7 +77,6 @@ pub struct LddState {
     pub current_gamma: u32,
     pub current_target_block_time: u64,
     pub current_adjustment_window: usize,
-    /// Explicit pointer tracking the height of the next scheduled difficulty adjustment.
     pub next_adjustment_height: u32,
     pub current_burn_rate: f64,
     pub current_kappa: f64,
@@ -78,26 +93,12 @@ impl Default for LddState {
             current_psi: 2,  
             current_gamma: 20, 
             current_target_block_time: 15,
-            current_adjustment_window: 10, // Reduced default window for faster initial adjustments
-            next_adjustment_height: 10, // Initial adjustment at block 10
+            current_adjustment_window: 10,
+            next_adjustment_height: 10,
             current_burn_rate: 0.1,
             current_kappa: 0.1,
         }
     }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct LocalMetrics {
-    pub orphan_count: u32,
-    pub max_reorg_depth: u32,
-    pub beacon_providers: HashSet<Vec<u8>>,
-}
-
-#[derive(Debug, Default)]
-pub struct VetoManager {
-    pub votes: HashMap<sha256d::Hash, HashSet<Vec<u8>>>,
-    pub weight: HashMap<sha256d::Hash, u64>,
-    pub blacklisted_blocks: HashSet<sha256d::Hash>,
 }
 
 pub struct Blockchain {
@@ -162,7 +163,6 @@ impl Blockchain {
         ldd_state.current_psi = consensus_params.psi_slot_gap.max(2);
         ldd_state.current_gamma = consensus_params.gamma_recovery_threshold;
         ldd_state.current_target_block_time = consensus_params.target_block_time;
-        // Start with a small window (10) for rapid initial adjustment
         ldd_state.current_adjustment_window = 10;
         ldd_state.next_adjustment_height = 10;
         ldd_state.current_burn_rate = fee_params.min_burn_rate;
@@ -241,7 +241,6 @@ impl Blockchain {
             bc.best_header_tip = best_tip;
             bc.best_header_work = best_work;
 
-            // Load saved LDD state pointer if available, otherwise default to config
             if let Some(height_bytes) = bc.meta_tree.get("next_adjustment_height")? {
                 let mut arr = [0u8; 4]; arr.copy_from_slice(&height_bytes);
                 bc.ldd_state.next_adjustment_height = u32::from_be_bytes(arr);
@@ -279,15 +278,14 @@ impl Blockchain {
         }
 
         if header.vrf_proof.is_none() {
-            let target = BlockHeader::calculate_target(header.bits);
             let hash_val = BigUint::from_bytes_be(header.hash().as_ref());
-
             let ldd_target = self.get_next_pow_target(delta);
             
             if height > 64 && hash_val > ldd_target {
                  bail!("Rejection: Block {} does not meet PoW target for delta {}s", header.hash(), delta);
             }
 
+            let target = BlockHeader::calculate_target(header.bits);
             if hash_val > target { bail!("Invalid PoW in header"); }
 
             let easiest = BlockHeader::calculate_target(0x207fffff);
@@ -346,10 +344,12 @@ impl Blockchain {
         
         self.consensus_engine.difficulty_manager.set_state(
             self.ldd_state.f_a_pow.to_f64(),
-            self.ldd_state.f_a_pos.to_f64()
+            self.ldd_state.f_a_pos.to_f64(),
+            self.ldd_state.current_psi,
+            self.ldd_state.current_gamma,
         );
         
-        info!("[CONSENSUS] sync_staking_totals: Total Bonded Supply = {} tokens. Engine state updated.", self.total_staked);
+        info!("[CONSENSUS] sync_staking_totals: Total Bonded Supply = {} tokens. Engine state synchronized.", self.total_staked);
     }
 
     pub fn update_utxo_set(&mut self, block: &Block) -> Result<()> {
@@ -577,121 +577,57 @@ impl Blockchain {
         }
     }
 
-    pub fn get_adaptive_target_mu(&self, load: f64) -> f64 {
-        let mu_max = self.consensus_params.target_block_time as f64;
-        let psi = self.ldd_state.current_psi as f64;
-        let safety_margin = psi / 2.0; 
-        let mu_floor = psi + safety_margin;
-        
-        let range = mu_max - mu_floor;
-        let target = mu_max - (range * load);
-        target.max(mu_floor)
-    }
-
-    /// Autonomous Dynamic Adjust with Bootstrap Protection.
     pub fn adjust_ldd(&mut self) {
-        let consensus_values = self.dcs.calculate_consensus();
-        
-        // 1. Set Timing parameters
-        let delta_cons = (consensus_values.consensus_delay as f64 / 1000.0).ceil() as u32;
-        let safety_margin = delta_cons.max(1);
-        self.ldd_state.current_psi = (delta_cons + safety_margin).max(2);
+        let total_window_blocks = self.ldd_state.recent_blocks.len();
+        if total_window_blocks < 2 { return; }
 
-        // 1.1 Economic Immune Response
-        let beta_base = self.fee_params.min_burn_rate;
-        let k_sec = 0.5;
-        self.ldd_state.current_burn_rate = (beta_base + k_sec * consensus_values.security_threat_level)
-            .min(self.fee_params.max_burn_rate);
+        let n_pow = self.ldd_state.recent_blocks.iter().filter(|(_, is_pow)| *is_pow).count();
+        let n_pos = total_window_blocks.saturating_sub(n_pow);
 
-        // 1.2 Exploit Resilience - Clamped to prevent window disappearance
-        let n_base = 240.0;
-        let n_min = 10.0;
-        let n_new = (n_base - n_min) * (1.0 - consensus_values.security_threat_level) + n_min;
-        self.ldd_state.current_adjustment_window = (n_new.round() as usize).max(10);
-
-        // 2. Calculate Required effective slope M_req
-        let target_mu = self.get_adaptive_target_mu(consensus_values.consensus_load);
-        let mu_net = target_mu - self.ldd_state.current_psi as f64;
-        let mu_net = mu_net.max(1.0);
-        let m_req_base = std::f64::consts::PI / (2.0 * mu_net * mu_net);
-        
-        // 3. Speed Correction
-        let total_blocks = self.ldd_state.recent_blocks.len();
-        if total_blocks < 2 { return; }
-        
+        // Calculate Observed Mu (Actual Block Spacing)
         let start_time = self.ldd_state.recent_blocks.first().unwrap().0;
         let end_time = self.ldd_state.recent_blocks.last().unwrap().0;
-        let observed_duration = end_time.saturating_sub(start_time) as f64;
-        let observed_mu = observed_duration / (total_blocks - 1) as f64;
-        let observed_mu = observed_mu.max(1.0);
-        
-        // Speed scaling clamped between 0.25x and 4.0x
-        let speed_ratio = (observed_mu / target_mu).powi(2).max(0.25).min(4.0);
-        let m_req = m_req_base * speed_ratio;
+        let duration = end_time.saturating_sub(start_time);
+        let observed_mu = SlotDuration((duration as u64) / (total_window_blocks as u64 - 1));
 
-        // 4. Proportional Adjustment (Correct Balance) with Bootstrap Protection
-        let n_pow = self.ldd_state.recent_blocks.iter().filter(|(_, is_pow)| *is_pow).count();
-        let n_pos = total_blocks - n_pow;
+        let network_state = self.dcs.get_consensus_state();
+        let target_mu = SlotDuration(self.consensus_params.target_block_time);
 
-        let mut f_a_pow_prime = self.ldd_state.f_a_pow.to_f64();
-        let mut f_a_pos_prime = self.ldd_state.f_a_pos.to_f64();
+        let current_params = LddParams {
+            psi: SlotDuration(self.ldd_state.current_psi as u64),
+            gamma: SlotDuration(self.ldd_state.current_gamma as u64),
+            f_a_pow: Probability::from_num(self.ldd_state.f_a_pow.to_f64()),
+            f_a_pos: Probability::from_num(self.ldd_state.f_a_pos.to_f64()),
+        };
 
-        // AGGRESSIVE BOOTSTRAP OVERRIDE:
-        // If we are seeing 0 PoS blocks, the protocol is failing to incentivize staking.
-        // We override the standard PID controller to force a massive correction.
-        if n_pos == 0 {
-            warn!("[BOOTSTRAP] Zero Stakers detected. ENGAGING AGGRESSIVE MODE.");
-            
-            // 1. Force a small window to allow rapid iteration
-            self.ldd_state.current_adjustment_window = 10;
+        // Logic fix: Douglas-Peucker or PID-style speed adjustment
+        let new_params = calculate_next_difficulty(
+            &current_params,
+            network_state,
+            target_mu,
+            observed_mu,
+            n_pos,
+            total_window_blocks
+        );
 
-            // 2. Exponentially increase PoS probability (Amplitude)
-            // Doubling per window (10 blocks) will rapidly find the staking threshold.
-            f_a_pos_prime = f_a_pos_prime * 2.0;
-            
-            // Safety Clamp: Don't exceed 1.0 probability
-            if f_a_pos_prime > 1.0 { f_a_pos_prime = 1.0; }
+        // Update local state
+        self.ldd_state.current_psi = new_params.psi.0 as u32;
+        self.ldd_state.current_gamma = new_params.gamma.0 as u32;
+        self.ldd_state.f_a_pow = Fixed::from_f64(new_params.f_a_pow.to_f64());
+        self.ldd_state.f_a_pos = Fixed::from_f64(new_params.f_a_pos.to_f64());
 
-            // 3. Slightly penalize PoW to discourage pure-miner dominance without killing chain liveness
-            f_a_pow_prime = f_a_pow_prime * 0.90;
-
-        } else {
-            // Standard Control Loop logic for when system is balanced
-            let p_pow = n_pow as f64 / total_blocks as f64;
-            let error_val = p_pow - 0.5;
-            
-            let kappa = self.ldd_state.current_kappa;
-            f_a_pow_prime = f_a_pow_prime * (1.0 - kappa * error_val);
-            f_a_pos_prime = f_a_pos_prime * (1.0 + kappa * error_val);
-        }
-
-        // 5. Stability Scaling
-        let m_actual = f_a_pow_prime + f_a_pos_prime;
-        let beta = if m_actual > 0.0 { m_req / m_actual } else { 1.0 };
-        
-        let beta_pow = beta;
-        let beta_pos = if n_pos == 0 { beta.max(1.0) } else { beta };
-        
-        self.ldd_state.f_a_pow = Fixed::from_f64(f_a_pow_prime * beta_pow);
-        self.ldd_state.f_a_pos = Fixed::from_f64(f_a_pos_prime * beta_pos);
-
-        // 6. Update Baselines
+        // Refresh fallbacks
         let t_fallback = 300.0;
         let b_total = 1.0 / t_fallback;
-        let m_total_final = (f_a_pow_prime * beta_pow) + (f_a_pos_prime * beta_pos);
-        if m_total_final > 0.0 {
-            self.ldd_state.f_b_pow = Fixed::from_f64((b_total * (f_a_pow_prime * beta_pow / m_total_final)).min(f_a_pow_prime * beta_pow));
-            self.ldd_state.f_b_pos = Fixed::from_f64((b_total * (f_a_pos_prime * beta_pos / m_total_final)).min(f_a_pos_prime * beta_pos));
+        let sum_a = self.ldd_state.f_a_pow.to_f64() + self.ldd_state.f_a_pos.to_f64();
+        if sum_a > 0.0 {
+            self.ldd_state.f_b_pow = Fixed::from_f64(b_total * (self.ldd_state.f_a_pow.to_f64() / sum_a));
+            self.ldd_state.f_b_pos = Fixed::from_f64(b_total * (self.ldd_state.f_a_pos.to_f64() / sum_a));
         }
 
-        // 7. Set Optimal Window
-        let p_fallback: f64 = 0.01;
-        let xi_optimal = ((-2.0 * p_fallback.ln()) / m_req).sqrt();
-        self.ldd_state.current_gamma = self.ldd_state.current_psi + xi_optimal.ceil() as u32;
+        // Fixed: Ensure the engine receives the updated window (psi/gamma) immediately.
+        self.sync_staking_totals();
 
-        info!("[ADJUST] LDD Hardened Update. Mu(Obs/Tgt): {:.2}s/{:.2}s | Window: {} | fA_PoW: {:.6} | fA_PoS: {:.6}", 
-            observed_mu, target_mu, self.ldd_state.current_adjustment_window, self.ldd_state.f_a_pow.to_f64(), self.ldd_state.f_a_pos.to_f64());
-        
         self.ldd_state.recent_blocks.clear();
         self.dcs.reset_interval(); 
     }
@@ -732,7 +668,7 @@ impl Blockchain {
         let psi = self.ldd_state.current_psi;
         let gamma = self.ldd_state.current_gamma;
 
-        let result = if delta < psi {
+        if delta < psi {
             Fixed(0)
         } else if delta < gamma {
             let num = Fixed::from_integer((delta - psi) as u64);
@@ -740,12 +676,7 @@ impl Blockchain {
             if den.0 == 0 { f_b } else { f_a * (num / den) }
         } else {
             f_a
-        };
-
-        debug!("[LDD] calculate_hazard: Delta={}s | Psi={}s | Gamma={}s | fA={:.6} | fB={:.6} | Res={:.8}", 
-            delta, psi, gamma, f_a.to_f64(), f_b.to_f64(), result.to_f64());
-            
-        result
+        }
     }
 
     pub fn get_mempool_txs(&mut self) -> Vec<Transaction> { 
@@ -878,7 +809,7 @@ impl Blockchain {
         }
 
         let type_label = if is_pow { "PoW" } else { "PoS" };
-        info!("[CONSENSUS] Adopting {} block {} at height {}. Total Staked: {} SYN.", type_label, hash, block.height, self.total_staked);
+        info!("[CONSENSUS] Adopting {} block {} at height {}.", type_label, hash, block.height);
 
         self.blocks_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
         
@@ -901,17 +832,10 @@ impl Blockchain {
             if !self.is_syncing() {
                 self.ldd_state.recent_blocks.push((block.header.time, is_pow));
                 
-                // REFACTORED TRIGGER: Explicit height check instead of modulo
                 if block.height >= self.ldd_state.next_adjustment_height { 
-                    let old_n = self.ldd_state.current_adjustment_window;
                     self.adjust_ldd(); 
-                    
-                    // Update next target based on new N
                     self.ldd_state.next_adjustment_height = block.height + self.ldd_state.current_adjustment_window as u32;
                     self.meta_tree.insert("next_adjustment_height", self.ldd_state.next_adjustment_height.to_be_bytes().as_slice())?;
-                    
-                    info!("ADJUSTMENT: Height={}, Old N={}, New N={}. Next Target={}", 
-                          block.height, old_n, self.ldd_state.current_adjustment_window, self.ldd_state.next_adjustment_height);
                 }
             }
             self.update_and_execute_proposals();
@@ -946,40 +870,7 @@ impl Blockchain {
         Ok(())
     }
 
-    pub fn validate_beacon_bounties(&self, block: &Block) -> Result<()> {
-        let coinbase = block.transactions.get(0).ok_or(anyhow!("Missing coinbase"))?;
-        let pool = (self.consensus_params.coinbase_reward * BEACON_BOUNTY_POOL_PERCENT) / 100;
-        let per_beacon = if !block.beacons.is_empty() { pool / block.beacons.len() as u64 } else { 0 };
-        if per_beacon == 0 { return Ok(()); }
-        for beacon in &block.beacons {
-            let pk = PublicKey::from_slice(&beacon.public_key)?;
-            let addr = address_from_pubkey_hash(&hash_pubkey(&pk));
-            let found = coinbase.vout.iter().any(|out| {
-                out.value == per_beacon && out.script_pub_key == TxOut::new(0, addr.clone()).script_pub_key
-            });
-            if !found { bail!("Invalid Coinbase bounty."); }
-        }
-        Ok(())
-    }
-
-    pub fn get_block_locator(&self) -> Vec<sha256d::Hash> {
-        let mut locator = Vec::new();
-        let mut step = 1;
-        let mut index = self.headers.len() as i32 - 1;
-        while index >= 0 {
-            locator.push(self.headers[index as usize].hash());
-            if index == 0 { break; }
-            index -= step;
-            if locator.len() > 10 { step *= 2; }
-        }
-        if let Some(gen) = self.headers.first() {
-            let h = gen.hash();
-            if locator.last() != Some(&h) { locator.push(h); }
-        }
-        locator
-    }
-
-    fn handle_reorganization(&mut self, new_block_hash: sha256d::Hash) -> Result<()> {
+    pub fn handle_reorganization(&mut self, new_block_hash: sha256d::Hash) -> Result<()> {
         let ancestor = self.find_common_ancestor(self.tip, new_block_hash)?;
         if let Some(finalized) = self.last_finalized_checkpoint {
             if !self.is_block_in_path(finalized, new_block_hash)? { bail!("Irreversibility Violation"); }
@@ -1081,6 +972,23 @@ impl Blockchain {
             } else { break; }
         }
         bail!("No common ancestor")
+    }
+
+    pub fn get_block_locator(&self) -> Vec<sha256d::Hash> {
+        let mut locator = Vec::new();
+        let mut step = 1;
+        let mut index = self.headers.len() as i32 - 1;
+        while index >= 0 {
+            locator.push(self.headers[index as usize].hash());
+            if index == 0 { break; }
+            index -= step;
+            if locator.len() > 10 { step *= 2; }
+        }
+        if let Some(gen) = self.headers.first() {
+            let h = gen.hash();
+            if locator.last() != Some(&h) { locator.push(h); }
+        }
+        locator
     }
 
     pub fn update_and_execute_proposals(&mut self) {
