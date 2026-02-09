@@ -142,7 +142,8 @@ mod tests {
             tip_hash, 
             bits, 
             prev_block.height + 1, 
-            bc.consensus_params.block_version
+            bc.consensus_params.block_version,
+            0 // proven_burn: 0 for PoW/Tests
         );
         
         // Block::new initializes utxo_root to zero, so we must calculate it
@@ -350,7 +351,18 @@ mod tests {
                 let merkle_root = Block::compute_merkle_root(&transactions);
                 let current_time = { bc_arc_clone_pow.lock().await.get_block(&tip_hash).unwrap().header.time + 1 };
 
-                let mut header = BlockHeader { version, prev_blockhash: tip_hash, merkle_root, utxo_root, time: current_time, bits, nonce: 0, vrf_proof: None };
+                // Fix: Initialize BlockHeader with proven_burn: 0 for PoW
+                let mut header = BlockHeader { 
+                    version, 
+                    prev_blockhash: tip_hash, 
+                    merkle_root, 
+                    utxo_root, 
+                    time: current_time, 
+                    bits, 
+                    nonce: 0, 
+                    vrf_proof: None,
+                    proven_burn: 0 
+                };
 
                 while BigUint::from_bytes_be(header.hash().as_ref()) > target {
                     header.nonce = header.nonce.wrapping_add(1);
@@ -364,7 +376,15 @@ mod tests {
                     bc_lock.get_block(&tip_hash).unwrap().height + 1
                 };
                 
-                let mut block = Block::new(header.time, transactions, header.prev_blockhash, header.bits, height, header.version);
+                let mut block = Block::new(
+                    header.time, 
+                    transactions, 
+                    header.prev_blockhash, 
+                    header.bits, 
+                    height, 
+                    header.version, 
+                    0 // proven_burn
+                );
                 block.header = header;
                 return Ok((block, true));
             });

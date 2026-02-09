@@ -761,7 +761,8 @@ impl Blockchain {
             }
         }
         
-        let mut block = Block::new(now, transactions, self.tip, bits, prev.height + 1, version);
+        // Miners don't burn fees for consensus weight, so proven_burn is 0
+        let mut block = Block::new(now, transactions, self.tip, bits, prev.height + 1, version, 0);
         block.beacons = beacons_to_include.to_vec();
         block.header.utxo_root = self.calculate_utxo_root()?;
         Ok(block)
@@ -844,11 +845,23 @@ impl Blockchain {
             let fees_fixed = Fixed::from_integer(fees);
             let burn_rate_fixed = Fixed::from_f64(self.ldd_state.current_burn_rate);
             let required_burn = ((fees_fixed * burn_rate_fixed).0 >> 64) as u64;
-            let burned = block.transactions.get(0).map_or(0, |tx| {
+            // The BlockHeader now claims a burn amount. We must verify this claim matches the actual block contents.
+            let claimed_burn = block.header.proven_burn;
+            
+            // Check 1: Does the header claim enough burn given the fees?
+            // Note: In a real implementation, the burn amount might be static or calculated differently.
+            // For now, we ensure that if it claims to be a PoS block, it meets the protocol's burn requirement.
+            if claimed_burn < required_burn {
+                 bail!("Insufficient Burn Claim in Header: {} < Required {}", claimed_burn, required_burn);
+            }
+
+            // Check 2: Did the block actually burn the amount claimed in the header?
+            let actual_burned = block.transactions.get(0).map_or(0, |tx| {
                 tx.vout.iter().filter(|o| o.script_pub_key == vec![0x6a]).map(|o| o.value).sum::<u64>()
             });
-            if burned < required_burn { 
-                bail!("Insufficient Proof-of-Burn for block {} (Burned: {}, Required: {})", hash, burned, required_burn); 
+            
+            if actual_burned < claimed_burn {
+                bail!("Invalid Proof-of-Burn: Header claims {}, Block burned {}", claimed_burn, actual_burned);
             }
         }
 

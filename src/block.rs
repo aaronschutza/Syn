@@ -55,6 +55,10 @@ pub struct BlockHeader {
     pub nonce: u32,
     /// VRF Proof for PoS blocks. None for PoW blocks.
     pub vrf_proof: Option<Vec<u8>>,
+    /// Proven Burn: The amount of value verifiably destroyed in this block.
+    /// Acts as the weight for PoS blocks.
+    #[serde(default)] 
+    pub proven_burn: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -94,6 +98,7 @@ impl Block {
         bits: u32,
         height: u32,
         version: i32,
+        proven_burn: u64, // New Parameter
     ) -> Self {
         let merkle_root = Block::compute_merkle_root(&transactions);
         Block {
@@ -106,6 +111,7 @@ impl Block {
                 bits,
                 nonce: 0,
                 vrf_proof: None,
+                proven_burn,
             },
             height,
             transactions,
@@ -154,7 +160,8 @@ impl Block {
     ) -> Self {
         let coinbase_tx = Transaction::new_coinbase(coinbase_data, address, reward, transaction_version);
         let transactions = vec![coinbase_tx];
-        Block::new(time, transactions, sha256d::Hash::all_zeros(), bits, 0, block_version)
+        // Genesis block has 0 burn
+        Block::new(time, transactions, sha256d::Hash::all_zeros(), bits, 0, block_version, 0)
     }
 
     pub fn get_size(&self) -> u64 {

@@ -120,7 +120,8 @@ mod tests {
         let mut final_txs = vec![coinbase];
         final_txs.extend(txs);
 
-        let mut block = Block::new(time, final_txs, bc.tip, 0x207fffff, height, 1);
+        // Updated Block::new call with proven_burn: 0
+        let mut block = Block::new(time, final_txs, bc.tip, 0x207fffff, height, 1, 0);
         block.beacons = beacons;
         block.header.utxo_root = bc.calculate_utxo_root().unwrap();
 
@@ -229,14 +230,18 @@ mod tests {
         let prev_block = bc.get_block(&bc.tip).unwrap();
 
         let coinbase = Transaction::new_coinbase("PoS Mining".to_string(), wallet.get_address(), bc.consensus_params.coinbase_reward, 1);
-        let mut block = Block::new(Utc::now().timestamp() as u32, vec![coinbase, fee_tx], bc.tip, 0x207fffff, prev_block.height + 1, 1);
+        
+        // Updated Block::new call with proven_burn: 0
+        let mut block = Block::new(Utc::now().timestamp() as u32, vec![coinbase, fee_tx], bc.tip, 0x207fffff, prev_block.height + 1, 1, 0);
         block.header.vrf_proof = Some(vec![0u8; 64]);
         block.header.utxo_root = bc.calculate_utxo_root().unwrap();
 
         let result = bc.add_block(block);
         
         assert!(result.is_err(), "PoS block without Proof-of-Burn output should be rejected");
-        assert!(result.unwrap_err().to_string().contains("Insufficient Proof-of-Burn"));
+        // FIXED: Assertion updated to match new error message from Phase 3 security repair.
+        // The error is now "Insufficient Burn Claim in Header" when proven_burn is 0.
+        assert!(result.unwrap_err().to_string().contains("Insufficient Burn Claim"));
 
         cleanup_test_env(&node_config).await;
     }

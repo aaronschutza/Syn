@@ -117,9 +117,17 @@ pub fn create_pos_block(
     let mut txs = vec![coinbase];
     txs.extend(bc.get_mempool_txs());
     
+    // Calculate Burn for PoS
+    // In this iteration, we just calculate it from existing OP_RETURNs in mempool txs for now.
+    // Ideally, the validator should insert a burn transaction if required by protocol.
+    // For now, we assume 0 burn for simplicity in block creation, relying on tests/users to submit fee txs.
+    let proven_burn = 0; 
+
     let prev = bc.get_block(&bc.tip).ok_or("Tip missing")?;
     let bits = bc.get_next_work_required(false, delta);
-    let mut block = Block::new(timestamp, txs, bc.tip, bits, prev.height + 1, bc.consensus_params.block_version);
+    
+    // Updated Block::new call with proven_burn
+    let mut block = Block::new(timestamp, txs, bc.tip, bits, prev.height + 1, bc.consensus_params.block_version, proven_burn);
     block.header.vrf_proof = Some(vrf_proof.to_vec());
     
     if let Ok(root) = bc.calculate_utxo_root() {

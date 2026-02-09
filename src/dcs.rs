@@ -1,6 +1,9 @@
 // src/dcs.rs - BFT-robust telemetry aggregation for adaptive security
 
 use crate::block::{Beacon, BeaconData};
+use crate::difficulty::NetworkState;
+use crate::units::{SlotDuration, Probability};
+use fixed::types::U64F64;
 
 /// The Decentralized Consensus Service (F_DCS)
 /// Aggregates on-chain beacons to provide metrics for Adaptive Protocol Homeostasis.
@@ -23,6 +26,11 @@ pub struct ConsensusValues {
     pub consensus_load: f64,
     pub security_threat_level: f64, // S_threat [0.0 - 1.0]
     pub chain_health_score: f64,     // H_chain [0.0 - 1.0]
+}
+
+/// Interface for supplying network state to the LDD controller.
+pub trait ConsensusOracle {
+    fn get_consensus_state(&self) -> NetworkState;
 }
 
 impl DecentralizedConsensusService {
@@ -108,5 +116,40 @@ impl DecentralizedConsensusService {
         v.sort_unstable();
         let idx = ((v.len() as u64 - 1) * percentile as u64 / 100) as usize;
         Some(v[idx.min(v.len() - 1)])
+    }
+}
+
+impl ConsensusOracle for DecentralizedConsensusService {
+    fn get_consensus_state(&self) -> NetworkState {
+        let values = self.calculate_consensus();
+        
+        // Convert primitives to Type-Safe Units
+        // Delay beacon is in ms, convert to seconds
+        let consensus_delay = SlotDuration((values.consensus_delay as u64 / 1000).max(1)); 
+        let consensus_load = Probability(U64F64::from_num(values.consensus_load));
+        let security_threat = Probability(U64F64::from_num(values.security_threat_level));
+
+        NetworkState {
+            consensus_delay,
+            consensus_load,
+            security_threat,
+        }
+    }
+}
+
+// Mock Oracle for Simulation/Testing
+pub struct MockOracle {
+    pub delay: u64,
+    pub load: f64,
+    pub threat: f64,
+}
+
+impl ConsensusOracle for MockOracle {
+    fn get_consensus_state(&self) -> NetworkState {
+        NetworkState {
+            consensus_delay: SlotDuration(self.delay),
+            consensus_load: Probability(U64F64::from_num(self.load)),
+            security_threat: Probability(U64F64::from_num(self.threat)),
+        }
     }
 }

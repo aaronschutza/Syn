@@ -33,6 +33,7 @@ pub mod client;
 pub mod difficulty;
 pub mod sync;
 pub mod units;
+pub mod weight; // Added
 
 // The tests module contains all the tests for the Synergeia library.
 #[cfg(test)]
