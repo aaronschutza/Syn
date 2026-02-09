@@ -88,9 +88,11 @@ pub fn is_eligible_to_stake(wallet: &Wallet, bc: &Blockchain, current_slot: u64)
 
     let alpha_i = Fixed::from_integer(amount) / total_stake;
 
+    // Use full Phi calculation: 1 - (1-f)^alpha
+    // Using deterministic binomial expansion
     let phi = match bc.consensus_params.pos_precision.as_str() {
         "test" => Fixed::from_f64(0.99),
-        _ => alpha_i * f_d,
+        _ => Fixed::consensus_phi(f_d, alpha_i),
     };
 
     let mut y_bytes = [0u8; 16];

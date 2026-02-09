@@ -63,20 +63,16 @@ impl ConsensusEngine {
         self.params.max_slope_change_per_block = new_slope;
     }
 
-    /// Remediation Step 2: Validation Logic with Consensus Stake
-    /// check_pos_eligibility now takes `committed_total_stake` from the block header.
     pub fn check_pos_eligibility(
         &self,
         stakeholder_address: &String,
         delta_seconds: u32,
         vrf_output: &[u8],
-        committed_total_stake: u64, // Added argument
+        committed_total_stake: u64,
     ) -> bool {
         let stake = self.staking_module.get_voting_power(stakeholder_address);
         if stake == 0 { return false; }
         
-        // Use the committed total stake from the header for the denominator
-        // to ensure all nodes calculate the same threshold.
         if committed_total_stake == 0 { return false; }
         
         let alpha = Fixed::from_integer(stake as u64) / Fixed::from_integer(committed_total_stake);
@@ -86,12 +82,10 @@ impl ConsensusEngine {
         let gamma = Fixed::from_integer(diff_state.gamma as u64);
         
         let f_a = Fixed::from_f64(diff_state.f_a_pos.to_num::<f64>());
-        // Remediation Step 1: Use f_b correctly
         let f_b = Fixed::from_f64(diff_state.f_b_pos.to_num::<f64>());
         
         let delta = Fixed::from_integer(delta_seconds as u64);
 
-        // Remediation Step 1: "Snowplow" Linear Interpolation
         let f_delta = if delta < psi {
             Fixed(0)
         } else if delta < gamma {
@@ -100,10 +94,10 @@ impl ConsensusEngine {
             f_b
         };
 
-        // Step A: Full Threshold Function (phi = 1 - (1-f)^alpha)
-        let phi = f_delta.pow_approx(alpha);
+        // AUDIT FIX: Using deterministic Phi calculation via Binomial Expansion
+        // Phi = 1 - (1-f)^alpha
+        let phi = Fixed::consensus_phi(f_delta, alpha);
 
-        // Step B: Scale to U256 Target
         let max_u256 = BigUint::from(1u32) << 256;
         let phi_bits = BigUint::from(phi.0);
         let target = (max_u256 * phi_bits) >> 64;

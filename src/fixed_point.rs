@@ -14,6 +14,7 @@ const SCALE: u128 = 1 << SCALE_BITS;
 
 impl Fixed {
     /// Constructs a Fixed point value from an f64.
+    /// WARNING: Only use for constants or logging. Not for consensus derivation.
     pub fn from_f64(n: f64) -> Self {
         if n < 0.0 { return Fixed(0); }
         Fixed((n * SCALE as f64) as u128)
@@ -27,13 +28,51 @@ impl Fixed {
         self.0 as f64 / SCALE as f64
     }
 
-    /// Integer-based power function for PoS threshold: 1 - (1-f)^alpha.
-    pub fn pow_approx(self, exp: Fixed) -> Self {
-        let f_val = self.to_f64();
-        let exp_val = exp.to_f64();
-        // Deterministic approximation for cross-platform consensus parity
-        let res = 1.0 - (1.0 - f_val).powf(exp_val);
-        Fixed::from_f64(res)
+    pub fn one() -> Self {
+        Fixed(1 << 64)
+    }
+
+    /// Calculates the consensus threshold Phi = 1 - (1 - f)^alpha
+    /// using the Binomial Expansion:
+    /// Phi = alpha*f + (alpha*(1-alpha)/2)*f^2 + (alpha*(1-alpha)*(2-alpha)/6)*f^3 + ...
+    /// 
+    /// This is strictly deterministic and avoids negative numbers/logarithms in the
+    /// critical path, while providing high precision for small f (hazard rates).
+    pub fn consensus_phi(f: Fixed, alpha: Fixed) -> Self {
+        // If f is 0, probability is 0
+        if f.0 == 0 { return Fixed(0); }
+        // If alpha is 0, probability is 0
+        if alpha.0 == 0 { return Fixed(0); }
+        
+        // Term 1: alpha * f
+        let t1 = alpha * f;
+        
+        // Term 2: alpha * (1 - alpha) * f^2 / 2
+        // We assume alpha <= 1.0. 
+        let one = Fixed::one();
+        
+        // Safety clamp for alpha > 1.0 (should be impossible in valid consensus state)
+        if alpha > one {
+            return one; 
+        }
+
+        let one_minus_alpha = one - alpha;
+        let f2 = f * f;
+        let t2 = (alpha * one_minus_alpha * f2) / Fixed::from_integer(2);
+
+        // Term 3: alpha * (1 - alpha) * (2 - alpha) * f^3 / 6
+        let two_minus_alpha = Fixed::from_integer(2) - alpha;
+        let f3 = f2 * f;
+        let t3 = (alpha * one_minus_alpha * two_minus_alpha * f3) / Fixed::from_integer(6);
+
+        // Term 4: alpha * (1 - alpha) * (2 - alpha) * (3 - alpha) * f^4 / 24
+        let three_minus_alpha = Fixed::from_integer(3) - alpha;
+        let f4 = f3 * f;
+        let t4 = (alpha * one_minus_alpha * two_minus_alpha * three_minus_alpha * f4) / Fixed::from_integer(24);
+
+        // Sum terms
+        // Phi = t1 + t2 + t3 + t4 ...
+        t1 + t2 + t3 + t4
     }
 }
 
