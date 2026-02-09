@@ -30,6 +30,7 @@ pub mod client;
 pub mod difficulty;
 pub mod sync;
 pub mod runtime;
+pub mod units;
 
 use anyhow::Result;
 use clap::Parser;

@@ -32,6 +32,7 @@ pub mod storage;
 pub mod client;
 pub mod difficulty;
 pub mod sync;
+pub mod units;
 
 // The tests module contains all the tests for the Synergeia library.
 #[cfg(test)]
@@ -44,4 +45,6 @@ mod tests {
     mod integration_tests;
     // Tests for advanced adaptive features (DCS, Burst, LDD).
     mod advanced_feature_tests;
+    // Tests for difficulty adjustment logic (Liveness Repair).
+    mod difficulty_tests;
 }
