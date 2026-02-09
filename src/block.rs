@@ -17,13 +17,13 @@ pub enum BeaconData {
     /// Delay Beacon: Observed block propagation delay (in ms). Used for Adaptive Slot Gap.
     Delay(u32),
     /// Load Beacon: Observed transaction load (normalized 0.0-1.0). Used for Adaptive Target Slope.
-    Load(u64), // Changed to u64 for Hash compatibility or use a fixed-point bit representation
+    Load(u64), 
     /// Security Beacon: Observed threat metrics. Used for Adaptive Burn Rate.
     /// (orphan_count, max_reorg_depth)
     Security(u32, u32), 
     /// Topology Beacon: Observed chain structure. Used for Adaptive Burst Threshold.
     /// (branching_factor_bits, max_orphan_chain_length)
-    Topology(u64, u32), // Changed branching factor to u64 for Hash compatibility
+    Topology(u64, u32),
 }
 
 #[serde_as]
@@ -59,6 +59,10 @@ pub struct BlockHeader {
     /// Acts as the weight for PoS blocks.
     #[serde(default)] 
     pub proven_burn: u64,
+    /// Committed Total Stake: The denominator S_total used for relative stake calculation.
+    /// Remediation Step 2: Enforce a canonical view of S_total.
+    #[serde(default)]
+    pub committed_total_stake: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -98,7 +102,8 @@ impl Block {
         bits: u32,
         height: u32,
         version: i32,
-        proven_burn: u64, // New Parameter
+        proven_burn: u64,
+        committed_total_stake: u64, // Remediation Step 2
     ) -> Self {
         let merkle_root = Block::compute_merkle_root(&transactions);
         Block {
@@ -112,6 +117,7 @@ impl Block {
                 nonce: 0,
                 vrf_proof: None,
                 proven_burn,
+                committed_total_stake,
             },
             height,
             transactions,
@@ -160,8 +166,8 @@ impl Block {
     ) -> Self {
         let coinbase_tx = Transaction::new_coinbase(coinbase_data, address, reward, transaction_version);
         let transactions = vec![coinbase_tx];
-        // Genesis block has 0 burn
-        Block::new(time, transactions, sha256d::Hash::all_zeros(), bits, 0, block_version, 0)
+        // Genesis block has 0 burn and 0 stake commitment (bootstrap phase)
+        Block::new(time, transactions, sha256d::Hash::all_zeros(), bits, 0, block_version, 0, 0)
     }
 
     pub fn get_size(&self) -> u64 {

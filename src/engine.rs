@@ -1,4 +1,4 @@
-// src/engine.rs - Fully Deterministic Consensus Logic with Parity Fixes
+// src/engine.rs - Remediation Step 2 & 3: Validated Stakes & Physics
 
 use crate::params::{ParamManager, ConsensusParams};
 use crate::stk_module::{StakingModule};
@@ -63,35 +63,41 @@ impl ConsensusEngine {
         self.params.max_slope_change_per_block = new_slope;
     }
 
-    /// Point 1 & 3: Unified eligibility logic using dynamic timing parameters.
+    /// Remediation Step 2: Validation Logic with Consensus Stake
+    /// check_pos_eligibility now takes `committed_total_stake` from the block header.
     pub fn check_pos_eligibility(
         &self,
         stakeholder_address: &String,
         delta_seconds: u32,
         vrf_output: &[u8],
+        committed_total_stake: u64, // Added argument
     ) -> bool {
         let stake = self.staking_module.get_voting_power(stakeholder_address);
         if stake == 0 { return false; }
         
-        let total_stake = self.staking_module.get_total_bonded_supply();
-        if total_stake == 0 { return false; }
+        // Use the committed total stake from the header for the denominator
+        // to ensure all nodes calculate the same threshold.
+        if committed_total_stake == 0 { return false; }
         
-        let alpha = Fixed::from_integer(stake as u64) / Fixed::from_integer(total_stake as u64);
+        let alpha = Fixed::from_integer(stake as u64) / Fixed::from_integer(committed_total_stake);
     
-        // Fixed: Reading synced LDD context from manager instead of hardcoding.
         let diff_state = self.difficulty_manager.get_state();
         let psi = Fixed::from_integer(diff_state.psi as u64); 
         let gamma = Fixed::from_integer(diff_state.gamma as u64);
         
         let f_a = Fixed::from_f64(diff_state.f_a_pos.to_num::<f64>());
+        // Remediation Step 1: Use f_b correctly
+        let f_b = Fixed::from_f64(diff_state.f_b_pos.to_num::<f64>());
+        
         let delta = Fixed::from_integer(delta_seconds as u64);
 
+        // Remediation Step 1: "Snowplow" Linear Interpolation
         let f_delta = if delta < psi {
             Fixed(0)
         } else if delta < gamma {
             f_a * ((delta - psi) / (gamma - psi))
         } else {
-            f_a / Fixed::from_integer(10)
+            f_b
         };
 
         // Step A: Full Threshold Function (phi = 1 - (1-f)^alpha)
@@ -104,7 +110,6 @@ impl ConsensusEngine {
 
         let vrf_val = BigUint::from_bytes_be(vrf_output);
 
-        // Step 3: Heartbeat Logging
         info!("[POS CHECK] Slot: {}, Delta: {}, f(d): {:.6}, Alpha: {:.6}, Phi: {:.6}, Target: {:x}", 
             delta_seconds, delta_seconds, f_delta.to_f64(), alpha.to_f64(), phi.to_f64(), target);
 

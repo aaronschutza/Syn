@@ -1,4 +1,4 @@
-// src/consensus.rs - Mining and Beaconing Loop with Wallet Reload Fix
+// src/consensus.rs - Mining Loop Updates for Remediation
 
 use crate::{
     block::{BeaconData, Beacon},
@@ -51,26 +51,18 @@ pub async fn start_consensus_loop(
 ) -> Result<()> {
     info!("Starting Synergeia Consensus Engine (Mode: {})", mode);
     
-    // IMPORTANT: Wallet is mutable so we can reload it
     let mut wallet = Wallet::load_from_file(&node_config)?;
-    
     let mut beacon_timer = tokio::time::interval(Duration::from_secs(30));
     let mut cdf_timer = tokio::time::interval(Duration::from_secs(10));
-    
-    // FIX: Timer to periodically check for wallet updates (e.g. after 'stake' RPC)
     let mut wallet_reload_timer = tokio::time::interval(Duration::from_secs(5));
-    
     let mut last_slot_log = 0;
 
     loop {
         tokio::select! {
             _ = wallet_reload_timer.tick() => {
-                // Reload wallet from disk to pick up changes made by RPC commands
                 if let Ok(new_wallet) = Wallet::load_from_file(&node_config) {
-                    // Check if stake info changed
                     let old_stake = wallet.stake_info.as_ref().map(|s| s.amount).unwrap_or(0);
                     let new_stake = new_wallet.stake_info.as_ref().map(|s| s.amount).unwrap_or(0);
-                    
                     if old_stake != new_stake {
                         info!("Consensus: Detected wallet update. Stake changed from {} to {}.", old_stake, new_stake);
                         wallet = new_wallet;
@@ -79,7 +71,6 @@ pub async fn start_consensus_loop(
             }
             
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                // 1. Gather Chain Statistics (Brief Lock)
                 let (last_height, delta, psi, bc_state, mempool_len) = {
                     let bc_lock = bc.lock().await;
                     let tip_hash = bc_lock.tip;
@@ -94,7 +85,6 @@ pub async fn start_consensus_loop(
                     (l_height, d, p, l_state, m_len)
                 };
 
-                // Heartbeat Logging with LDD Amplitudes to diagnose stalls
                 let now_u32 = Utc::now().timestamp() as u32;
                 if now_u32 > last_slot_log {
                     info!("[SLOT] H: {} | Delta: {}s/{}s | Amplitudes (PoW: {:.4}, PoS: {:.4}) | Burn: {:.2} | Mempool: {}", 
@@ -102,7 +92,7 @@ pub async fn start_consensus_loop(
                     last_slot_log = now_u32;
                 }
 
-                // 2. PoW Mining Logic
+                // PoW Mining
                 if mode == "miner" || mode == "full" {
                     if delta >= psi {
                         let mut bc_lock = bc.lock().await;
@@ -121,14 +111,13 @@ pub async fn start_consensus_loop(
                             let beacons = block.beacons.clone();
                             apply_beacon_rewards(&mut block, reward, &beacons);
                             let target = bc_lock.get_next_pow_target(delta);
-                            // Short PoW attempt
+                            
                             for _ in 0..2000 {
                                 if BigUint::from_bytes_be(block.header.hash().as_ref()) <= target {
-                                    let hash = block.header.hash();
                                     if bc_lock.add_block(block.clone()).is_ok() {
                                         info!("[MINED PoW] Block {} (Hash: {}..) - Broadcasted", 
                                             block.height, 
-                                            hash.to_string().get(0..8).unwrap_or(""));
+                                            block.header.hash().to_string().get(0..8).unwrap_or(""));
                                         let _ = p2p_tx.send(P2PMessage::NewBlock(Box::new(block)));
                                     }
                                     break;
@@ -139,12 +128,13 @@ pub async fn start_consensus_loop(
                     }
                 }
 
-                // 3. PoS Staking Logic
+                // PoS Staking
                 if mode == "staker" || mode == "full" {
                     let now_u64 = Utc::now().timestamp() as u64;
                     let mut bc_lock = bc.lock().await;
-                    if let Some((proof, delta_pos)) = pos::is_eligible_to_stake(&wallet, &bc_lock, now_u64) {
-                        match pos::create_pos_block(&mut bc_lock, &wallet, proof, delta_pos as u32, now_u32) {
+                    // Remediation Step 2: Use the committed total stake returned by check
+                    if let Some((proof, delta_pos, committed_total_stake)) = pos::is_eligible_to_stake(&wallet, &bc_lock, now_u64) {
+                        match pos::create_pos_block(&mut bc_lock, &wallet, proof, delta_pos as u32, now_u32, committed_total_stake) {
                             Ok(block) => {
                                 let hash = block.header.hash();
                                 let height = block.height;

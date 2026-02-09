@@ -1,4 +1,4 @@
-// src/pos.rs - Deterministic Proof-of-Stake Eligibility with Verbose Debugging
+// src/pos.rs - Remediation Step 1: Fixed Snowplow Curve Implementation
 
 use crate::{
     block::Block,
@@ -22,20 +22,26 @@ fn vrf_eval(seed: &[u8], sk: &SecretKey) -> (sha256d::Hash, [u8; 64]) {
     (vrf_hash, sig_bytes)
 }
 
-fn f_delta(delta: u64, f_a: Fixed, psi: u32, gamma: u32) -> Fixed {
+// Remediation Step 1: Correct Implementation of Equation (1)
+// f(delta) = 0 if delta < psi
+// f(delta) = f_a * (delta - psi) / (gamma - psi) if psi <= delta < gamma
+// f(delta) = f_b if delta >= gamma
+fn f_delta(delta: u64, f_a: Fixed, f_b: Fixed, psi: u32, gamma: u32) -> Fixed {
     if delta < psi as u64 {
         Fixed(0)
     } else if delta < gamma as u64 {
         let den = (gamma - psi) as u64;
         if den == 0 { return Fixed(0); }
         let num = delta.saturating_sub(psi as u64);
+        // Linear Interpolation (The Snowplow Ramp)
         f_a * (Fixed::from_integer(num) / Fixed::from_integer(den))
     } else {
-        f_a
+        // Recovery Phase: Flatline probability at f_b
+        f_b
     }
 }
 
-pub fn is_eligible_to_stake(wallet: &Wallet, bc: &Blockchain, current_slot: u64) -> Option<([u8; 64], u64)> {
+pub fn is_eligible_to_stake(wallet: &Wallet, bc: &Blockchain, current_slot: u64) -> Option<([u8; 64], u64, u64)> {
     let last_block = bc.get_block(&bc.tip)?;
     let parent_slot = last_block.header.time as u64;
     
@@ -54,13 +60,20 @@ pub fn is_eligible_to_stake(wallet: &Wallet, bc: &Blockchain, current_slot: u64)
 
     let (y, pi) = vrf_eval(seed_msg.as_ref(), &wallet.secret_key);
     
-    let f_d = f_delta(delta, bc.ldd_state.f_a_pos, bc.ldd_state.current_psi, bc.ldd_state.current_gamma);
+    // Remediation Step 1: Use the corrected hazard function with f_b
+    let f_d = f_delta(
+        delta, 
+        bc.ldd_state.f_a_pos, 
+        bc.ldd_state.f_b_pos, 
+        bc.ldd_state.current_psi, 
+        bc.ldd_state.current_gamma
+    );
 
+    // Remediation Step 2: Use the current agreed total stake for the header
     let total_bonded_supply = bc.consensus_engine.staking_module.get_total_bonded_supply() as u64;
     let total_stake = Fixed::from_integer(total_bonded_supply);
     
     if total_stake.0 == 0 { 
-        // Only warn once per slot/delta to avoid spamming if checking frequently
         if delta % 10 == 0 { warn!("PoS: Total Network Stake is 0. No one can win."); }
         return None; 
     }
@@ -83,10 +96,8 @@ pub fn is_eligible_to_stake(wallet: &Wallet, bc: &Blockchain, current_slot: u64)
     let mut y_bytes = [0u8; 16];
     y_bytes.copy_from_slice(&y[0..16]);
     
-    // Fixed point logic: shift right by 64 bits to normalize 128-bit hash to [0,1) in 64.64 fixed point
     let normalized_vrf = Fixed(u128::from_be_bytes(y_bytes) >> 64);
 
-    // DEBUG: Only log if we are past the slot gap (f_d > 0)
     if f_d.0 > 0 {
         info!(
             "PoS Check [Slot {} | Delta {}]: Stake {}/{} (alpha {:.4}) | f_delta {:.6} | Phi {:.6} | VRF {:.6} | Eligible: {}",
@@ -98,7 +109,8 @@ pub fn is_eligible_to_stake(wallet: &Wallet, bc: &Blockchain, current_slot: u64)
 
     if normalized_vrf < phi { 
         info!("*** PoS WINNER *** Slot {} | VRF {:.6} < Phi {:.6}", current_slot, normalized_vrf.to_f64(), phi.to_f64());
-        Some((pi, delta)) 
+        // Return total_bonded_supply to be committed to the header
+        Some((pi, delta, total_bonded_supply)) 
     } else { 
         None 
     }
@@ -110,6 +122,7 @@ pub fn create_pos_block(
     vrf_proof: [u8; 64],
     delta: u32,
     timestamp: u32,
+    committed_total_stake: u64, // Remediation Step 2 argument
 ) -> Result<Block, String> {
     let coinbase = Transaction::new_coinbase(
         "PoS Mining".into(), wallet.get_address(), bc.consensus_params.coinbase_reward, bc.consensus_params.transaction_version
@@ -117,17 +130,23 @@ pub fn create_pos_block(
     let mut txs = vec![coinbase];
     txs.extend(bc.get_mempool_txs());
     
-    // Calculate Burn for PoS
-    // In this iteration, we just calculate it from existing OP_RETURNs in mempool txs for now.
-    // Ideally, the validator should insert a burn transaction if required by protocol.
-    // For now, we assume 0 burn for simplicity in block creation, relying on tests/users to submit fee txs.
     let proven_burn = 0; 
 
     let prev = bc.get_block(&bc.tip).ok_or("Tip missing")?;
     let bits = bc.get_next_work_required(false, delta);
     
-    // Updated Block::new call with proven_burn
-    let mut block = Block::new(timestamp, txs, bc.tip, bits, prev.height + 1, bc.consensus_params.block_version, proven_burn);
+    // Remediation Step 2: Include committed_total_stake in the block header
+    let mut block = Block::new(
+        timestamp, 
+        txs, 
+        bc.tip, 
+        bits, 
+        prev.height + 1, 
+        bc.consensus_params.block_version, 
+        proven_burn,
+        committed_total_stake 
+    );
+    
     block.header.vrf_proof = Some(vrf_proof.to_vec());
     
     if let Ok(root) = bc.calculate_utxo_root() {

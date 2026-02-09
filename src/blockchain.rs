@@ -1,4 +1,4 @@
-// src/blockchain.rs - Full Audited Implementation with Sync Fixes
+// src/blockchain.rs - Remediation Step 4: Operational Reset and Validation
 
 use crate::{
     block::{Block, BlockHeader, Beacon},
@@ -84,14 +84,15 @@ pub struct LddState {
 
 impl Default for LddState {
     fn default() -> Self {
+        // Remediation Step 4: Operational Reset Safety Parameters
         Self {
-            f_a_pow: Fixed::from_f64(0.002),
-            f_a_pos: Fixed::from_f64(0.002),
-            f_b_pow: Fixed::from_f64(0.0002),
-            f_b_pos: Fixed::from_f64(0.0002),
+            f_a_pow: Fixed::from_f64(0.05), // Reset Amplitude
+            f_a_pos: Fixed::from_f64(0.05), // Reset Amplitude
+            f_b_pow: Fixed::from_f64(0.005),
+            f_b_pos: Fixed::from_f64(0.005),
             recent_blocks: Vec::new(),
-            current_psi: 2,  
-            current_gamma: 20, 
+            current_psi: 5,   // Reset Slot Gap
+            current_gamma: 50, // Reset Recovery Threshold
             current_target_block_time: 15,
             current_adjustment_window: 10,
             next_adjustment_height: 10,
@@ -160,11 +161,8 @@ impl Blockchain {
         let meta_tree = db.open_tree("chain_metadata")?;
 
         let mut ldd_state = LddState::default();
-        ldd_state.current_psi = consensus_params.psi_slot_gap.max(2);
-        ldd_state.current_gamma = consensus_params.gamma_recovery_threshold;
+        // Override with config only if config is more conservative, otherwise respect the safety patch
         ldd_state.current_target_block_time = consensus_params.target_block_time;
-        ldd_state.current_adjustment_window = 10;
-        ldd_state.next_adjustment_height = 10;
         ldd_state.current_burn_rate = fee_params.min_burn_rate;
 
         let mut bc = Blockchain {
@@ -600,7 +598,6 @@ impl Blockchain {
             f_a_pos: Probability::from_num(self.ldd_state.f_a_pos.to_f64()),
         };
 
-        // Logic fix: Douglas-Peucker or PID-style speed adjustment
         let new_params = calculate_next_difficulty(
             &current_params,
             network_state,
@@ -625,7 +622,6 @@ impl Blockchain {
             self.ldd_state.f_b_pos = Fixed::from_f64(b_total * (self.ldd_state.f_a_pos.to_f64() / sum_a));
         }
 
-        // Fixed: Ensure the engine receives the updated window (psi/gamma) immediately.
         self.sync_staking_totals();
 
         self.ldd_state.recent_blocks.clear();
@@ -642,6 +638,7 @@ impl Blockchain {
         let hazard = if pow {
             self.calculate_hazard(delta, self.ldd_state.f_a_pow, self.ldd_state.f_b_pow)
         } else {
+            // Remediation Step 1 support: pass f_b_pos
             self.calculate_hazard(delta, self.ldd_state.f_a_pos, self.ldd_state.f_b_pos)
         };
 
@@ -673,9 +670,10 @@ impl Blockchain {
         } else if delta < gamma {
             let num = Fixed::from_integer((delta - psi) as u64);
             let den = Fixed::from_integer((gamma - psi) as u64);
+            // Remediation Step 1: Linear Interpolation
             if den.0 == 0 { f_b } else { f_a * (num / den) }
         } else {
-            f_a
+            f_b // Use correct fallback
         }
     }
 
@@ -711,7 +709,10 @@ impl Blockchain {
             }
         }
         
-        let mut block = Block::new(now, transactions, self.tip, bits, prev.height + 1, version, 0);
+        // Populate committed_total_stake with current view
+        let committed_total_stake = self.total_staked;
+
+        let mut block = Block::new(now, transactions, self.tip, bits, prev.height + 1, version, 0, committed_total_stake);
         block.beacons = beacons_to_include.to_vec();
         block.header.utxo_root = self.calculate_utxo_root()?;
         Ok(block)
@@ -763,7 +764,10 @@ impl Blockchain {
                             } else { "".to_string() }
                         }).unwrap_or_default();
 
-                    if !self.consensus_engine.check_pos_eligibility(&validator_addr, delta, vrf_hash.as_ref()) {
+                    // Remediation Step 2: Use committed_total_stake from the header
+                    let committed_stake = block.header.committed_total_stake;
+                    
+                    if !self.consensus_engine.check_pos_eligibility(&validator_addr, delta, vrf_hash.as_ref(), committed_stake) {
                         bail!("Rejection: Validator {} not eligible for PoS block at delta {}s", validator_addr, delta);
                     }
                 }
