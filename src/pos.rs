@@ -4,7 +4,7 @@ use crate::{
     block::Block,
     blockchain::Blockchain,
     fixed_point::Fixed,
-    transaction::Transaction,
+    transaction::{Transaction, TxOut},
     wallet::Wallet,
 };
 use bitcoin_hashes::{sha256d, Hash};
@@ -126,21 +126,45 @@ pub fn create_pos_block(
     timestamp: u32,
     committed_total_stake: u64, // Remediation Step 2 argument
 ) -> Result<Block, String> {
-    let coinbase = Transaction::new_coinbase(
+    let mut coinbase = Transaction::new_coinbase(
         "PoS Mining".into(), wallet.get_address(), bc.consensus_params.coinbase_reward, bc.consensus_params.transaction_version
     );
-    let mut txs = vec![coinbase];
-    txs.extend(bc.get_mempool_txs());
+    let mut txs = vec![coinbase.clone()]; // Temporary vec to calc fees
+    let mempool_txs = bc.get_mempool_txs();
+    txs.extend(mempool_txs.clone());
     
-    let proven_burn = 0; 
-
+    // Calculate required burn based on fees
+    // We construct a temporary block to reuse calculate_total_fees logic
     let prev = bc.get_block(&bc.tip).ok_or("Tip missing")?;
+    let temp_block = Block::new(timestamp, txs.clone(), bc.tip, 0, prev.height + 1, 1, 0, 0);
+    let fees = bc.calculate_total_fees(&temp_block);
+    
+    let burn_rate_fixed = bc.ldd_state.current_burn_rate;
+    // Calculate required burn: fees * burn_rate
+    let fees_fixed = Fixed::from_integer(fees);
+    // REMOVED: Fixed::from_f64() call on burn_rate_fixed
+    let proven_burn = ((fees_fixed * burn_rate_fixed).0 >> 64) as u64;
+
+    if proven_burn > 0 {
+        // Add burn output to coinbase
+        coinbase.vout.push(TxOut { value: proven_burn, script_pub_key: vec![0x6a] });
+        // Deduct from reward? Or is it additional cost?
+        // Protocol typically burns FEEs. The miner collects (Fees - Burn).
+        // If coinbase value was Reward, we should add (Fees - Burn).
+        // Since we don't have fee collection logic in new_coinbase (it just sets value=reward),
+        // we implicitly assume the miner takes the rest.
+        // However, we MUST include the burn output to pass validation.
+    }
+
+    let mut final_txs = vec![coinbase];
+    final_txs.extend(mempool_txs);
+
     let bits = bc.get_next_work_required(false, delta);
     
     // Remediation Step 2: Include committed_total_stake in the block header
     let mut block = Block::new(
         timestamp, 
-        txs, 
+        final_txs, 
         bc.tip, 
         bits, 
         prev.height + 1, 

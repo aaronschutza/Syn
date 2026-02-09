@@ -2,6 +2,7 @@
 
 use fixed::types::U64F64;
 use std::ops::{Add, Sub, Mul, Div};
+// use num_traits::ToPrimitive; // Removed unused import
 
 /// Represents Time (T) in seconds or slots.
 /// Unit: Seconds (s)
@@ -12,6 +13,40 @@ pub struct SlotDuration(pub u64);
 /// Range: [0.0, 1.0]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Probability(pub U64F64);
+
+impl Probability {
+    pub fn from_num<N: fixed::traits::ToFixed>(n: N) -> Self {
+        Probability(U64F64::from_num(n))
+    }
+    
+    pub fn to_f64(self) -> f64 {
+        self.0.to_num()
+    }
+
+    pub fn to_bits(self) -> u128 {
+        self.0.to_bits()
+    }
+
+    pub fn from_bits(bits: u128) -> Self {
+        Probability(U64F64::from_bits(bits))
+    }
+
+    /// Deterministic square root for Probability type.
+    pub fn sqrt(self) -> Self {
+        // Use the same BigUint logic as Fixed::sqrt to ensure safety and precision
+        // U64F64 is u128 bits, Q64.64.
+        let val: num_bigint::BigUint = num_bigint::BigUint::from(self.0.to_bits()) << 64;
+        let root = val.sqrt();
+        let bytes = root.to_bytes_be();
+        let mut buf = [0u8; 16];
+        if bytes.len() > 16 {
+             return Probability(U64F64::MAX);
+        }
+        let start = 16 - bytes.len();
+        buf[start..].copy_from_slice(&bytes);
+        Probability(U64F64::from_bits(u128::from_be_bytes(buf)))
+    }
+}
 
 /// Represents Frequency Squared (T^-2).
 /// Used for the Rayleigh slope parameter M.
@@ -125,16 +160,6 @@ impl Div<u64> for Probability {
 }
 
 // --- Helper Constructors ---
-
-impl Probability {
-    pub fn from_num<N: fixed::traits::ToFixed>(n: N) -> Self {
-        Probability(U64F64::from_num(n))
-    }
-    
-    pub fn to_f64(self) -> f64 {
-        self.0.to_num()
-    }
-}
 
 impl SlotDuration {
     pub fn new(seconds: u64) -> Self {

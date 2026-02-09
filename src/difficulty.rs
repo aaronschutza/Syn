@@ -10,7 +10,12 @@ use log::info;
 // Constants for Autonomous Adaptation
 const SAFETY_MARGIN_SECONDS: u64 = 1;
 const MIN_BLOCK_TIME_SECONDS: u64 = 1;
-const BASE_FALLBACK_PROBABILITY: f64 = 0.01;
+
+// Constant for -2.0 * ln(0.01) calculated in Q64.64 fixed point.
+// ln(0.01) approx -4.60517
+// -2 * -4.60517 approx 9.21034
+// 9.21034 as U64F64
+const LOG_FALLBACK_CONST: U64F64 = U64F64::from_bits(0x0000000000000009_35D8DD44BF000000); 
 
 /// Represents the dynamic state of the LDD parameters.
 #[derive(Debug, Clone)]
@@ -53,24 +58,26 @@ impl DynamicDifficultyManager {
 
     pub fn get_state(&self) -> DifficultyState {
         let params = self.state.read();
-        // Calculate f_b as derived from f_a (e.g. 1/10th)
-        let f_b_pos_val = params.f_a_pos.0.to_num::<f64>() / 10.0;
+        // Calculate f_b as derived from f_a (e.g. 1/10th) using fixed point math
+        let f_b_pos_val = I64F64::from_num(params.f_a_pos.0) / 10;
+        
         DifficultyState {
-            f_a_pow: I64F64::from_num(params.f_a_pow.0.to_num::<f64>()),
-            f_a_pos: I64F64::from_num(params.f_a_pos.0.to_num::<f64>()),
-            f_b_pos: I64F64::from_num(f_b_pos_val),
+            f_a_pow: I64F64::from_num(params.f_a_pow.0),
+            f_a_pos: I64F64::from_num(params.f_a_pos.0),
+            f_b_pos: f_b_pos_val,
             psi: params.psi.0 as u32,
             gamma: params.gamma.0 as u32,
         }
     }
 
-    pub fn set_state(&self, f_a_pow: f64, f_a_pos: f64, psi: u32, gamma: u32) {
+    // UPDATED: Now takes raw bits (u128) to avoid f64 non-determinism
+    pub fn set_state_from_bits(&self, f_a_pow_bits: u128, f_a_pos_bits: u128, psi: u32, gamma: u32) {
         let mut params = self.state.write();
-        params.f_a_pow = Probability::from_num(f_a_pow);
-        params.f_a_pos = Probability::from_num(f_a_pos);
+        params.f_a_pow = Probability::from_bits(f_a_pow_bits);
+        params.f_a_pos = Probability::from_bits(f_a_pos_bits);
         params.psi = SlotDuration(psi as u64);
         params.gamma = SlotDuration(gamma as u64);
-        info!("[LDD-SYNC] Engine view updated: PoW={:.8}, PoS={:.8}, Psi={}s, Gamma={}s", f_a_pow, f_a_pos, psi, gamma);
+        info!("[LDD-SYNC] Engine view updated: Psi={}s, Gamma={}s", psi, gamma);
     }
 
     pub fn record_block(&self, is_pow: bool, _block_height: u32) {
@@ -110,8 +117,19 @@ pub fn calculate_next_difficulty(
 
     // 3. Calculate new Window Size (Gamma)
     // Gamma is chosen such that the probability of failure (p_fallback) is low.
-    let xi_optimal = (U64F64::from_num(-2.0 * BASE_FALLBACK_PROBABILITY.ln()) / m_req).to_num::<f64>().sqrt();
-    let gamma_new = psi_new + SlotDuration(xi_optimal.ceil() as u64);
+    // REPLACED: Non-deterministic f64 logic with fixed point math.
+    // Original: (-2 * ln(P_fallback) / M_req).sqrt()
+    
+    // We use the pre-calculated log constant for P_fallback = 0.01
+    let ratio = LOG_FALLBACK_CONST / m_req;
+    let xi_optimal_prob = Probability(ratio).sqrt(); // Use deterministic sqrt
+    
+    // We need to convert the probability type back to a duration (u64)
+    // Ceiling logic: add approx 0.999 then floor (truncate)
+    let xi_val = xi_optimal_prob.0;
+    let xi_ceil = xi_val.ceil().to_num::<u64>();
+    
+    let gamma_new = psi_new + SlotDuration(xi_ceil);
 
     // Remediation Step 3: Recalibrate the Feedback Controller
     // Align physical units: f_A = M_req * (gamma - psi)
@@ -148,6 +166,7 @@ pub fn calculate_next_difficulty(
         let pos_adj = I64F64::from_num(1.0) + kappa * error_val;
         
         // Apply adjustments to the PHYSICALLY DERIVED base amplitude
+        // We cast back to U64F64 for the Probability wrapper.
         let pow_val = f_a_base * U64F64::from_num(pow_adj.max(I64F64::from_num(0.01)));
         let pos_val = f_a_base * U64F64::from_num(pos_adj.max(I64F64::from_num(0.01)));
         

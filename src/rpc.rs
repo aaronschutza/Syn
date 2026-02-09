@@ -121,7 +121,7 @@ async fn handle_request(
         "list_proposals" => list_proposals(req, blockchain).await,
         "vote" => vote(req, blockchain, node_config).await,
         "faucet" => faucet_coins(req, blockchain, p2p_tx).await, // Passed p2p_tx
-        "stake" => rpc_stake(req, blockchain, node_config).await,
+        "stake" => rpc_stake(req, blockchain, p2p_tx, node_config).await,
         _ => Ok(Box::new(warp::reply::json(&RpcError {
             jsonrpc: "2.0".to_string(),
             error: json!({"code": -32601, "message": "Method not found"}),
@@ -130,7 +130,7 @@ async fn handle_request(
     }
 }
 
-async fn rpc_stake(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, node_config: Arc<NodeConfig>) -> RpcResult {
+async fn rpc_stake(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, p2p_tx: broadcast::Sender<P2PMessage>, node_config: Arc<NodeConfig>) -> RpcResult {
     if req.params.len() != 2 {
         return create_error_reply(req.id, -32602, "Invalid params: expected [asset, amount]");
     }
@@ -140,29 +140,42 @@ async fn rpc_stake(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, node_con
         None => return create_error_reply(req.id, -32602, "Amount must be integer"),
     };
 
-    // 1. Update Wallet File (so pos.rs knows we are staking)
+    if asset != "SYN" {
+        return create_error_reply(req.id, -32602, "Only SYN asset supported for staking currently.");
+    }
+
+    // 1. Update Wallet File locally (for PoS mining to pick it up)
     let mut wallet = match Wallet::load_from_file(&node_config) {
         Ok(w) => w,
         Err(e) => return create_error_reply(req.id, -1, &format!("Wallet load error: {}", e)),
     };
     
+    // We update the local wallet file to track intentions, but consensus depends on the chain.
     wallet.stake_info = Some(StakeInfo { asset, amount });
     if let Err(e) = wallet.save_to_file(&node_config) {
         return create_error_reply(req.id, -1, &format!("Wallet save error: {}", e));
     }
 
-    // 2. Update Chain State (so eligibility math works)
-    let bc = blockchain.lock().await;
-    match bc.consensus_engine.staking_module.process_stake(wallet.get_address(), amount as u128) {
-        Ok(_) => {
-            info!("Stake registered: {} SYN for {}", amount, wallet.get_address());
+    // 2. Create and Broadcast Stake Transaction
+    let mut bc = blockchain.lock().await;
+    match Transaction::new_stake_transaction(&wallet, amount, &mut bc) {
+        Ok((tx, _)) => {
+            let txid = tx.id();
+            bc.mempool.insert(txid, tx.clone());
+            
+            if p2p_tx.send(P2PMessage::NewTransaction(tx)).is_err() {
+                 warn!("Failed to broadcast stake transaction to P2P network");
+                 // Don't error out the RPC call if just broadcast failed, as it's in mempool.
+            }
+            
+            info!("Stake transaction created: {} SYN. TXID: {}", amount, txid);
             Ok(Box::new(warp::reply::json(&RpcResponse {
                 jsonrpc: "2.0".to_string(),
-                result: json!(format!("Stake of {} SYN processed and wallet updated.", amount)),
+                result: json!(format!("Stake transaction {} created and broadcast. Wait for confirmation.", txid)),
                 id: req.id,
-            })))
+            })) as Box<dyn Reply>)
         },
-        Err(e) => create_error_reply(req.id, -1, &format!("Staking failed: {}", e)),
+        Err(e) => create_error_reply(req.id, -1, &format!("Staking transaction failed: {}", e)),
     }
 }
 
@@ -216,7 +229,7 @@ async fn faucet_coins(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, p2p_t
         jsonrpc: "2.0".to_string(),
         result: json!(txid.to_string()),
         id: req.id,
-    })))
+    })) as Box<dyn Reply>)
 }
 
 
@@ -247,7 +260,7 @@ async fn get_balance(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -> Rpc
         jsonrpc: "2.0".to_string(),
         result: json!(balance),
         id: req.id,
-    })))
+    })) as Box<dyn Reply>)
 }
 
 async fn send(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, p2p_tx: broadcast::Sender<P2PMessage>, node_config: Arc<NodeConfig>) -> RpcResult {
@@ -285,7 +298,7 @@ async fn send(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, p2p_tx: broad
                 jsonrpc: "2.0".to_string(),
                 result: json!(txid.to_string()),
                 id: req.id,
-            })))
+            })) as Box<dyn Reply>)
         }
         Err(e) => create_error_reply(req.id, -1, &e.to_string()),
     }
@@ -307,7 +320,7 @@ async fn print_chain(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -> Rpc
         jsonrpc: "2.0".to_string(),
         result: chain_info,
         id: req.id,
-    })))
+    })) as Box<dyn Reply>)
 }
 
 async fn get_block(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -> RpcResult {
@@ -322,7 +335,7 @@ async fn get_block(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -> RpcRe
         jsonrpc: "2.0".to_string(),
         result: json!(block),
         id: req.id,
-    })))
+    })) as Box<dyn Reply>)
 }
 
 async fn get_transaction(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -> RpcResult {
@@ -340,7 +353,7 @@ async fn get_transaction(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) ->
         jsonrpc: "2.0".to_string(),
         result: json!(tx),
         id: req.id,
-    })))
+    })) as Box<dyn Reply>)
 }
 
 async fn get_mempool_info(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -> RpcResult {
@@ -353,7 +366,7 @@ async fn get_mempool_info(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -
             "txids": mempool_txids
         }),
         id: req.id,
-    })))
+    })) as Box<dyn Reply>)
 }
 
 async fn initiate_withdrawal(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, p2p_tx: broadcast::Sender<P2PMessage>, node_config: Arc<NodeConfig>, _progonos_config: Arc<ProgonosConfig>) -> RpcResult {
@@ -390,7 +403,7 @@ async fn initiate_withdrawal(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>
             "burn_txid": txid.to_string(),
         }),
         id: req.id,
-    })))
+    })) as Box<dyn Reply>)
 }
 
 
@@ -435,7 +448,7 @@ async fn submit_deposit_proof(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>
                 jsonrpc: "2.0".to_string(),
                 result: json!("sBTC minting transaction created and sent to mempool."),
                 id: req.id,
-            })))
+            })) as Box<dyn Reply>)
         },
         Err(e) => create_error_reply(req.id, -1, &e.to_string()),
     }
@@ -457,7 +470,7 @@ async fn create_proposal(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, no
         jsonrpc: "2.0".to_string(),
         result: json!({ "message": "Proposal created successfully", "proposal_id": proposal_id }),
         id: req.id,
-    })))
+    })) as Box<dyn Reply>)
 }
 
 async fn list_proposals(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -> RpcResult {
@@ -467,7 +480,7 @@ async fn list_proposals(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>) -> 
         jsonrpc: "2.0".to_string(),
         result: json!(proposals),
         id: req.id,
-    })))
+    })) as Box<dyn Reply>)
 }
 
 async fn vote(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, node_config: Arc<NodeConfig>) -> RpcResult {
@@ -482,7 +495,7 @@ async fn vote(req: RpcRequest, blockchain: Arc<Mutex<Blockchain>>, node_config: 
             jsonrpc: "2.0".to_string(),
             result: json!({ "message": "Vote cast successfully" }),
             id: req.id,
-        }))),
+        })) as Box<dyn Reply>),
         Err(e) => create_error_reply(req.id, -1, &e),
     }
 }

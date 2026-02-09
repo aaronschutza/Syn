@@ -109,6 +109,59 @@ impl Transaction {
         Ok((tx, prev_tx_outputs))
     }
 
+    /// Creates a transaction that burns tokens to register as a validator stake.
+    /// Format: OP_RETURN + "STAKE" + PubKeyHash
+    pub fn new_stake_transaction(
+        from_wallet: &Wallet,
+        amount: u64,
+        bc: &mut Blockchain,
+    ) -> Result<(Transaction, HashMap<sha256d::Hash, TxOut>)> {
+        // The staked amount is effectively "spent" into the contract.
+        // We also need to pay the standard network fee.
+        let fee = bc.consensus_params.fee_per_transaction;
+        let total_needed = amount + fee;
+        let (accumulated, unspent_outputs) = bc.find_spendable_outputs(&from_wallet.get_address(), total_needed)?;
+
+        let mut vin = Vec::new();
+        let mut prev_tx_outputs = HashMap::new();
+
+        for (txid, out_idx) in unspent_outputs {
+            let prev_tx = bc.get_transaction(&txid)?.ok_or_else(|| anyhow!("Prev tx missing"))?;
+            prev_tx_outputs.insert(txid, prev_tx.vout[out_idx as usize].clone());
+
+            vin.push(TxIn {
+                prev_txid: txid,
+                prev_vout: out_idx,
+                script_sig: vec![],
+                sequence: u32::MAX,
+            });
+        }
+
+        // Construct the Staking Output
+        // OP_RETURN (0x6a) + PUSH(5) + "STAKE" + PUSH(20) + <PubKeyHash>
+        let pk_hash = crate::crypto::hash_pubkey(&from_wallet.public_key);
+        let mut script_pub_key = vec![0x6a, 0x05];
+        script_pub_key.extend_from_slice(b"STAKE");
+        script_pub_key.push(0x14); // 20 bytes for RIPEMD160 hash
+        script_pub_key.extend_from_slice(pk_hash.as_ref());
+
+        // Value is the amount being staked
+        let mut vout = vec![TxOut { value: amount, script_pub_key }];
+        
+        // Change output
+        if accumulated > total_needed {
+            vout.push(TxOut::new(accumulated - total_needed, from_wallet.get_address()));
+        }
+
+        let mut tx = Transaction {
+            version: bc.consensus_params.transaction_version,
+            vin, vout, lock_time: 0,
+        };
+
+        from_wallet.sign_transaction(&mut tx, prev_tx_outputs.clone())?;
+        Ok((tx, prev_tx_outputs))
+    }
+
     pub fn create_burn_output(amount: u64) -> TxOut {
         TxOut { value: amount, script_pub_key: vec![0x6a] }
     }

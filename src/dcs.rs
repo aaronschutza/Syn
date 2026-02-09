@@ -23,9 +23,10 @@ pub struct ConsensusValues {
     pub median_time: u64,
     pub median_total_stake: u64,
     pub consensus_delay: u32,
-    pub consensus_load: f64,
-    pub security_threat_level: f64, // S_threat [0.0 - 1.0]
-    pub chain_health_score: f64,     // H_chain [0.0 - 1.0]
+    // CHANGED: Use fixed point for consensus values
+    pub consensus_load: U64F64,
+    pub security_threat_level: U64F64, // S_threat [0.0 - 1.0]
+    pub chain_health_score: U64F64,     // H_chain [0.0 - 1.0]
 }
 
 /// Interface for supplying network state to the LDD controller.
@@ -72,20 +73,38 @@ impl DecentralizedConsensusService {
         let p90_orphan = self.calculate_percentile(&self.orphan_rates, 90).unwrap_or(0);
         let p90_reorg = self.calculate_percentile(&self.reorg_depths, 90).unwrap_or(0);
         
-        let threat_orphan = (p90_orphan as f64 / 10.0).min(1.0); // Baseline: 10 orphans/window is max threat
-        let threat_reorg = (p90_reorg as f64 / 6.0).min(1.0);   // Baseline: 6 block reorg is max threat
+        // Use fixed point arithmetic for normalization
+        // threat_orphan = min(1.0, orphan / 10.0)
+        let orphan_u64 = U64F64::from_num(p90_orphan);
+        let ten = U64F64::from_num(10);
+        let threat_orphan = (orphan_u64 / ten).min(U64F64::ONE);
+
+        // threat_reorg = min(1.0, reorg / 6.0)
+        let reorg_u64 = U64F64::from_num(p90_reorg);
+        let six = U64F64::from_num(6);
+        let threat_reorg = (reorg_u64 / six).min(U64F64::ONE);
+        
         let s_threat = threat_orphan.max(threat_reorg);
 
         // 2. Calculate Chain Health Score (H_chain)
         // High branching factors pull H_chain towards 1.0
         let p90_branching = self.calculate_percentile_u64(&self.branching_factors, 90).unwrap_or(1_000_000);
-        let h_chain = ((p90_branching as f64 / 1_000_000.0) - 1.0).max(0.0).min(1.0);
+        
+        // health = clamp(((branching / 1,000,000) - 1.0), 0.0, 1.0)
+        let branching_u64 = U64F64::from_num(p90_branching);
+        let million = U64F64::from_num(1_000_000);
+        let ratio = branching_u64 / million;
+        let h_chain = ratio.saturating_sub(U64F64::ONE).min(U64F64::ONE);
+
+        // Consensus Load
+        let median_load_u64 = self.calculate_median_u64(&self.load_beacons).unwrap_or(0);
+        let consensus_load = U64F64::from_num(median_load_u64) / million;
 
         ConsensusValues {
             median_time: self.calculate_median(&self.time_beacons).unwrap_or(0),
             median_total_stake: self.calculate_median(&self.stake_beacons).unwrap_or(0),
             consensus_delay: self.calculate_percentile(&self.delay_beacons, 95).unwrap_or(0),
-            consensus_load: self.calculate_median_u64(&self.load_beacons).unwrap_or(0) as f64 / 1_000_000.0,
+            consensus_load,
             security_threat_level: s_threat,
             chain_health_score: h_chain,
         }
@@ -126,8 +145,8 @@ impl ConsensusOracle for DecentralizedConsensusService {
         // Convert primitives to Type-Safe Units
         // Delay beacon is in ms, convert to seconds
         let consensus_delay = SlotDuration((values.consensus_delay as u64 / 1000).max(1)); 
-        let consensus_load = Probability(U64F64::from_num(values.consensus_load));
-        let security_threat = Probability(U64F64::from_num(values.security_threat_level));
+        let consensus_load = Probability(values.consensus_load);
+        let security_threat = Probability(values.security_threat_level);
 
         NetworkState {
             consensus_delay,

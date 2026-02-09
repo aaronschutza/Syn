@@ -3,6 +3,8 @@
 use std::ops::{Add, Sub, Mul, Div};
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
+use fixed::types::U64F64;
+use std::fmt;
 
 /// A fixed-point number: 64 bits integer, 64 bits fractional part.
 /// Replaces floating point arithmetic to ensure cross-platform consensus determinism.
@@ -10,26 +12,62 @@ use serde::{Deserialize, Serialize};
 pub struct Fixed(pub u128);
 
 const SCALE_BITS: u32 = 64;
-const SCALE: u128 = 1 << SCALE_BITS;
+// const SCALE: u128 = 1 << SCALE_BITS;
 
 impl Fixed {
     /// Constructs a Fixed point value from an f64.
     /// WARNING: Only use for constants or logging. Not for consensus derivation.
     pub fn from_f64(n: f64) -> Self {
         if n < 0.0 { return Fixed(0); }
-        Fixed((n * SCALE as f64) as u128)
+        Fixed(U64F64::from_num(n).to_bits())
     }
 
     pub fn from_integer(n: u64) -> Self {
         Fixed((n as u128) << SCALE_BITS)
     }
 
+    pub fn from_bits(n: u128) -> Self {
+        Fixed(n)
+    }
+
+    pub fn to_bits(self) -> u128 {
+        self.0
+    }
+
     pub fn to_f64(self) -> f64 {
-        self.0 as f64 / SCALE as f64
+        U64F64::from_bits(self.0).to_num()
     }
 
     pub fn one() -> Self {
         Fixed(1 << 64)
+    }
+
+    /// Integer-based Square Root for Q64.64 Fixed Point.
+    /// Returns sqrt(x) in the same fixed point format.
+    /// Algorithm: Newton-Raphson on the underlying integer.
+    /// We want y = sqrt(x). In fixed point: Y = sqrt(X * 2^64).
+    /// To preserve precision, we calculate sqrt(X << 64) which gives sqrt(x)*2^64.
+    pub fn sqrt(self) -> Self {
+        if self.0 == 0 { return Fixed(0); }
+        
+        // We need 192 bits to hold self.0 << 64. 
+        // Since we don't have u192, we use BigUint for the intermediate calculation
+        // to ensure absolute correctness and safety.
+        let val: BigUint = BigUint::from(self.0) << 64;
+        let root = val.sqrt();
+        
+        // The result should fit in u128 because sqrt(max_u128 << 64) is approx max_u128 / 2^32 * 2^32 = max_u128.
+        // Actually sqrt(2^192) = 2^96, which fits in u128.
+        let bytes = root.to_bytes_be();
+        let mut buf = [0u8; 16];
+        if bytes.len() > 16 {
+            // Should theoretically not happen for valid Q64.64 ranges we care about, 
+            // but clamping for safety.
+            return Fixed(u128::MAX);
+        }
+        let start = 16 - bytes.len();
+        buf[start..].copy_from_slice(&bytes);
+        Fixed(u128::from_be_bytes(buf))
     }
 
     /// Calculates the consensus threshold Phi = 1 - (1 - f)^alpha
@@ -76,6 +114,12 @@ impl Fixed {
     }
 }
 
+impl fmt::Display for Fixed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_f64())
+    }
+}
+
 impl Add for Fixed {
     type Output = Self;
     fn add(self, other: Self) -> Self {
@@ -97,6 +141,11 @@ impl Mul for Fixed {
         let b = BigUint::from(other.0);
         let product = a * b;
         let scaled = product >> SCALE_BITS;
+        // Saturate on overflow
+        let bytes = scaled.to_bytes_be();
+        if bytes.len() > 16 {
+            return Fixed(u128::MAX);
+        }
         Fixed(scaled.try_into().unwrap_or(u128::MAX))
     }
 }
@@ -109,6 +158,10 @@ impl Div for Fixed {
         let b = BigUint::from(other.0);
         let scaled_a = a << SCALE_BITS;
         let res = scaled_a / b;
+        let bytes = res.to_bytes_be();
+        if bytes.len() > 16 {
+            return Fixed(u128::MAX);
+        }
         Fixed(res.try_into().unwrap_or(u128::MAX))
     }
 }

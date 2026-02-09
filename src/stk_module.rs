@@ -92,6 +92,25 @@ impl StakingModule {
         Ok(())
     }
 
+    /// Reduces the stake for a validator. Used during chain reorganization rollback.
+    pub fn reduce_stake(&self, address: &Address, amount: StakeAmount) -> Result<(), StakingError> {
+        let mut validators = self.validators.write();
+        if let Some(validator) = validators.get_mut(address) {
+            if validator.bonded_stake < amount {
+                return Err(StakingError::InvalidUnstakeAmount);
+            }
+            validator.bonded_stake -= amount;
+            if validator.bonded_stake == 0 {
+                validator.status = ValidatorStatus::Unbonded;
+            }
+            let mut total_supply = self.total_bonded_supply.write();
+            *total_supply = total_supply.saturating_sub(amount);
+            Ok(())
+        } else {
+            Err(StakingError::ValidatorNotActive)
+        }
+    }
+
     pub fn get_voting_power(&self, address: &Address) -> StakeAmount {
         let validators = self.validators.read();
         validators.get(address)

@@ -17,7 +17,7 @@ use crate::{
     units::{LddParams, SlotDuration, Probability},
 };
 use anyhow::{anyhow, bail, Result};
-use bitcoin_hashes::{sha256d, Hash};
+use bitcoin_hashes::{sha256d, Hash, hash160};
 use chrono::Utc;
 use num_traits::{ToPrimitive, Zero};
 use num_bigint::BigUint;
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use secp256k1::PublicKey;
 use sled::Batch;
 use serde::{Serialize, Deserialize};
-use log::info;
+use log::{info, warn};
 
 const MAX_BEACONS_PER_BLOCK: usize = 16;
 const MAX_UTXO_CACHE_SIZE: usize = 100000;
@@ -78,8 +78,9 @@ pub struct LddState {
     pub current_target_block_time: u64,
     pub current_adjustment_window: usize,
     pub next_adjustment_height: u32,
-    pub current_burn_rate: f64,
-    pub current_kappa: f64,
+    // CHANGED: Use Fixed for deterministic state
+    pub current_burn_rate: Fixed,
+    pub current_kappa: Fixed,
 }
 
 impl Default for LddState {
@@ -96,8 +97,8 @@ impl Default for LddState {
             current_target_block_time: 15,
             current_adjustment_window: 10,
             next_adjustment_height: 10,
-            current_burn_rate: 0.1,
-            current_kappa: 0.1,
+            current_burn_rate: Fixed::from_f64(0.1),
+            current_kappa: Fixed::from_f64(0.1),
         }
     }
 }
@@ -163,7 +164,8 @@ impl Blockchain {
         let mut ldd_state = LddState::default();
         // Override with config only if config is more conservative, otherwise respect the safety patch
         ldd_state.current_target_block_time = consensus_params.target_block_time;
-        ldd_state.current_burn_rate = fee_params.min_burn_rate;
+        // CHANGED: Use Fixed conversion for state
+        ldd_state.current_burn_rate = Fixed::from_f64(fee_params.min_burn_rate);
 
         let mut bc = Blockchain {
             db, blocks_tree, headers_tree, header_meta_tree, utxo_tree, addr_utxo_tree, tx_index_tree, btc_txid_tree, meta_tree,
@@ -340,9 +342,10 @@ impl Blockchain {
         let actual_bonded = self.consensus_engine.staking_module.get_total_bonded_supply();
         self.total_staked = actual_bonded as u64;
         
-        self.consensus_engine.difficulty_manager.set_state(
-            self.ldd_state.f_a_pow.to_f64(),
-            self.ldd_state.f_a_pos.to_f64(),
+        // CHANGED: Use set_state_from_bits to avoid float
+        self.consensus_engine.difficulty_manager.set_state_from_bits(
+            self.ldd_state.f_a_pow.to_bits(),
+            self.ldd_state.f_a_pos.to_bits(),
             self.ldd_state.current_psi,
             self.ldd_state.current_gamma,
         );
@@ -405,6 +408,20 @@ impl Blockchain {
             }
 
             for (i, vout) in tx.vout.iter().enumerate() {
+                // Check for STAKE transaction output (OP_RETURN + b"STAKE")
+                // Protocol Rule: Stake output format: 0x6a (OP_RETURN) | 0x05 (PUSH 5) | "STAKE" | 0x14 (PUSH 20) | <PubKeyHash>
+                if vout.script_pub_key.len() >= 27 && vout.script_pub_key[0] == 0x6a && vout.script_pub_key[1] == 0x05 && &vout.script_pub_key[2..7] == b"STAKE" {
+                    // Extract pubkey hash (20 bytes starting at index 8)
+                    let pubkey_hash_bytes = &vout.script_pub_key[8..28];
+                    let pk_hash = hash160::Hash::from_slice(pubkey_hash_bytes)?;
+                    let address = address_from_pubkey_hash(&pk_hash);
+                    
+                    info!("[STAKING] Detected on-chain stake for address {}: {} SYN", address, vout.value);
+                    if let Err(e) = self.consensus_engine.staking_module.process_stake(address, vout.value as u128) {
+                        warn!("Failed to process stake: {}", e);
+                    }
+                }
+
                 let entry = UtxoEntry { output: vout.clone(), height: block.height, is_coinbase: tx.is_coinbase() };
                 let mut utxo_key = Vec::with_capacity(36);
                 utxo_key.extend_from_slice(txid.as_ref());
@@ -760,7 +777,7 @@ impl Blockchain {
                         .map(|out| {
                             if out.script_pub_key.len() >= 25 {
                                 let pkh = &out.script_pub_key[3..23];
-                                address_from_pubkey_hash(&bitcoin_hashes::hash160::Hash::from_slice(pkh).unwrap())
+                                address_from_pubkey_hash(&hash160::Hash::from_slice(pkh).unwrap())
                             } else { "".to_string() }
                         }).unwrap_or_default();
 
@@ -791,7 +808,8 @@ impl Blockchain {
 
         if !is_pow {
             let fees_fixed = Fixed::from_integer(fees);
-            let burn_rate_fixed = Fixed::from_f64(self.ldd_state.current_burn_rate);
+            // CHANGED: Use Fixed rate
+            let burn_rate_fixed = self.ldd_state.current_burn_rate;
             let required_burn = ((fees_fixed * burn_rate_fixed).0 >> 64) as u64;
             let claimed_burn = block.header.proven_burn;
             
@@ -929,6 +947,18 @@ impl Blockchain {
     fn rollback_utxo_set(&mut self, block: &Block) -> Result<()> {
         let mut rolling_muhash = self.get_muhash_root()?;
         for tx in block.transactions.iter().rev() {
+            for vout in tx.vout.iter() {
+                // Rollback STAKE transaction (OP_RETURN + b"STAKE")
+                if vout.script_pub_key.len() >= 27 && vout.script_pub_key[0] == 0x6a && vout.script_pub_key[1] == 0x05 && &vout.script_pub_key[2..7] == b"STAKE" {
+                    let pubkey_hash_bytes = &vout.script_pub_key[8..28];
+                    if let Ok(pk_hash) = hash160::Hash::from_slice(pubkey_hash_bytes) {
+                        let address = address_from_pubkey_hash(&pk_hash);
+                        info!("[ROLLBACK] Reducing stake for address {}: {} SYN", address, vout.value);
+                        let _ = self.consensus_engine.staking_module.reduce_stake(&address, vout.value as u128);
+                    }
+                }
+            }
+
             let txid = tx.id();
             for (i, _) in tx.vout.iter().enumerate() {
                 let mut utxo_key = Vec::with_capacity(36);
