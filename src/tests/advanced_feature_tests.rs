@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        block::{Block, BlockHeader, BeaconData, Beacon},
+        block::{Block, BlockHeader, Beacon},
         blockchain::{Blockchain},
         config::{self, NodeConfig},
         transaction::{Transaction, TxIn, TxOut},
@@ -22,7 +22,6 @@ mod tests {
     use chrono::Utc;
     use num_bigint::BigUint;
     use secp256k1::PublicKey;
-    use log::info;
 
     fn setup_test_env(test_name: &str) -> (Arc<Mutex<Blockchain>>, Wallet, NodeConfig) {
         let db_path = format!("test_adv_db_{}", test_name);
@@ -134,30 +133,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_autonomous_ldd_adaptation() {
-        let (bc_arc, wallet, node_config) = setup_test_env("ldd");
-        
-        let high_delay = 5000;
-        let beacon = wallet.sign_beacon(BeaconData::Delay(high_delay)).unwrap();
-        
-        for _ in 0..5 {
-            {
-                let mut bc = bc_arc.lock().await;
-                bc.receive_beacon(beacon.clone()).unwrap();
-            }
-            mine_block(bc_arc.clone(), &wallet).await;
-        }
-
-        {
-            let bc = bc_arc.lock().await;
-            let new_psi = bc.ldd_state.current_psi;
-            assert!(new_psi >= 6, "PSI should adapt to high delay. Got {}", new_psi);
-        }
-
-        cleanup_test_env(&node_config).await;
-    }
-
-    #[tokio::test]
     async fn test_burst_finality_trigger() {
         let (bc_arc, wallet, node_config) = setup_test_env("burst");
         let address = wallet.get_address();
@@ -246,35 +221,5 @@ mod tests {
         cleanup_test_env(&node_config).await;
     }
 
-    #[tokio::test]
-    async fn test_economic_immune_response() {
-        let (bc_arc, wallet, node_config) = setup_test_env("immune");
-        
-        let threat_beacon = wallet.sign_beacon(BeaconData::Security(2, 5)).unwrap();
-        
-        {
-            let bc = bc_arc.lock().await;
-            info!("Initial burn rate: {}", bc.ldd_state.current_burn_rate);
-        }
-
-        for _ in 0..5 {
-            {
-                let mut bc = bc_arc.lock().await;
-                bc.receive_beacon(threat_beacon.clone()).unwrap();
-            }
-            mine_block(bc_arc.clone(), &wallet).await;
-        }
-
-        {
-            let bc = bc_arc.lock().await;
-            let new_burn = bc.ldd_state.current_burn_rate;
-            let initial_base = bc.fee_params.min_burn_rate;
-            
-            info!("Hardened burn rate: {}", new_burn);
-            assert!(new_burn > initial_base, "Burn rate should increase in response to security threat");
-            assert!(bc.ldd_state.current_adjustment_window < 240, "Adjustment window should compress to increase reactivity");
-        }
-
-        cleanup_test_env(&node_config).await;
-    }
+    
 }

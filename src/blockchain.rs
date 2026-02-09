@@ -61,6 +61,8 @@ pub struct LddState {
     pub current_gamma: u32,
     pub current_target_block_time: u64,
     pub current_adjustment_window: usize,
+    /// Explicit pointer tracking the height of the next scheduled difficulty adjustment.
+    pub next_adjustment_height: u32,
     pub current_burn_rate: f64,
     pub current_kappa: f64,
 }
@@ -76,7 +78,8 @@ impl Default for LddState {
             current_psi: 2,  
             current_gamma: 20, 
             current_target_block_time: 15,
-            current_adjustment_window: 100, 
+            current_adjustment_window: 10, // Reduced default window for faster initial adjustments
+            next_adjustment_height: 10, // Initial adjustment at block 10
             current_burn_rate: 0.1,
             current_kappa: 0.1,
         }
@@ -159,7 +162,9 @@ impl Blockchain {
         ldd_state.current_psi = consensus_params.psi_slot_gap.max(2);
         ldd_state.current_gamma = consensus_params.gamma_recovery_threshold;
         ldd_state.current_target_block_time = consensus_params.target_block_time;
-        ldd_state.current_adjustment_window = consensus_params.adjustment_window;
+        // Start with a small window (10) for rapid initial adjustment
+        ldd_state.current_adjustment_window = 10;
+        ldd_state.next_adjustment_height = 10;
         ldd_state.current_burn_rate = fee_params.min_burn_rate;
 
         let mut bc = Blockchain {
@@ -235,9 +240,14 @@ impl Blockchain {
             }
             bc.best_header_tip = best_tip;
             bc.best_header_work = best_work;
+
+            // Load saved LDD state pointer if available, otherwise default to config
+            if let Some(height_bytes) = bc.meta_tree.get("next_adjustment_height")? {
+                let mut arr = [0u8; 4]; arr.copy_from_slice(&height_bytes);
+                bc.ldd_state.next_adjustment_height = u32::from_be_bytes(arr);
+            }
         }
         
-        // Audited: Ensure staking totals are synced on startup
         bc.sync_staking_totals();
         Ok(bc)
     }
@@ -263,7 +273,6 @@ impl Blockchain {
 
         let delta = header.time.saturating_sub(prev_header.time);
         
-        // Audited: Bootstrap Grace Period (Height < 64) allows initial network bonding/sync
         let height = self.headers.len() as u32;
         if height > 64 && delta < self.ldd_state.current_psi {
             bail!("Protocol Violation: Block found before Slot Gap elapsed (Delta: {}s, Psi: {}s)", delta, self.ldd_state.current_psi);
@@ -275,7 +284,6 @@ impl Blockchain {
 
             let ldd_target = self.get_next_pow_target(delta);
             
-            // Audited: Validation logic with Bootstrap/Test leniency
             if height > 64 && hash_val > ldd_target {
                  bail!("Rejection: Block {} does not meet PoW target for delta {}s", header.hash(), delta);
             }
@@ -336,8 +344,6 @@ impl Blockchain {
         let actual_bonded = self.consensus_engine.staking_module.get_total_bonded_supply();
         self.total_staked = actual_bonded as u64;
         
-        // Audited: PERSIST the state change into the shared DifficultyManager.
-        // This ensures the stakers (consensus.rs loop) forge with current Rayleigh parameters.
         self.consensus_engine.difficulty_manager.set_state(
             self.ldd_state.f_a_pow.to_f64(),
             self.ldd_state.f_a_pos.to_f64()
@@ -523,7 +529,6 @@ impl Blockchain {
         if vrf_opt.is_none() {
             let easiest = BlockHeader::calculate_target(0x207fffff);
             let target = BlockHeader::calculate_target(block.header.bits);
-            // Audited: Fixed move error using clone()
             let easiest_val = if easiest.is_zero() { BigUint::from(1u32) } else { easiest.clone() };
             let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
             block.synergistic_work = (easiest_val / target_val).to_u64().unwrap_or(1);
@@ -531,7 +536,6 @@ impl Blockchain {
             let pow_target_bits = self.consensus_params.max_target_bits;
             let easiest = BlockHeader::calculate_target(0x207fffff);
             let target = BlockHeader::calculate_target(pow_target_bits);
-            // Audited: Fixed move error using clone()
             let easiest_val = if easiest.is_zero() { BigUint::from(1u32) } else { easiest.clone() };
             let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
             
@@ -573,11 +577,10 @@ impl Blockchain {
         }
     }
 
-    /// Audited: Adaptive Target Slope based on Load (Whitepaper 10.9)
     pub fn get_adaptive_target_mu(&self, load: f64) -> f64 {
         let mu_max = self.consensus_params.target_block_time as f64;
         let psi = self.ldd_state.current_psi as f64;
-        let safety_margin = psi / 2.0; // M_safety
+        let safety_margin = psi / 2.0; 
         let mu_floor = psi + safety_margin;
         
         let range = mu_max - mu_floor;
@@ -585,26 +588,26 @@ impl Blockchain {
         target.max(mu_floor)
     }
 
-    /// Audited: Implementation of "Autonomous Dynamic Adjust" (Whitepaper 10.12)
+    /// Autonomous Dynamic Adjust with Bootstrap Protection.
     pub fn adjust_ldd(&mut self) {
         let consensus_values = self.dcs.calculate_consensus();
         
-        // 1. Set Timing parameters (Enforce Floor to prevent racing)
+        // 1. Set Timing parameters
         let delta_cons = (consensus_values.consensus_delay as f64 / 1000.0).ceil() as u32;
         let safety_margin = delta_cons.max(1);
         self.ldd_state.current_psi = (delta_cons + safety_margin).max(2);
 
-        // 1.1 Economic Immune Response (WP 15.3)
+        // 1.1 Economic Immune Response
         let beta_base = self.fee_params.min_burn_rate;
         let k_sec = 0.5;
         self.ldd_state.current_burn_rate = (beta_base + k_sec * consensus_values.security_threat_level)
             .min(self.fee_params.max_burn_rate);
 
-        // 1.2 Exploit Resilience (WP 12.5)
+        // 1.2 Exploit Resilience - Clamped to prevent window disappearance
         let n_base = 240.0;
         let n_min = 10.0;
         let n_new = (n_base - n_min) * (1.0 - consensus_values.security_threat_level) + n_min;
-        self.ldd_state.current_adjustment_window = n_new.round() as usize;
+        self.ldd_state.current_adjustment_window = (n_new.round() as usize).max(10);
 
         // 2. Calculate Required effective slope M_req
         let target_mu = self.get_adaptive_target_mu(consensus_values.consensus_load);
@@ -612,12 +615,9 @@ impl Blockchain {
         let mu_net = mu_net.max(1.0);
         let m_req_base = std::f64::consts::PI / (2.0 * mu_net * mu_net);
         
-        // 3. Speed Correction (WP 10.7 - Step 2 Scaling)
+        // 3. Speed Correction
         let total_blocks = self.ldd_state.recent_blocks.len();
-        if total_blocks < 2 { 
-            debug!("[DEBUG] adjust_ldd skipped: Not enough blocks ({}).", total_blocks);
-            return; 
-        }
+        if total_blocks < 2 { return; }
         
         let start_time = self.ldd_state.recent_blocks.first().unwrap().0;
         let end_time = self.ldd_state.recent_blocks.last().unwrap().0;
@@ -625,25 +625,50 @@ impl Blockchain {
         let observed_mu = observed_duration / (total_blocks - 1) as f64;
         let observed_mu = observed_mu.max(1.0);
         
-        // Audited: Damping factors to prevent the "nuke" effect (0.5x to 2.0x limit)
+        // Speed scaling clamped between 0.25x and 4.0x
         let speed_ratio = (observed_mu / target_mu).powi(2).max(0.25).min(4.0);
         let m_req = m_req_base * speed_ratio;
 
-        // 4. Proportional Adjustment (Correct Balance)
+        // 4. Proportional Adjustment (Correct Balance) with Bootstrap Protection
         let n_pow = self.ldd_state.recent_blocks.iter().filter(|(_, is_pow)| *is_pow).count();
         let n_pos = total_blocks - n_pow;
-        let p_pow = n_pow as f64 / total_blocks as f64;
-        let error_val = p_pow - 0.5;
-        
-        let kappa = self.ldd_state.current_kappa;
-        let f_a_pow_prime = self.ldd_state.f_a_pow.to_f64() * (1.0 - kappa * error_val);
-        let f_a_pos_prime = self.ldd_state.f_a_pos.to_f64() * (1.0 + kappa * error_val);
 
-        // 5. Stability Scaling (Correct Speed)
+        let mut f_a_pow_prime = self.ldd_state.f_a_pow.to_f64();
+        let mut f_a_pos_prime = self.ldd_state.f_a_pos.to_f64();
+
+        // AGGRESSIVE BOOTSTRAP OVERRIDE:
+        // If we are seeing 0 PoS blocks, the protocol is failing to incentivize staking.
+        // We override the standard PID controller to force a massive correction.
+        if n_pos == 0 {
+            warn!("[BOOTSTRAP] Zero Stakers detected. ENGAGING AGGRESSIVE MODE.");
+            
+            // 1. Force a small window to allow rapid iteration
+            self.ldd_state.current_adjustment_window = 10;
+
+            // 2. Exponentially increase PoS probability (Amplitude)
+            // Doubling per window (10 blocks) will rapidly find the staking threshold.
+            f_a_pos_prime = f_a_pos_prime * 2.0;
+            
+            // Safety Clamp: Don't exceed 1.0 probability
+            if f_a_pos_prime > 1.0 { f_a_pos_prime = 1.0; }
+
+            // 3. Slightly penalize PoW to discourage pure-miner dominance without killing chain liveness
+            f_a_pow_prime = f_a_pow_prime * 0.90;
+
+        } else {
+            // Standard Control Loop logic for when system is balanced
+            let p_pow = n_pow as f64 / total_blocks as f64;
+            let error_val = p_pow - 0.5;
+            
+            let kappa = self.ldd_state.current_kappa;
+            f_a_pow_prime = f_a_pow_prime * (1.0 - kappa * error_val);
+            f_a_pos_prime = f_a_pos_prime * (1.0 + kappa * error_val);
+        }
+
+        // 5. Stability Scaling
         let m_actual = f_a_pow_prime + f_a_pos_prime;
         let beta = if m_actual > 0.0 { m_req / m_actual } else { 1.0 };
         
-        // Audited: Ratchet Prevention - Don't suppress underrepresented resources
         let beta_pow = beta;
         let beta_pos = if n_pos == 0 { beta.max(1.0) } else { beta };
         
@@ -667,10 +692,6 @@ impl Blockchain {
         info!("[ADJUST] LDD Hardened Update. Mu(Obs/Tgt): {:.2}s/{:.2}s | Window: {} | fA_PoW: {:.6} | fA_PoS: {:.6}", 
             observed_mu, target_mu, self.ldd_state.current_adjustment_window, self.ldd_state.f_a_pow.to_f64(), self.ldd_state.f_a_pos.to_f64());
         
-        if self.total_staked == 0 {
-            warn!("[WARN] LDD Adjustment detected ZERO Total Staked. PoS blocks will be impossible.");
-        }
-
         self.ldd_state.recent_blocks.clear();
         self.dcs.reset_interval(); 
     }
@@ -718,8 +739,6 @@ impl Blockchain {
             let den = Fixed::from_integer((gamma - psi) as u64);
             if den.0 == 0 { f_b } else { f_a * (num / den) }
         } else {
-            // Audited: Recovery phase logic - Nakamoto style constant hazard
-            // Hazard stays at the peak forging window amplitude for deltas >= gamma
             f_a
         };
 
@@ -761,7 +780,6 @@ impl Blockchain {
             }
         }
         
-        // Miners don't burn fees for consensus weight, so proven_burn is 0
         let mut block = Block::new(now, transactions, self.tip, bits, prev.height + 1, version, 0);
         block.beacons = beacons_to_include.to_vec();
         block.header.utxo_root = self.calculate_utxo_root()?;
@@ -789,14 +807,12 @@ impl Blockchain {
         let is_pow = block.header.vrf_proof.is_none();
         let fees = self.calculate_total_fees(&block);
 
-        // Audited: CRITICAL - Verify target eligibility before acceptance
         let prev_hash = block.header.prev_blockhash;
         if prev_hash != sha256d::Hash::all_zeros() {
             let prev_header_bytes = self.headers_tree.get(prev_hash.as_ref() as &[u8])?.unwrap();
             let prev_header: BlockHeader = bincode::deserialize(&prev_header_bytes)?;
             let delta = block.header.time.saturating_sub(prev_header.time);
             
-            // Audited: Bootstrap/Test Grace Period (Height < 64) allows initial network sync/bonding
             if block.height > 64 {
                 if is_pow {
                     let target = self.get_next_pow_target(delta);
@@ -804,11 +820,9 @@ impl Blockchain {
                         bail!("Rejection: Block {} does not meet PoW target for delta {}s", hash, delta);
                     }
                 } else {
-                    // PoS verification
                     let vrf_proof = block.header.vrf_proof.as_ref().ok_or_else(|| anyhow!("PoS block missing VRF"))?;
                     let vrf_hash = sha256d::Hash::hash(vrf_proof);
                     
-                    // Extract validator address from first output of coinbase
                     let validator_addr = block.transactions.first()
                         .and_then(|tx| tx.vout.first())
                         .map(|out| {
@@ -818,7 +832,6 @@ impl Blockchain {
                             } else { "".to_string() }
                         }).unwrap_or_default();
 
-                    // Audited: Direct eligibility check using authoritative local LddState
                     if !self.consensus_engine.check_pos_eligibility(&validator_addr, delta, vrf_hash.as_ref()) {
                         bail!("Rejection: Validator {} not eligible for PoS block at delta {}s", validator_addr, delta);
                     }
@@ -845,17 +858,12 @@ impl Blockchain {
             let fees_fixed = Fixed::from_integer(fees);
             let burn_rate_fixed = Fixed::from_f64(self.ldd_state.current_burn_rate);
             let required_burn = ((fees_fixed * burn_rate_fixed).0 >> 64) as u64;
-            // The BlockHeader now claims a burn amount. We must verify this claim matches the actual block contents.
             let claimed_burn = block.header.proven_burn;
             
-            // Check 1: Does the header claim enough burn given the fees?
-            // Note: In a real implementation, the burn amount might be static or calculated differently.
-            // For now, we ensure that if it claims to be a PoS block, it meets the protocol's burn requirement.
             if claimed_burn < required_burn {
                  bail!("Insufficient Burn Claim in Header: {} < Required {}", claimed_burn, required_burn);
             }
 
-            // Check 2: Did the block actually burn the amount claimed in the header?
             let actual_burned = block.transactions.get(0).map_or(0, |tx| {
                 tx.vout.iter().filter(|o| o.script_pub_key == vec![0x6a]).map(|o| o.value).sum::<u64>()
             });
@@ -869,7 +877,6 @@ impl Blockchain {
             bail!("Irreversibility Violation: Fork reverts finalized genesis.");
         }
 
-        // Audited: confirm block acceptance source
         let type_label = if is_pow { "PoW" } else { "PoS" };
         info!("[CONSENSUS] Adopting {} block {} at height {}. Total Staked: {} SYN.", type_label, hash, block.height, self.total_staked);
 
@@ -893,8 +900,18 @@ impl Blockchain {
 
             if !self.is_syncing() {
                 self.ldd_state.recent_blocks.push((block.header.time, is_pow));
-                if self.ldd_state.recent_blocks.len() >= self.ldd_state.current_adjustment_window { 
+                
+                // REFACTORED TRIGGER: Explicit height check instead of modulo
+                if block.height >= self.ldd_state.next_adjustment_height { 
+                    let old_n = self.ldd_state.current_adjustment_window;
                     self.adjust_ldd(); 
+                    
+                    // Update next target based on new N
+                    self.ldd_state.next_adjustment_height = block.height + self.ldd_state.current_adjustment_window as u32;
+                    self.meta_tree.insert("next_adjustment_height", self.ldd_state.next_adjustment_height.to_be_bytes().as_slice())?;
+                    
+                    info!("ADJUSTMENT: Height={}, Old N={}, New N={}. Next Target={}", 
+                          block.height, old_n, self.ldd_state.current_adjustment_window, self.ldd_state.next_adjustment_height);
                 }
             }
             self.update_and_execute_proposals();
