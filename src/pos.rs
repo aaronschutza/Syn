@@ -1,4 +1,4 @@
-// src/pos.rs - Deterministic Proof-of-Stake Eligibility
+// src/pos.rs - Deterministic Proof-of-Stake Eligibility with Verbose Debugging
 
 use crate::{
     block::Block,
@@ -10,6 +10,7 @@ use crate::{
 use bitcoin_hashes::{sha256d, Hash};
 use secp256k1::{Message, Secp256k1, SecretKey};
 use std::convert::TryInto;
+use log::{debug, info, warn, trace};
 
 fn vrf_eval(seed: &[u8], sk: &SecretKey) -> (sha256d::Hash, [u8; 64]) {
     let secp = Secp256k1::new();
@@ -39,7 +40,10 @@ pub fn is_eligible_to_stake(wallet: &Wallet, bc: &Blockchain, current_slot: u64)
     let parent_slot = last_block.header.time as u64;
     
     // Ensure we are ahead of the tip
-    if current_slot <= parent_slot { return None; }
+    if current_slot <= parent_slot { 
+        trace!("PoS: Current slot {} <= Parent slot {}", current_slot, parent_slot);
+        return None; 
+    }
     
     let delta = current_slot - parent_slot;
 
@@ -49,15 +53,26 @@ pub fn is_eligible_to_stake(wallet: &Wallet, bc: &Blockchain, current_slot: u64)
     let seed_msg = sha256d::Hash::hash(&seed_data);
 
     let (y, pi) = vrf_eval(seed_msg.as_ref(), &wallet.secret_key);
+    
     let f_d = f_delta(delta, bc.ldd_state.f_a_pos, bc.ldd_state.current_psi, bc.ldd_state.current_gamma);
 
-    // FIXED: Use the staking module as the source of truth for total bonded supply
     let total_bonded_supply = bc.consensus_engine.staking_module.get_total_bonded_supply() as u64;
     let total_stake = Fixed::from_integer(total_bonded_supply);
     
-    if total_stake.0 == 0 { return None; }
+    if total_stake.0 == 0 { 
+        // Only warn once per slot/delta to avoid spamming if checking frequently
+        if delta % 10 == 0 { warn!("PoS: Total Network Stake is 0. No one can win."); }
+        return None; 
+    }
     
     let amount = wallet.stake_info.as_ref().map_or(0, |s| s.amount);
+    if amount == 0 {
+        if delta % 10 == 0 { 
+             debug!("PoS: Local wallet has 0 stake. Ensure stake RPC was called and wallet reloaded.");
+        }
+        return None;
+    }
+
     let alpha_i = Fixed::from_integer(amount) / total_stake;
 
     let phi = match bc.consensus_params.pos_precision.as_str() {
@@ -67,9 +82,26 @@ pub fn is_eligible_to_stake(wallet: &Wallet, bc: &Blockchain, current_slot: u64)
 
     let mut y_bytes = [0u8; 16];
     y_bytes.copy_from_slice(&y[0..16]);
+    
+    // Fixed point logic: shift right by 64 bits to normalize 128-bit hash to [0,1) in 64.64 fixed point
     let normalized_vrf = Fixed(u128::from_be_bytes(y_bytes) >> 64);
 
-    if normalized_vrf < phi { Some((pi, delta)) } else { None }
+    // DEBUG: Only log if we are past the slot gap (f_d > 0)
+    if f_d.0 > 0 {
+        info!(
+            "PoS Check [Slot {} | Delta {}]: Stake {}/{} (alpha {:.4}) | f_delta {:.6} | Phi {:.6} | VRF {:.6} | Eligible: {}",
+            current_slot, delta, amount, total_bonded_supply, alpha_i.to_f64(), 
+            f_d.to_f64(), phi.to_f64(), normalized_vrf.to_f64(),
+            normalized_vrf < phi
+        );
+    }
+
+    if normalized_vrf < phi { 
+        info!("*** PoS WINNER *** Slot {} | VRF {:.6} < Phi {:.6}", current_slot, normalized_vrf.to_f64(), phi.to_f64());
+        Some((pi, delta)) 
+    } else { 
+        None 
+    }
 }
 
 pub fn create_pos_block(
@@ -89,5 +121,10 @@ pub fn create_pos_block(
     let bits = bc.get_next_work_required(false, delta);
     let mut block = Block::new(timestamp, txs, bc.tip, bits, prev.height + 1, bc.consensus_params.block_version);
     block.header.vrf_proof = Some(vrf_proof.to_vec());
+    
+    if let Ok(root) = bc.calculate_utxo_root() {
+        block.header.utxo_root = root;
+    }
+
     Ok(block)
 }

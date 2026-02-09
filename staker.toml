@@ -1,9 +1,9 @@
 [node]
-rpc_port = 9332                # Different RPC port
+rpc_port = 9332                
 rpc_host = "127.0.0.1"
-p2p_port = 9333                # Different P2P port
-db_path = "staker.db"          # Different database
-wallet_file = "staker-wallet.dat"  # Different wallet
+p2p_port = 9333                
+db_path = "staker.db"          
+wallet_file = "staker-wallet.dat"
 rpc_auth_token = "mysecrettoken"
 
 [p2p]
@@ -17,7 +17,7 @@ protocol_version = 1
 [consensus]
 bootstrap_nodes = ["127.0.0.1:8333"]
 target_block_time = 15
-adjustment_window = 100
+adjustment_window = 10 # Reduced to 10 for faster testnet convergence
 nakamoto_target_block_time = 600
 bootstrap_pos_block_threshold = 10
 psi_slot_gap = 2
@@ -29,7 +29,7 @@ coinbase_maturity = 100
 coinbase_reward = 5000000000
 fee_per_transaction = 1000
 max_target_bits = 0x1d00ffff
-genesis_timestamp = 1672531200 # IMPORTANT: Must be same as miner
+genesis_timestamp = 1672531200 
 genesis_bits = 0x1e0ffff0
 genesis_coinbase_data = "PoW + PoS < PoW * PoS"
 genesis_address = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"

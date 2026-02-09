@@ -15,9 +15,9 @@ reconnect_delay_secs = 30
 protocol_version = 1
 
 [consensus]
-bootstrap_nodes = [] # This is the first node, so it has no one to connect to
+bootstrap_nodes = [] 
 target_block_time = 15
-adjustment_window = 100
+adjustment_window = 10 # Reduced to 10 for faster testnet convergence
 nakamoto_target_block_time = 600
 psi_slot_gap = 2
 gamma_recovery_threshold = 20

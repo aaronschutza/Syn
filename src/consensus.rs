@@ -1,4 +1,4 @@
-// src/consensus.rs - Mining and Beaconing Loop with Robust Lock Handling
+// src/consensus.rs - Mining and Beaconing Loop with Wallet Reload Fix
 
 use crate::{
     block::{BeaconData, Beacon},
@@ -50,14 +50,34 @@ pub async fn start_consensus_loop(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
     info!("Starting Synergeia Consensus Engine (Mode: {})", mode);
-    let wallet = Wallet::load_from_file(&node_config)?;
+    
+    // IMPORTANT: Wallet is mutable so we can reload it
+    let mut wallet = Wallet::load_from_file(&node_config)?;
+    
     let mut beacon_timer = tokio::time::interval(Duration::from_secs(30));
     let mut cdf_timer = tokio::time::interval(Duration::from_secs(10));
+    
+    // FIX: Timer to periodically check for wallet updates (e.g. after 'stake' RPC)
+    let mut wallet_reload_timer = tokio::time::interval(Duration::from_secs(5));
     
     let mut last_slot_log = 0;
 
     loop {
         tokio::select! {
+            _ = wallet_reload_timer.tick() => {
+                // Reload wallet from disk to pick up changes made by RPC commands
+                if let Ok(new_wallet) = Wallet::load_from_file(&node_config) {
+                    // Check if stake info changed
+                    let old_stake = wallet.stake_info.as_ref().map(|s| s.amount).unwrap_or(0);
+                    let new_stake = new_wallet.stake_info.as_ref().map(|s| s.amount).unwrap_or(0);
+                    
+                    if old_stake != new_stake {
+                        info!("Consensus: Detected wallet update. Stake changed from {} to {}.", old_stake, new_stake);
+                        wallet = new_wallet;
+                    }
+                }
+            }
+            
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
                 // 1. Gather Chain Statistics (Brief Lock)
                 let (last_height, delta, psi, bc_state, mempool_len) = {

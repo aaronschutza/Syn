@@ -1,4 +1,4 @@
-// src/difficulty.rs - Authoritative LDD State Management
+// src/difficulty.rs - Authoritative LDD State Management with Retuned Defaults
 
 use fixed::types::I64F64;
 use crate::params::ParamManager;
@@ -17,8 +17,13 @@ pub struct DifficultyState {
 impl Default for DifficultyState {
     fn default() -> Self {
         Self {
-            // Initial conservative amplitudes to prevent block flooding during bootstrap
-            f_a_pow: I64F64::from_num(0.002),
+            // RETUNED: f_a_pow drastically reduced to 0.000005.
+            // Since PoW miners do ~4000 hashes/sec, and PoS stakers do 1 check/sec,
+            // PoW needs a much lower probability per-hash to balance the block times.
+            // 4000 * 0.000005 = 0.02 (Effective Hazard/sec)
+            // 1 * 0.002 = 0.002 (Effective Hazard/sec)
+            // This starts PoW slightly faster but within the same order of magnitude.
+            f_a_pow: I64F64::from_num(0.000005),
             f_a_pos: I64F64::from_num(0.002),
         }
     }
@@ -52,7 +57,7 @@ impl DynamicDifficultyManager {
         let mut state = self.state.write();
         state.f_a_pow = I64F64::from_num(f_a_pow);
         state.f_a_pos = I64F64::from_num(f_a_pos);
-        debug!("[LDD-SYNC] Engine view updated: PoW Amplitide={:.6}, PoS Amplitude={:.6}", f_a_pow, f_a_pos);
+        debug!("[LDD-SYNC] Engine view updated: PoW Amplitude={:.8}, PoS Amplitude={:.8}", f_a_pow, f_a_pos);
     }
 
     /// Records block production to help the node track local performance metrics.
@@ -62,6 +67,5 @@ impl DynamicDifficultyManager {
         } else {
             *self.pos_blocks_count.write() += 1;
         }
-        // Adjustment windows are now handled authoritatively by Blockchain::adjust_ldd.
     }
 }
