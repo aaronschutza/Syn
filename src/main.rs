@@ -31,6 +31,7 @@ pub mod difficulty;
 pub mod sync;
 pub mod runtime;
 pub mod units;
+pub mod weight;
 
 use anyhow::Result;
 use clap::Parser;

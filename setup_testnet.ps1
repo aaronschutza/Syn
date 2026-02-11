@@ -1,8 +1,8 @@
 #Requires -Version 5.1
 
 # --- Configuration ---
-$numMiners = 4
-$numStakers = 4
+$numMiners = 15
+$numStakers = 1
 $baseP2pPort = 10000
 $baseRpcPort = 20000
 $projectRoot = $PSScriptRoot

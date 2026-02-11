@@ -11,9 +11,6 @@ use log::info;
 const SAFETY_MARGIN_SECONDS: u64 = 1;
 const MIN_BLOCK_TIME_SECONDS: u64 = 1;
 
-// Constant for -2.0 * ln(0.01) calculated in Q64.64 fixed point.
-const LOG_FALLBACK_CONST: U64F64 = U64F64::from_bits(0x0000000000000009_35D8DD44BF000000); 
-
 /// Represents the dynamic state of the LDD parameters.
 #[derive(Debug, Clone)]
 pub struct DifficultyState {
@@ -92,10 +89,10 @@ pub fn calculate_next_difficulty(
     pos_count: usize,
     total_window_blocks: usize,
 ) -> LddParams {
-    // 1. Calculate new Slot Gap (Psi)
+    //  Calculate new Slot Gap (Psi)
     let psi_new = network_state.consensus_delay + SlotDuration(SAFETY_MARGIN_SECONDS);
 
-    // 2. Calculate Target Slope (M_req) based on Target Block Time (Mu)
+    //  Calculate Target Slope (M_req) based on Target Block Time (Mu)
     let mu_calc_target = if target_mu > psi_new {
         target_mu
     } else {
@@ -110,28 +107,14 @@ pub fn calculate_next_difficulty(
     // We calculate this for reference logging, but we drive adaptation via Beta.
     let m_req = pi_over_2 / tw_sq; 
 
-    // 3. Calculate new Window Size (Gamma)
-    let ratio = LOG_FALLBACK_CONST / m_req;
-    let xi_optimal_prob = Probability(ratio).sqrt();
-    let xi_val = xi_optimal_prob.0;
-    let xi_ceil = xi_val.ceil().to_num::<u64>();
-    let gamma_new = psi_new + SlotDuration(xi_ceil);
-
-    // Window scaling factor (if window changes, amplitude must scale to keep slope constant)
-    let old_window = (current_params.gamma - current_params.psi).0.max(1);
-    let new_window = (gamma_new - psi_new).0.max(1);
-    let window_scale = U64F64::from_num(new_window) / U64F64::from_num(old_window);
-
-    // 4. Resource Balancing (Beta & Kappa)
+    // Resource Balancing (Beta & Kappa)
     // Beta: Speed Correction. Observed / Target.
     let beta = if observed_mu.0 == 0 {
         U64F64::from_num(0.1) 
     } else {
         U64F64::from_num(observed_mu.0) / U64F64::from_num(mu_calc_target.0)
     };
-    // Clamp beta to prevent wild swings
-    let beta_clamped = beta.min(U64F64::from_num(4.0)).max(U64F64::from_num(0.25));
-    
+
     let kappa = I64F64::from_num(0.1);
 
     // Retrieve current amplitudes as U64F64
@@ -142,7 +125,7 @@ pub fn calculate_next_difficulty(
         // Bootstrap/Emergency Mode: PoS is missing.
         // Increase PoS difficulty (easier) significantly to invite stakers.
         // Decrease PoW difficulty (harder) if it's dominating too fast.
-        let pow_new = current_pow * beta_clamped * window_scale;
+        let pow_new = current_pow * beta;
         let pos_new = (current_pos * U64F64::from_num(2.0)).min(U64F64::ONE);
         (Probability(pow_new), Probability(pos_new))
     } else {
@@ -154,9 +137,9 @@ pub fn calculate_next_difficulty(
         let pow_adj = I64F64::from_num(1.0) - kappa * error_val;
         let pos_adj = I64F64::from_num(1.0) + kappa * error_val;
         
-        // Multiplicative update: Old * Beta * BalanceAdj * WindowScale
-        let pow_val = current_pow * beta_clamped * U64F64::from_num(pow_adj.max(I64F64::from_num(0.01))) * window_scale;
-        let pos_val = current_pos * beta_clamped * U64F64::from_num(pos_adj.max(I64F64::from_num(0.01))) * window_scale;
+        // Multiplicative update: Old * Beta * BalanceAdj
+        let pow_val = current_pow * beta * U64F64::from_num(pow_adj.max(I64F64::from_num(0.01)));
+        let pos_val = current_pos * beta * U64F64::from_num(pos_adj.max(I64F64::from_num(0.01)));
         
         // Safety Clamps
         let pow_final = pow_val.min(U64F64::ONE).max(U64F64::from_num(0.00000001));
@@ -166,15 +149,15 @@ pub fn calculate_next_difficulty(
     };
 
     info!(
-        "[LDD ADJUST] Mu_target: {}s | M_req: {:.8} | Beta: {:.4} | WinScale: {:.4} | fA_PoW: {:.8} -> {:.8} | fA_PoS: {:.8} -> {:.8}",
-        target_mu.0, m_req.to_num::<f64>(), beta_clamped.to_num::<f64>(), window_scale.to_num::<f64>(),
+        "[LDD ADJUST] Mu_target: {}s | M_req: {:.8} | Beta: {:.4} | fA_PoW: {:.8} -> {:.8} | fA_PoS: {:.8} -> {:.8}",
+        target_mu.0, m_req.to_num::<f64>(), beta.to_num::<f64>(),
         current_pow.to_num::<f64>(), f_a_pow_new.to_f64(), 
         current_pos.to_num::<f64>(), f_a_pos_new.to_f64()
     );
 
     LddParams {
-        psi: psi_new,
-        gamma: gamma_new,
+        psi: current_params.psi,
+        gamma: current_params.gamma,
         f_a_pow: f_a_pow_new,
         f_a_pos: f_a_pos_new,
     }

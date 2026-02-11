@@ -15,11 +15,12 @@ use crate::{
     client::SpvClientState,
     difficulty::calculate_next_difficulty, 
     units::{LddParams, SlotDuration, Probability},
+    weight::SynergisticWeight, // AUDIT FIX: Import Weight Trait
 };
 use anyhow::{anyhow, bail, Result};
 use bitcoin_hashes::{sha256d, Hash, hash160};
 use chrono::Utc;
-use num_traits::{ToPrimitive, Zero};
+// use num_traits::{ToPrimitive, Zero}; // Removed unused imports
 use num_bigint::BigUint;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use secp256k1::PublicKey;
 use sled::Batch;
 use serde::{Serialize, Deserialize};
 use log::{info, warn};
+use std::cmp;
 
 const MAX_BEACONS_PER_BLOCK: usize = 16;
 const MAX_UTXO_CACHE_SIZE: usize = 100000;
@@ -78,7 +80,6 @@ pub struct LddState {
     pub current_target_block_time: u64,
     pub current_adjustment_window: usize,
     pub next_adjustment_height: u32,
-    // CHANGED: Use Fixed for deterministic state
     pub current_burn_rate: Fixed,
     pub current_kappa: Fixed,
 }
@@ -86,20 +87,17 @@ pub struct LddState {
 impl Default for LddState {
     fn default() -> Self {
         // Remediation Step 4: Operational Reset Safety Parameters
-        // UPDATED DEFAULTS: 
-        // f_a_pow drastically reduced to 0.00001 to balance against high hashrate.
-        // f_a_pos increased to 0.25 to make Staking easier initially.
         Self {
             f_a_pow: Fixed::from_f64(0.01), 
             f_a_pos: Fixed::from_f64(0.05), 
             f_b_pow: Fixed::from_f64(0.001),
             f_b_pos: Fixed::from_f64(0.05),
             recent_blocks: Vec::new(),
-            current_psi: 5,   // Reset Slot Gap
-            current_gamma: 50, // Reset Recovery Threshold
+            current_psi: 5,
+            current_gamma: 50,
             current_target_block_time: 15,
-            current_adjustment_window: 10,
-            next_adjustment_height: 10,
+            current_adjustment_window: 3,
+            next_adjustment_height: 3,
             current_burn_rate: Fixed::from_f64(0.1),
             current_kappa: Fixed::from_f64(0.1),
         }
@@ -165,9 +163,7 @@ impl Blockchain {
         let meta_tree = db.open_tree("chain_metadata")?;
 
         let mut ldd_state = LddState::default();
-        // Override with config only if config is more conservative, otherwise respect the safety patch
         ldd_state.current_target_block_time = consensus_params.target_block_time;
-        // CHANGED: Use Fixed conversion for state
         ldd_state.current_burn_rate = Fixed::from_f64(fee_params.min_burn_rate);
 
         let mut bc = Blockchain {
@@ -291,17 +287,15 @@ impl Blockchain {
             let target = BlockHeader::calculate_target(header.bits);
             if hash_val > target { bail!("Invalid PoW in header"); }
 
-            let easiest = BlockHeader::calculate_target(0x207fffff);
-            let easiest_val = if easiest.is_zero() { BigUint::from(1u32) } else { easiest.clone() };
-            let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
-            return Ok((easiest_val / target_val).to_u64().unwrap_or(1));
+            // AUDIT FIX: Use shared SynergisticWeight trait for validation return value
+            // We return 0 here because the actual cumulative work is calculated later using the full block context if needed
+            // But for validation we just need to pass. The work value returned here is used for best_header selection.
+            // Using the trait:
+            let burn_rate = Probability::from_num(self.ldd_state.current_burn_rate.to_f64());
+            return Ok(header.calculate_synergistic_weight(burn_rate));
         } else {
-            let pow_target_bits = self.consensus_params.max_target_bits;
-            let easiest = BlockHeader::calculate_target(0x207fffff);
-            let target = BlockHeader::calculate_target(pow_target_bits);
-            let easiest_val = if easiest.is_zero() { BigUint::from(1u32) } else { easiest.clone() };
-            let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
-            return Ok((easiest_val / target_val).to_u64().unwrap_or(1));
+            let burn_rate = Probability::from_num(self.ldd_state.current_burn_rate.to_f64());
+            return Ok(header.calculate_synergistic_weight(burn_rate));
         }
     }
 
@@ -345,7 +339,6 @@ impl Blockchain {
         let actual_bonded = self.consensus_engine.staking_module.get_total_bonded_supply();
         self.total_staked = actual_bonded as u64;
         
-        // CHANGED: Use set_state_from_bits to avoid float
         self.consensus_engine.difficulty_manager.set_state_from_bits(
             self.ldd_state.f_a_pow.to_bits(),
             self.ldd_state.f_a_pos.to_bits(),
@@ -411,10 +404,7 @@ impl Blockchain {
             }
 
             for (i, vout) in tx.vout.iter().enumerate() {
-                // Check for STAKE transaction output (OP_RETURN + b"STAKE")
-                // Protocol Rule: Stake output format: 0x6a (OP_RETURN) | 0x05 (PUSH 5) | "STAKE" | 0x14 (PUSH 20) | <PubKeyHash>
                 if vout.script_pub_key.len() >= 27 && vout.script_pub_key[0] == 0x6a && vout.script_pub_key[1] == 0x05 && &vout.script_pub_key[2..7] == b"STAKE" {
-                    // Extract pubkey hash (20 bytes starting at index 8)
                     let pubkey_hash_bytes = &vout.script_pub_key[8..28];
                     let pk_hash = hash160::Hash::from_slice(pubkey_hash_bytes)?;
                     let address = address_from_pubkey_hash(&pk_hash);
@@ -542,30 +532,11 @@ impl Blockchain {
         }).sum()
     }
 
+    // AUDIT FIX: Dimensional Consistency for ASW
     pub fn calculate_synergistic_work(&self, block: &mut Block) {
-        let vrf_opt = &block.header.vrf_proof;
-        if vrf_opt.is_none() {
-            let easiest = BlockHeader::calculate_target(0x207fffff);
-            let target = BlockHeader::calculate_target(block.header.bits);
-            let easiest_val = if easiest.is_zero() { BigUint::from(1u32) } else { easiest.clone() };
-            let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
-            block.synergistic_work = (easiest_val / target_val).to_u64().unwrap_or(1);
-        } else {
-            let pow_target_bits = self.consensus_params.max_target_bits;
-            let easiest = BlockHeader::calculate_target(0x207fffff);
-            let target = BlockHeader::calculate_target(pow_target_bits);
-            let easiest_val = if easiest.is_zero() { BigUint::from(1u32) } else { easiest.clone() };
-            let target_val = if target.is_zero() { BigUint::from(1u32) } else { target };
-            
-            let base_pos_work = (easiest_val / target_val).to_u64().unwrap_or(1);
-
-            let entropy_bonus = if let Some(p) = &block.header.vrf_proof {
-                 let vrf_hash = sha256d::Hash::hash(p);
-                 (vrf_hash.to_byte_array()[0] as u64) % 10 
-            } else { 0 };
-
-            block.synergistic_work = base_pos_work + (base_pos_work * entropy_bonus / 100);
-        }
+        let burn_rate = Probability::from_num(self.ldd_state.current_burn_rate.to_f64());
+        // Delegate to the shared SynergisticWeight trait implementation
+        block.synergistic_work = block.header.calculate_synergistic_weight(burn_rate);
     }
 
     pub fn get_and_reset_metrics(&mut self) -> LocalMetrics {
@@ -602,11 +573,10 @@ impl Blockchain {
         let n_pow = self.ldd_state.recent_blocks.iter().filter(|(_, is_pow)| *is_pow).count();
         let n_pos = total_window_blocks.saturating_sub(n_pow);
 
-        // Calculate Observed Mu (Actual Block Spacing)
         let start_time = self.ldd_state.recent_blocks.first().unwrap().0;
         let end_time = self.ldd_state.recent_blocks.last().unwrap().0;
         let duration = end_time.saturating_sub(start_time);
-        // Avoid division by zero
+        
         let observed_mu = if total_window_blocks > 1 {
             SlotDuration((duration as u64) / (total_window_blocks as u64 - 1))
         } else {
@@ -616,11 +586,12 @@ impl Blockchain {
         let network_state = self.dcs.get_consensus_state();
         let target_mu = SlotDuration(self.consensus_params.target_block_time);
 
+        // Construct parameters using bitwise conversion to ensure exact preservation
         let current_params = LddParams {
             psi: SlotDuration(self.ldd_state.current_psi as u64),
             gamma: SlotDuration(self.ldd_state.current_gamma as u64),
-            f_a_pow: Probability::from_num(self.ldd_state.f_a_pow.to_f64()),
-            f_a_pos: Probability::from_num(self.ldd_state.f_a_pos.to_f64()),
+            f_a_pow: Probability::from_bits(self.ldd_state.f_a_pow.to_bits()),
+            f_a_pos: Probability::from_bits(self.ldd_state.f_a_pos.to_bits()),
         };
 
         let new_params = calculate_next_difficulty(
@@ -632,19 +603,35 @@ impl Blockchain {
             total_window_blocks
         );
 
-        // Update local state
         self.ldd_state.current_psi = new_params.psi.0 as u32;
         self.ldd_state.current_gamma = new_params.gamma.0 as u32;
-        self.ldd_state.f_a_pow = Fixed::from_f64(new_params.f_a_pow.to_f64());
-        self.ldd_state.f_a_pos = Fixed::from_f64(new_params.f_a_pos.to_f64());
+        self.ldd_state.f_a_pow = Fixed::from_bits(new_params.f_a_pow.to_bits());
+        self.ldd_state.f_a_pos = Fixed::from_bits(new_params.f_a_pos.to_bits());
 
-        // Refresh fallbacks
-        let t_fallback = 300.0;
-        let b_total = 1.0 / t_fallback;
-        let sum_a = self.ldd_state.f_a_pow.to_f64() + self.ldd_state.f_a_pos.to_f64();
-        if sum_a > 0.0 {
-            self.ldd_state.f_b_pow = Fixed::from_f64(b_total * (self.ldd_state.f_a_pow.to_f64() / sum_a));
-            self.ldd_state.f_b_pos = Fixed::from_f64(b_total * (self.ldd_state.f_a_pos.to_f64() / sum_a));
+        // Refresh fallbacks - STRICT DETERMINISTIC MATH
+        let t_fallback = self.consensus_params.nakamoto_target_block_time;
+        
+        // b_total = 1 / t_fallback
+        let t_fallback_fixed = Fixed::from_integer(t_fallback);
+        let b_total = if t_fallback_fixed.0 > 0 {
+            Fixed::one() / t_fallback_fixed
+        } else {
+            Fixed::from_integer(0) 
+        };
+
+        let sum_a = self.ldd_state.f_a_pow + self.ldd_state.f_a_pos;
+        
+        if sum_a.0 > 0 {
+            // f_b_pow_target = b_total * (f_a_pow / sum_a)
+            let ratio_pow = self.ldd_state.f_a_pow / sum_a;
+            let f_b_pow_target = b_total * ratio_pow;
+            
+            let ratio_pos = self.ldd_state.f_a_pos / sum_a;
+            let f_b_pos_target = b_total * ratio_pos;
+
+            // Safety: f_b cannot be easier (larger) than f_a
+            self.ldd_state.f_b_pow = cmp::min(f_b_pow_target, self.ldd_state.f_a_pow);
+            self.ldd_state.f_b_pos = cmp::min(f_b_pos_target, self.ldd_state.f_a_pos);
         }
 
         self.sync_staking_totals();
@@ -663,7 +650,6 @@ impl Blockchain {
         let hazard = if pow {
             self.calculate_hazard(delta, self.ldd_state.f_a_pow, self.ldd_state.f_b_pow)
         } else {
-            // Remediation Step 1 support: pass f_b_pos
             self.calculate_hazard(delta, self.ldd_state.f_a_pos, self.ldd_state.f_b_pos)
         };
 
@@ -695,10 +681,9 @@ impl Blockchain {
         } else if delta < gamma {
             let num = Fixed::from_integer((delta - psi) as u64);
             let den = Fixed::from_integer((gamma - psi) as u64);
-            // Remediation Step 1: Linear Interpolation
             if den.0 == 0 { f_b } else { f_a * (num / den) }
         } else {
-            f_b // Use correct fallback
+            f_b 
         }
     }
 
@@ -734,7 +719,6 @@ impl Blockchain {
             }
         }
         
-        // Populate committed_total_stake with current view
         let committed_total_stake = self.total_staked;
 
         let mut block = Block::new(now, transactions, self.tip, bits, prev.height + 1, version, 0, committed_total_stake);
@@ -789,7 +773,6 @@ impl Blockchain {
                             } else { "".to_string() }
                         }).unwrap_or_default();
 
-                    // Remediation Step 2: Use committed_total_stake from the header
                     let committed_stake = block.header.committed_total_stake;
                     
                     if !self.consensus_engine.check_pos_eligibility(&validator_addr, delta, vrf_hash.as_ref(), committed_stake) {
@@ -816,7 +799,6 @@ impl Blockchain {
 
         if !is_pow {
             let fees_fixed = Fixed::from_integer(fees);
-            // CHANGED: Use Fixed rate
             let burn_rate_fixed = self.ldd_state.current_burn_rate;
             let required_burn = ((fees_fixed * burn_rate_fixed).0 >> 64) as u64;
             let claimed_burn = block.header.proven_burn;
@@ -956,7 +938,6 @@ impl Blockchain {
         let mut rolling_muhash = self.get_muhash_root()?;
         for tx in block.transactions.iter().rev() {
             for vout in tx.vout.iter() {
-                // Rollback STAKE transaction (OP_RETURN + b"STAKE")
                 if vout.script_pub_key.len() >= 27 && vout.script_pub_key[0] == 0x6a && vout.script_pub_key[1] == 0x05 && &vout.script_pub_key[2..7] == b"STAKE" {
                     let pubkey_hash_bytes = &vout.script_pub_key[8..28];
                     if let Ok(pk_hash) = hash160::Hash::from_slice(pubkey_hash_bytes) {
