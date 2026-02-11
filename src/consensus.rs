@@ -1,7 +1,7 @@
 // src/consensus.rs - Mining Loop Updates for Remediation
 
 use crate::{
-    block::{BeaconData, Beacon},
+    block::{BeaconData},
     blockchain::Blockchain, 
     config::NodeConfig, 
     p2p::P2PMessage, 
@@ -9,11 +9,11 @@ use crate::{
     wallet::Wallet,
     crypto::{hash_pubkey, address_from_pubkey_hash},
     cdf::Color,
-    pos,
+    block::Beacon,
 };
 use anyhow::Result;
 use chrono::Utc;
-use log::{info, warn, debug}; 
+use log::{info, debug}; 
 use num_bigint::BigUint;
 use std::sync::Arc;
 use std::time::Duration;
@@ -129,24 +129,24 @@ pub async fn start_consensus_loop(
                 }
 
                 // PoS Staking
+                // REFACTOR: Logic delegated to StakingModule
                 if mode == "staker" || mode == "full" {
                     let now_u64 = Utc::now().timestamp() as u64;
                     let mut bc_lock = bc.lock().await;
-                    // Remediation Step 2: Use the committed total stake returned by check
-                    if let Some((proof, delta_pos, committed_total_stake)) = pos::is_eligible_to_stake(&wallet, &bc_lock, now_u64) {
-                        match pos::create_pos_block(&mut bc_lock, &wallet, proof, delta_pos as u32, now_u32, committed_total_stake) {
-                            Ok(block) => {
-                                let hash = block.header.hash();
-                                let height = block.height;
-                                if bc_lock.add_block(block.clone()).is_ok() {
-                                    info!("[MINED PoS] Block {} (Hash: {}..) - Validator: {}", 
-                                        height, 
-                                        hash.to_string().get(0..8).unwrap_or(""), 
-                                        wallet.get_address());
-                                    let _ = p2p_tx.send(P2PMessage::NewBlock(Box::new(block)));
-                                }
-                            }
-                            Err(e) => warn!("Failed to construct PoS block: {}", e),
+                    
+                    // Clone the Arc to access the staking module while bc_lock is held mutably
+                    let staking_module = bc_lock.consensus_engine.staking_module.clone();
+                    
+                    if let Some(block) = staking_module.attempt_stake(&wallet, &mut *bc_lock, now_u64) {
+                        let hash = block.header.hash();
+                        let height = block.height;
+                        
+                        if bc_lock.add_block(block.clone()).is_ok() {
+                            info!("[MINED PoS] Block {} (Hash: {}..) - Validator: {}", 
+                                height, 
+                                hash.to_string().get(0..8).unwrap_or(""), 
+                                wallet.get_address());
+                            let _ = p2p_tx.send(P2PMessage::NewBlock(Box::new(block)));
                         }
                     }
                 }

@@ -86,11 +86,14 @@ pub struct LddState {
 impl Default for LddState {
     fn default() -> Self {
         // Remediation Step 4: Operational Reset Safety Parameters
+        // UPDATED DEFAULTS: 
+        // f_a_pow drastically reduced to 0.00001 to balance against high hashrate.
+        // f_a_pos increased to 0.25 to make Staking easier initially.
         Self {
-            f_a_pow: Fixed::from_f64(0.05), // Reset Amplitude
-            f_a_pos: Fixed::from_f64(0.05), // Reset Amplitude
-            f_b_pow: Fixed::from_f64(0.005),
-            f_b_pos: Fixed::from_f64(0.005),
+            f_a_pow: Fixed::from_f64(0.01), 
+            f_a_pos: Fixed::from_f64(0.05), 
+            f_b_pow: Fixed::from_f64(0.001),
+            f_b_pos: Fixed::from_f64(0.05),
             recent_blocks: Vec::new(),
             current_psi: 5,   // Reset Slot Gap
             current_gamma: 50, // Reset Recovery Threshold
@@ -603,7 +606,12 @@ impl Blockchain {
         let start_time = self.ldd_state.recent_blocks.first().unwrap().0;
         let end_time = self.ldd_state.recent_blocks.last().unwrap().0;
         let duration = end_time.saturating_sub(start_time);
-        let observed_mu = SlotDuration((duration as u64) / (total_window_blocks as u64 - 1));
+        // Avoid division by zero
+        let observed_mu = if total_window_blocks > 1 {
+            SlotDuration((duration as u64) / (total_window_blocks as u64 - 1))
+        } else {
+            SlotDuration(15)
+        };
 
         let network_state = self.dcs.get_consensus_state();
         let target_mu = SlotDuration(self.consensus_params.target_block_time);

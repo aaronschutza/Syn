@@ -12,9 +12,6 @@ const SAFETY_MARGIN_SECONDS: u64 = 1;
 const MIN_BLOCK_TIME_SECONDS: u64 = 1;
 
 // Constant for -2.0 * ln(0.01) calculated in Q64.64 fixed point.
-// ln(0.01) approx -4.60517
-// -2 * -4.60517 approx 9.21034
-// 9.21034 as U64F64
 const LOG_FALLBACK_CONST: U64F64 = U64F64::from_bits(0x0000000000000009_35D8DD44BF000000); 
 
 /// Represents the dynamic state of the LDD parameters.
@@ -22,7 +19,7 @@ const LOG_FALLBACK_CONST: U64F64 = U64F64::from_bits(0x0000000000000009_35D8DD44
 pub struct DifficultyState {
     pub f_a_pow: I64F64,
     pub f_a_pos: I64F64,
-    pub f_b_pos: I64F64, // Added for Remediation Step 1 support
+    pub f_b_pos: I64F64,
     pub psi: u32,
     pub gamma: u32,
 }
@@ -58,7 +55,6 @@ impl DynamicDifficultyManager {
 
     pub fn get_state(&self) -> DifficultyState {
         let params = self.state.read();
-        // Calculate f_b as derived from f_a (e.g. 1/10th) using fixed point math
         let f_b_pos_val = I64F64::from_num(params.f_a_pos.0) / 10;
         
         DifficultyState {
@@ -70,7 +66,6 @@ impl DynamicDifficultyManager {
         }
     }
 
-    // UPDATED: Now takes raw bits (u128) to avoid f64 non-determinism
     pub fn set_state_from_bits(&self, f_a_pow_bits: u128, f_a_pos_bits: u128, psi: u32, gamma: u32) {
         let mut params = self.state.write();
         params.f_a_pow = Probability::from_bits(f_a_pow_bits);
@@ -101,7 +96,6 @@ pub fn calculate_next_difficulty(
     let psi_new = network_state.consensus_delay + SlotDuration(SAFETY_MARGIN_SECONDS);
 
     // 2. Calculate Target Slope (M_req) based on Target Block Time (Mu)
-    // Equation (2): M_req = pi / (2 * (mu - psi)^2)
     let mu_calc_target = if target_mu > psi_new {
         target_mu
     } else {
@@ -113,51 +107,46 @@ pub fn calculate_next_difficulty(
     let pi_over_2 = U64F64::PI / U64F64::from_num(2);
     
     // This is the Target Slope required to achieve Mu_target
+    // We calculate this for reference logging, but we drive adaptation via Beta.
     let m_req = pi_over_2 / tw_sq; 
 
     // 3. Calculate new Window Size (Gamma)
-    // Gamma is chosen such that the probability of failure (p_fallback) is low.
-    // REPLACED: Non-deterministic f64 logic with fixed point math.
-    // Original: (-2 * ln(P_fallback) / M_req).sqrt()
-    
-    // We use the pre-calculated log constant for P_fallback = 0.01
     let ratio = LOG_FALLBACK_CONST / m_req;
-    let xi_optimal_prob = Probability(ratio).sqrt(); // Use deterministic sqrt
-    
-    // We need to convert the probability type back to a duration (u64)
-    // Ceiling logic: add approx 0.999 then floor (truncate)
+    let xi_optimal_prob = Probability(ratio).sqrt();
     let xi_val = xi_optimal_prob.0;
     let xi_ceil = xi_val.ceil().to_num::<u64>();
-    
     let gamma_new = psi_new + SlotDuration(xi_ceil);
 
-    // Remediation Step 3: Recalibrate the Feedback Controller
-    // Align physical units: f_A = M_req * (gamma - psi)
-    // We calculate a baseline Amplitude that physically corresponds to the target Slope.
-    let window_duration = gamma_new - psi_new;
-    let window_u64 = U64F64::from_num(window_duration.0);
-    
-    // Eq (3): f_A = Slope * Window
-    let f_a_base = m_req * window_u64;
+    // Window scaling factor (if window changes, amplitude must scale to keep slope constant)
+    let old_window = (current_params.gamma - current_params.psi).0.max(1);
+    let new_window = (gamma_new - psi_new).0.max(1);
+    let window_scale = U64F64::from_num(new_window) / U64F64::from_num(old_window);
 
     // 4. Resource Balancing (Beta & Kappa)
-    // We adjust the baseline f_A for PoW and PoS relative to their observed contribution
-    // to maintain the 50/50 split.
-    
+    // Beta: Speed Correction. Observed / Target.
     let beta = if observed_mu.0 == 0 {
         U64F64::from_num(0.1) 
     } else {
         U64F64::from_num(observed_mu.0) / U64F64::from_num(mu_calc_target.0)
     };
-    let beta_clamped = beta.min(U64F64::from_num(2.0)).max(U64F64::from_num(0.01));
+    // Clamp beta to prevent wild swings
+    let beta_clamped = beta.min(U64F64::from_num(4.0)).max(U64F64::from_num(0.25));
+    
     let kappa = I64F64::from_num(0.1);
 
-    let (f_a_pow_new, f_a_pos_new) = if pos_count == 0 {
-        // Bootstrap Mode: Boost PoS to bootstrap
-        let pow_new = Probability(f_a_base * beta_clamped);
-        let pos_new = Probability((current_params.f_a_pos.0 * U64F64::from_num(2.0)).min(U64F64::from_num(1.0)));
-        (pow_new, pos_new)
+    // Retrieve current amplitudes as U64F64
+    let current_pow = U64F64::from_bits(current_params.f_a_pow.to_bits());
+    let current_pos = U64F64::from_bits(current_params.f_a_pos.to_bits());
+
+    let (f_a_pow_new, f_a_pos_new) = if pos_count == 0 && total_window_blocks > 0 {
+        // Bootstrap/Emergency Mode: PoS is missing.
+        // Increase PoS difficulty (easier) significantly to invite stakers.
+        // Decrease PoW difficulty (harder) if it's dominating too fast.
+        let pow_new = current_pow * beta_clamped * window_scale;
+        let pos_new = (current_pos * U64F64::from_num(2.0)).min(U64F64::ONE);
+        (Probability(pow_new), Probability(pos_new))
     } else {
+        // Normal Mode: Proportional Adjustment
         let n_pow = total_window_blocks.saturating_sub(pos_count);
         let p_pow = I64F64::from_num(n_pow) / I64F64::from_num(total_window_blocks);
         let error_val = p_pow - I64F64::from_num(0.5);
@@ -165,18 +154,22 @@ pub fn calculate_next_difficulty(
         let pow_adj = I64F64::from_num(1.0) - kappa * error_val;
         let pos_adj = I64F64::from_num(1.0) + kappa * error_val;
         
-        // Apply adjustments to the PHYSICALLY DERIVED base amplitude
-        // We cast back to U64F64 for the Probability wrapper.
-        let pow_val = f_a_base * U64F64::from_num(pow_adj.max(I64F64::from_num(0.01)));
-        let pos_val = f_a_base * U64F64::from_num(pos_adj.max(I64F64::from_num(0.01)));
+        // Multiplicative update: Old * Beta * BalanceAdj * WindowScale
+        let pow_val = current_pow * beta_clamped * U64F64::from_num(pow_adj.max(I64F64::from_num(0.01))) * window_scale;
+        let pos_val = current_pos * beta_clamped * U64F64::from_num(pos_adj.max(I64F64::from_num(0.01))) * window_scale;
         
-        (Probability(pow_val), Probability(pos_val))
+        // Safety Clamps
+        let pow_final = pow_val.min(U64F64::ONE).max(U64F64::from_num(0.00000001));
+        let pos_final = pos_val.min(U64F64::ONE).max(U64F64::from_num(0.00000001));
+
+        (Probability(pow_final), Probability(pos_final))
     };
 
     info!(
-        "[LDD ADJUST] Mu_target: {}s | M_req: {:.8} | Window: {}s | fA_Base: {:.8} | fA_PoW: {:.8} | fA_PoS: {:.8}",
-        target_mu.0, m_req.to_num::<f64>(), window_duration.0, f_a_base.to_num::<f64>(), 
-        f_a_pow_new.to_f64(), f_a_pos_new.to_f64()
+        "[LDD ADJUST] Mu_target: {}s | M_req: {:.8} | Beta: {:.4} | WinScale: {:.4} | fA_PoW: {:.8} -> {:.8} | fA_PoS: {:.8} -> {:.8}",
+        target_mu.0, m_req.to_num::<f64>(), beta_clamped.to_num::<f64>(), window_scale.to_num::<f64>(),
+        current_pow.to_num::<f64>(), f_a_pow_new.to_f64(), 
+        current_pos.to_num::<f64>(), f_a_pos_new.to_f64()
     );
 
     LddParams {

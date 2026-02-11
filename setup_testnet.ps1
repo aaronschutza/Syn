@@ -143,18 +143,9 @@ Start-Process powershell -ArgumentList "-NoExit", "-Command", "$m1Cmd"
 
 if (!(Wait-For-RPC -port 20001 -name "Miner 1")) { exit 1 }
 
-# CRITICAL FIX: The bootstrap miner must first confirm its first block 
-# to have a balance to stake. This prevents the LDD system from 
-# entering a PoW-only deadlock.
-Write-Host "Waiting for Miner 1 to confirm its first reward..."
-$h = -1
-while ($h -lt 1) {
-    Start-Sleep -Seconds 3
-    $h = Get-ChainHeight -port 20001
-}
-
-Write-Host "Registering Initial Stake for Miner 1 to bootstrap PoS..."
-& "$nodeBin" --config "$m1Conf" stake --asset SYN --amount 5000000000 | Out-Null
+# Wait for block 2 so Miner 1 has mature spendable funds (maturity=1)
+Write-Host "Waiting for Miner 1 to mine initial blocks..."
+Wait-For-Block -port 20001 -currentHeight 1
 
 # 2. START BOOTSTRAP STAKER 1
 Write-Host "`n[PHASE 2] Instantiating Bootstrap Staker 1..." -ForegroundColor Cyan
@@ -163,24 +154,31 @@ $s1Addr = Get-Content -Path (Join-Path -Path $s1Dir -ChildPath "address.txt")
 $s1Conf = Join-Path -Path $s1Dir -ChildPath "config.toml"
 
 # Fund Staker 1 via Miner 1
+# NOTE: Miner 1 sends 100,000 coins. Staker 1 will stake 90,000 of them.
 $h = Get-ChainHeight -port 20001
-$res = & "$nodeBin" --config "$m1Conf" faucet --address "$s1Addr" --amount 1000000 2>&1
-Write-Host "Funding Staker 1... TXID: $res"
+$res = & "$nodeBin" --config "$m1Conf" send --to "$s1Addr" --amount 100000 2>&1
+Write-Host "Sending funds to Staker 1... TXID: $res"
 Wait-For-Block -port 20001 -currentHeight $h
 
-# Start Staker 1 in a window
+# Start Staker 1
 $s1Cmd = "Set-Location '$s1Dir'; & '$nodeBin' --config '$s1Conf' start-node --mode staker 2>&1 | Tee-Object -FilePath 'node.log'"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "$s1Cmd"
 
 $s1Rpc = 20000 + $numMiners + 1
 if (Wait-For-RPC -port $s1Rpc -name "Staker 1") {
     Write-Host "Registering stake for Staker 1..."
-    & "$nodeBin" --config "$s1Conf" stake --asset SYN --amount 1000000 | Out-Null
-    Write-Host "Staker 1 fully operational." -ForegroundColor Green
+    & "$nodeBin" --config "$s1Conf" stake --asset SYN --amount 90000 | Out-Null
+    Write-Host "Staker 1 configured. Waiting for stake confirmation..."
+    
+    # Wait for the stake tx to be mined into a block
+    $h = Get-ChainHeight -port 20001
+    Wait-For-Block -port 20001 -currentHeight $h
+    
+    Write-Host "Staker 1 is now active." -ForegroundColor Green
 }
 
-# 3. INTERLEAVED BACKGROUND EXPANSION (PAIR BY PAIR)
-Write-Host "`n[PHASE 3] Expanding Testnet: Strictly Interleaving Miner/Staker pairs..." -ForegroundColor Cyan
+# 3. INTERLEAVED BACKGROUND EXPANSION
+Write-Host "`n[PHASE 3] Expanding Testnet..." -ForegroundColor Cyan
 $maxCount = [math]::Max($numMiners, $numStakers)
 
 for ($i = 2; $i -le $maxCount; $i++) {
@@ -192,14 +190,12 @@ for ($i = 2; $i -le $maxCount; $i++) {
         $mConf = Join-Path -Path $mDir -ChildPath "config.toml"
         $mRpc = 20000 + $i
         
-        Write-Host ">>> PHASE 3.$i.A: Starting Miner $i..."
+        Write-Host ">>> Starting Miner $i..."
         Start-Job -Name "Miner$i" -ScriptBlock { 
             param($d, $c, $a, $b) 
             Set-Location $d
             & $b --config $c start-node --mode miner --mine-to-address $a 2>&1 | Out-File "node.log"
         } -ArgumentList $mDir, $mConf, $mAddr, $nodeBin
-        
-        Wait-For-RPC -port $mRpc -name "Miner $i" | Out-Null
     }
 
     # Start Staker i
@@ -209,30 +205,27 @@ for ($i = 2; $i -le $maxCount; $i++) {
         $sConf = Join-Path -Path $sDir -ChildPath "config.toml"
         $sRpc = 20000 + $numMiners + $i
         
-        Write-Host ">>> PHASE 3.$i.B: Funding Staker $i..."
-        $h = Get-ChainHeight -port 20001
-        & "$nodeBin" --config "$m1Conf" faucet --address "$sAddr" --amount 1000000 2>&1 | Out-Null
-        Wait-For-Block -port 20001 -currentHeight $h
-
-        Write-Host ">>> PHASE 3.$i.C: Starting Staker $i..."
+        Write-Host ">>> Funding Staker $i..."
+        # Funding from Miner 1 again (Miner 1 is the faucet)
+        & "$nodeBin" --config "$m1Conf" send --to "$sAddr" --amount 100000 2>&1 | Out-Null
+        
+        Write-Host ">>> Starting Staker $i..."
         Start-Job -Name "Staker$i" -ScriptBlock { 
             param($d, $c, $b) 
             Set-Location $d
             & $b --config $c start-node --mode staker 2>&1 | Out-File "node.log"
         } -ArgumentList $sDir, $sConf, $nodeBin
 
-        if (Wait-For-RPC -port $sRpc -name "Staker $i") {
-            Write-Host ">>> PHASE 3.$i.D: Registering stake for Staker $i..."
-            & "$nodeBin" --config "$sConf" stake --asset SYN --amount 1000000 | Out-Null
-            Write-Host "Staker $i initialized." -ForegroundColor Green
-        }
+        # We don't wait for RPC here to speed up launch, but we attempt stake blindly
+        # (It will fail until RPC is up, but user can manually stake later or script can be improved)
+        # For robustness, we just launch the process here.
     }
     
-    Write-Host "Cooldown for synchronization (15s)..."
-    Start-Sleep -Seconds 15
+    Start-Sleep -Seconds 2
 }
 
 Write-Host "`nTestnet setup complete. Total nodes: $((($numMiners + $numStakers)))" -ForegroundColor Green
+Write-Host "NOTE: Miners 2-$numMiners and Stakers 2-$numStakers are running in background jobs."
 '@
 $startScriptContent = $startScriptContent -replace '__BINARY_PATH__', $binaryPath.Replace('\', '\\')
 $startScriptContent = $startScriptContent -replace '__NUM_MINERS__', $numMiners

@@ -4,8 +4,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Serialize, Deserialize};
-use log::debug;
+use log::{debug, warn};
 use thiserror::Error;
+
+// Imports required for the staking procedure
+use crate::pos;
+use crate::block::Block;
+use crate::blockchain::Blockchain;
+use crate::wallet::Wallet;
 
 pub type Address = String;
 pub type StakeAmount = u128;
@@ -74,6 +80,21 @@ impl StakingModule {
             total_bonded_supply: Arc::new(RwLock::new(0)),
             bank,
         }
+    }
+
+    /// Primary staking procedure.
+    /// Checks eligibility via VRF and creates a block if selected.
+    pub fn attempt_stake(&self, wallet: &Wallet, bc: &mut Blockchain, timestamp: u64) -> Option<Block> {
+        // Delegate to pos.rs for the cryptographic check (VRF vs Difficulty)
+        // Remediation Step 2: Use the committed total stake returned by the check
+        if let Some((proof, delta_pos, committed_total_stake)) = pos::is_eligible_to_stake(wallet, bc, timestamp) {
+            // If eligible, attempt to construct the full block
+            match pos::create_pos_block(bc, wallet, proof, delta_pos as u32, timestamp as u32, committed_total_stake) {
+                Ok(block) => return Some(block),
+                Err(e) => warn!("Failed to construct PoS block despite eligibility: {}", e),
+            }
+        }
+        None
     }
 
     pub fn process_stake(&self, address: Address, amount: StakeAmount) -> Result<(), StakingError> {
