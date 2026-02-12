@@ -10,7 +10,7 @@ use crate::{
 };
 use anyhow::Result;
 use bitcoin_hashes::{sha256d, Hash}; 
-use log::{info, debug, warn, error}; 
+use log::{info, debug, warn, error, trace}; 
 use serde::{Serialize, Deserialize};
 use std::net::{SocketAddr, IpAddr};
 use std::sync::Arc;
@@ -67,20 +67,39 @@ pub async fn start_server(
             res = listener.accept() => {
                 if let Ok((socket, addr)) = res {
                     let mut pm = peer_manager.lock().await;
-                    if !pm.can_accept_inbound() || pm.is_banned(&addr) { continue; }
+                    
+                    // AUDIT: Check bans first
+                    if pm.is_banned(&addr) {
+                        debug!("[P2P] Rejecting banned peer: {}", addr);
+                        continue; 
+                    }
 
+                    // AUDIT: Check inbound capacity
+                    if !pm.can_accept_inbound() {
+                        debug!("[P2P] Rejecting inbound connection from {}: Max peers reached.", addr);
+                        continue; 
+                    }
+
+                    // AUDIT: Subnet limits
                     let subnet = get_subnet_id(addr.ip());
                     let mut subnets = active_subnets.lock().await;
                     let count = *subnets.get(&subnet).unwrap_or(&0);
-                    let limit = if addr.ip().is_loopback() { 128 } else { 2 };
-                    if count >= limit { continue; }
+                    let limit = if addr.ip().is_loopback() { 128 } else { 4 }; // Increased slightly for LAN setups
+                    
+                    if count >= limit {
+                        debug!("[P2P] Rejecting inbound from {}: Subnet limit reached ({}/{})", addr, count, limit);
+                        continue; 
+                    }
 
                     subnets.insert(subnet.clone(), count + 1);
+                    // Register connection immediately to reserve slot, even before handshake
                     pm.on_connect(addr, false);
                     drop(pm);
                     
                     let (tx, rx) = oneshot::channel();
                     connection_shutdowns.lock().await.insert(addr, tx);
+
+                    info!("[P2P] Accepted connection from {}", addr);
 
                     tokio::spawn(handle_connection(
                         socket, addr, subnet, active_subnets.clone(), 
@@ -114,9 +133,11 @@ async fn handle_connection(
     let (peer_tx, mut peer_rx) = mpsc::channel::<P2PMessage>(1000);
 
     // Phase 1: Send Version
+    // We send this immediately upon connection.
     {
         let bc = blockchain.lock().await;
         let height = bc.headers.len() as u32;
+        debug!("[P2P] Sending Version to {}: My Height {}", addr, height);
         let _ = peer_tx.send(P2PMessage::Version { 
             version: 1, 
             best_height: height,
@@ -149,16 +170,40 @@ async fn handle_connection(
 
     let bc = blockchain.clone();
     let pm = peer_manager.clone();
+    
     let read_task = tokio::spawn(async move {
         let _tx_keeper = peer_tx; 
+        
+        // AUDIT FIX: Enforce handshake timeout
+        // The first message MUST be Version, and it must arrive within 5 seconds.
+        let handshake_timeout = Duration::from_secs(5);
+        let mut handshake_complete = false;
+
         loop {
             let mut size_buf = [0u8; 4];
-            let read_prefix = tokio::select! {
-                res = reader.read_exact(&mut size_buf) => res,
-                _ = &mut disconnect_rx => break,
+            
+            // Apply timeout only if handshake is not complete
+            let read_future = async {
+                reader.read_exact(&mut size_buf).await
             };
 
-            if read_prefix.is_err() { break; }
+            let read_result = if !handshake_complete {
+                match tokio::time::timeout(handshake_timeout, read_future).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        warn!("[P2P] Handshake timeout with {}", addr);
+                        return; // Terminate task
+                    }
+                }
+            } else {
+                tokio::select! {
+                    res = read_future => res,
+                    _ = &mut disconnect_rx => break,
+                }
+            };
+
+            if read_result.is_err() { break; } // Connection closed or error
+            
             let size = u32::from_be_bytes(size_buf) as usize;
             if size > p2p_config.max_message_size { 
                 error!("P2P: Message from {} exceeds size limit ({}).", addr, size);
@@ -169,38 +214,56 @@ async fn handle_connection(
             if reader.read_exact(&mut buf).await.is_err() { break; }
 
             if let Ok(msg) = bincode::deserialize::<P2PMessage>(&buf) {
-                match msg {
-                    P2PMessage::Version { best_height: peer_height, listener_port, .. } => {
-                        info!("P2P: Handshake from {} [Height: {}, Port: {}]", addr, peer_height, listener_port);
-                        
-                        let mut listen_addr = addr;
-                        listen_addr.set_port(listener_port);
-                        pm.lock().await.add_known_addresses(vec![listen_addr]);
+                
+                // Enforce Handshake Protocol
+                if !handshake_complete {
+                    match msg {
+                        P2PMessage::Version { best_height: peer_height, listener_port, .. } => {
+                            info!("P2P: Handshake received from {} [Height: {}, Port: {}]", addr, peer_height, listener_port);
+                            
+                            // Add their listener address to our address book
+                            let mut listen_addr = addr;
+                            listen_addr.set_port(listener_port);
+                            pm.lock().await.add_known_addresses(vec![listen_addr]);
 
-                        let (local_height, locator) = {
-                            let b = bc.lock().await; 
-                            (b.headers.len() as u32, b.get_block_locator())
-                        };
+                            let (local_height, locator) = {
+                                let b = bc.lock().await; 
+                                (b.headers.len() as u32, b.get_block_locator())
+                            };
 
-                        if peer_height > local_height {
-                            info!("P2P: Peer {} is ahead ({} > {}). Syncing headers...", addr, peer_height, local_height);
-                            let _ = _tx_keeper.send(P2PMessage::GetHeaders { 
-                                version: 1, 
-                                block_locator_hashes: locator, 
-                                hash_stop: sha256d::Hash::all_zeros() 
-                            }).await;
+                            if peer_height > local_height {
+                                info!("P2P: Peer {} is ahead ({} > {}). Syncing headers...", addr, peer_height, local_height);
+                                let _ = _tx_keeper.send(P2PMessage::GetHeaders { 
+                                    version: 1, 
+                                    block_locator_hashes: locator, 
+                                    hash_stop: sha256d::Hash::all_zeros() 
+                                }).await;
+                            }
+                            
+                            let _ = _tx_keeper.send(P2PMessage::Verack).await;
+                            handshake_complete = true;
+                            continue; // Process next message
+                        },
+                        _ => {
+                            warn!("[P2P] Protocol Violation: First message from {} was not Version.", addr);
+                            pm.lock().await.report_misbehavior(addr, 20);
+                            break;
                         }
-                        let _ = _tx_keeper.send(P2PMessage::Verack).await;
+                    }
+                }
+
+                // Post-Handshake Message Handling
+                match msg {
+                    P2PMessage::Version { .. } => {
+                        // Duplicate version? Ignore or punish.
                     }
                     P2PMessage::GetHeaders { block_locator_hashes, hash_stop, .. } => {
                         let b = bc.lock().await;
                         let mut headers = Vec::new();
                         let mut start_found = false;
                         
-                        // Find the common ancestor in our local chain
                         for locator_hash in block_locator_hashes {
                             if let Some(pos) = b.headers.iter().position(|h| h.hash() == locator_hash) {
-                                // Start from the block immediately after the locator
                                 for header in b.headers.iter().skip(pos + 1).take(2000) {
                                     let h_hash = header.hash();
                                     headers.push(header.clone());
@@ -211,7 +274,6 @@ async fn handle_connection(
                             }
                         }
 
-                        // If no ancestor found, start from genesis
                         if !start_found {
                             for header in b.headers.iter().take(2000) {
                                 headers.push(header.clone());
@@ -220,18 +282,20 @@ async fn handle_connection(
                         }
 
                         if !headers.is_empty() {
-                            debug!("P2P: Sending {} headers to {}", headers.len(), addr);
+                            trace!("P2P: Sending {} headers to {}", headers.len(), addr);
                             let _ = _tx_keeper.send(P2PMessage::Headers(headers)).await;
                         }
                     }
                     P2PMessage::Headers(headers) => {
                         if headers.is_empty() { continue; }
-                        info!("P2P: Received {} headers from {}. Validating...", headers.len(), addr);
+                        debug!("P2P: Received {} headers from {}. Validating...", headers.len(), addr);
                         let mut missing_bodies = Vec::new();
                         {
                             let mut b = bc.lock().await;
                             if let Err(e) = b.process_headers(headers.clone()) {
                                 error!("P2P: Failed to process headers from {}: {}", addr, e);
+                                // Punishment for sending invalid headers
+                                pm.lock().await.report_misbehavior(addr, 10);
                                 continue;
                             }
                             
@@ -244,7 +308,7 @@ async fn handle_connection(
                         }
 
                         if !missing_bodies.is_empty() {
-                            info!("P2P: Requesting {} block bodies from {}...", missing_bodies.len(), addr);
+                            debug!("P2P: Requesting {} block bodies from {}...", missing_bodies.len(), addr);
                             let _ = _tx_keeper.send(P2PMessage::GetData { hashes: missing_bodies }).await;
                         }
                     }
@@ -260,7 +324,7 @@ async fn handle_connection(
                         let _ = to_consensus_tx.send(P2PMessage::NewBlock(block)).await;
                     }
                     P2PMessage::Verack => {
-                        debug!("P2P: Verack from {}", addr);
+                        debug!("P2P: Verack from {}. Asking for addresses.", addr);
                         let _ = _tx_keeper.send(P2PMessage::GetAddr).await;
                     }
                     P2PMessage::GetAddr => {
@@ -268,6 +332,7 @@ async fn handle_connection(
                         let _ = _tx_keeper.send(P2PMessage::Addr(known)).await;
                     }
                     P2PMessage::Addr(addrs) => {
+                        debug!("P2P: Received {} peer addresses from {}", addrs.len(), addr);
                         pm.lock().await.add_known_addresses(addrs);
                     }
                     P2PMessage::NewTransaction(tx) => {
@@ -292,7 +357,7 @@ async fn handle_connection(
         }
     }
     peer_manager.lock().await.on_disconnect(&addr);
-    info!("P2P: Connection to {} closed.", addr);
+    trace!("P2P: Connection task for {} finished cleanup.", addr);
 }
 
 fn get_subnet_id(addr: IpAddr) -> Vec<u8> {
@@ -328,6 +393,9 @@ async fn start_client(
             }
             targets.extend(potential_targets);
 
+            // Shuffle targets lightly or just iterate. 
+            // In a real impl, we'd shuffle to avoid connecting to the same bad nodes repeatedly.
+            
             for addr in targets {
                 if node_config.p2p_port == addr.port() && addr.ip().is_loopback() { continue; }
                 if current_peers.contains(&addr) { continue; }
@@ -335,7 +403,7 @@ async fn start_client(
                 let subnet = get_subnet_id(addr.ip());
                 let mut subnets = active_subnets.lock().await;
                 let count = *subnets.get(&subnet).unwrap_or(&0);
-                let limit = if addr.ip().is_loopback() { 128 } else { 2 };
+                let limit = if addr.ip().is_loopback() { 128 } else { 4 };
                 
                 if count < limit {
                     match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(addr)).await {
@@ -356,7 +424,10 @@ async fn start_client(
                                 rx,
                             ));
                         }
-                        _ => {}
+                        _ => {
+                            // Connection failed.
+                            // In a full implementation, we would report this to PeerManager to downrank the peer.
+                        }
                     }
                 }
             }
