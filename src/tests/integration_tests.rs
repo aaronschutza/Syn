@@ -368,10 +368,6 @@ mod tests {
                     pos_blocks_produced += 1;
                     println!("Block {} (PoS) produced at time {}", block_num + 3, block_time);
                 }
-
-                if bc_lock.ldd_state.recent_blocks.len() >= bc_lock.ldd_state.current_adjustment_window {
-                    bc_lock.adjust_ldd();
-                }
             }
         }
 

@@ -5,6 +5,7 @@ use crate::stk_module::{StakingModule};
 use crate::gov_module::GovernanceModule;
 use crate::difficulty::DynamicDifficultyManager; 
 use crate::fixed_point::Fixed;
+use crate::blockchain::LddState;
 use std::sync::Arc;
 use num_bigint::BigUint;
 use log::info;
@@ -51,10 +52,6 @@ impl ConsensusEngine {
         let max_change = self.params.max_slope_change_per_block;
         let current_slope = self.params.max_slope_change_per_block;
 
-        // Note: usage of f64 here is for fee adjustment logic, which is generally tolerant of small diffs 
-        // unlike consensus validation, but ideally this should also be fixed. 
-        // For strict consensus, we should use Fixed.
-        // Assuming this is a local policy parameter for now.
         let new_slope = if previous_block_size > target_block_size {
             let increase_factor = (previous_block_size - target_block_size) as f64 / target_block_size as f64;
             current_slope + (increase_factor * max_change)
@@ -67,8 +64,9 @@ impl ConsensusEngine {
         self.params.max_slope_change_per_block = new_slope;
     }
 
-    pub fn check_pos_eligibility(
+    pub fn check_pos_eligibility_with_state(
         &self,
+        ldd: &LddState,
         stakeholder_address: &String,
         delta_seconds: u32,
         vrf_output: &[u8],
@@ -81,15 +79,11 @@ impl ConsensusEngine {
         
         let alpha = Fixed::from_integer(stake as u64) / Fixed::from_integer(committed_total_stake);
     
-        let diff_state = self.difficulty_manager.get_state();
-        let psi = Fixed::from_integer(diff_state.psi as u64); 
-        let gamma = Fixed::from_integer(diff_state.gamma as u64);
+        let psi = Fixed::from_integer(ldd.current_psi as u64); 
+        let gamma = Fixed::from_integer(ldd.current_gamma as u64);
         
-        // FIXED: Use direct bitwise conversion to avoid f64 non-determinism
-        // diff_state uses I64F64 (from fixed crate), Fixed uses u128 (Q64.64).
-        // I64F64 is signed, Fixed is unsigned. Assuming difficulty is positive.
-        let f_a = Fixed::from_bits(diff_state.f_a_pos.to_bits() as u128);
-        let f_b = Fixed::from_bits(diff_state.f_b_pos.to_bits() as u128);
+        let f_a = ldd.f_a_pos;
+        let f_b = ldd.f_b_pos;
         
         let delta = Fixed::from_integer(delta_seconds as u64);
 
@@ -101,8 +95,6 @@ impl ConsensusEngine {
             f_b
         };
 
-        // AUDIT FIX: Using deterministic Phi calculation via Binomial Expansion
-        // Phi = 1 - (1-f)^alpha
         let phi = Fixed::consensus_phi(f_delta, alpha);
 
         let max_u256 = BigUint::from(1u32) << 256;

@@ -4,10 +4,11 @@ use crate::block::{Beacon, BeaconData};
 use crate::difficulty::NetworkState;
 use crate::units::{SlotDuration, Probability};
 use fixed::types::U64F64;
+use serde::{Deserialize, Serialize};
 
 /// The Decentralized Consensus Service (F_DCS)
 /// Aggregates on-chain beacons to provide metrics for Adaptive Protocol Homeostasis.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DecentralizedConsensusService {
     time_beacons: Vec<u64>,
     stake_beacons: Vec<u64>,
@@ -23,7 +24,6 @@ pub struct ConsensusValues {
     pub median_time: u64,
     pub median_total_stake: u64,
     pub consensus_delay: u32,
-    // CHANGED: Use fixed point for consensus values
     pub consensus_load: U64F64,
     pub security_threat_level: U64F64, // S_threat [0.0 - 1.0]
     pub chain_health_score: U64F64,     // H_chain [0.0 - 1.0]
@@ -69,17 +69,13 @@ impl DecentralizedConsensusService {
     /// Uses 90th percentiles for threat detection as per whitepaper Section 15.2.
     pub fn calculate_consensus(&self) -> ConsensusValues {
         // 1. Calculate Security Threat Level (S_threat)
-        // High orphan rates or reorg depths pull S_threat towards 1.0
         let p90_orphan = self.calculate_percentile(&self.orphan_rates, 90).unwrap_or(0);
         let p90_reorg = self.calculate_percentile(&self.reorg_depths, 90).unwrap_or(0);
         
-        // Use fixed point arithmetic for normalization
-        // threat_orphan = min(1.0, orphan / 10.0)
         let orphan_u64 = U64F64::from_num(p90_orphan);
         let ten = U64F64::from_num(10);
         let threat_orphan = (orphan_u64 / ten).min(U64F64::ONE);
 
-        // threat_reorg = min(1.0, reorg / 6.0)
         let reorg_u64 = U64F64::from_num(p90_reorg);
         let six = U64F64::from_num(6);
         let threat_reorg = (reorg_u64 / six).min(U64F64::ONE);
@@ -87,10 +83,8 @@ impl DecentralizedConsensusService {
         let s_threat = threat_orphan.max(threat_reorg);
 
         // 2. Calculate Chain Health Score (H_chain)
-        // High branching factors pull H_chain towards 1.0
         let p90_branching = self.calculate_percentile_u64(&self.branching_factors, 90).unwrap_or(1_000_000);
         
-        // health = clamp(((branching / 1,000,000) - 1.0), 0.0, 1.0)
         let branching_u64 = U64F64::from_num(p90_branching);
         let million = U64F64::from_num(1_000_000);
         let ratio = branching_u64 / million;
@@ -143,7 +137,6 @@ impl ConsensusOracle for DecentralizedConsensusService {
         let values = self.calculate_consensus();
         
         // Convert primitives to Type-Safe Units
-        // Delay beacon is in ms, convert to seconds
         let consensus_delay = SlotDuration((values.consensus_delay as u64 / 1000).max(1)); 
         let consensus_load = Probability(values.consensus_load);
         let security_threat = Probability(values.security_threat_level);

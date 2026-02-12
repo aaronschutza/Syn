@@ -1,4 +1,4 @@
-// src/blockchain.rs - Remediation Step 4: Operational Reset and Validation
+// src/blockchain.rs - State Isolation & LDD Persistence Remediation
 
 use crate::{
     block::{Block, BlockHeader, Beacon},
@@ -15,12 +15,11 @@ use crate::{
     client::SpvClientState,
     difficulty::calculate_next_difficulty, 
     units::{LddParams, SlotDuration, Probability},
-    weight::SynergisticWeight, // AUDIT FIX: Import Weight Trait
+    weight::SynergisticWeight, 
 };
 use anyhow::{anyhow, bail, Result};
 use bitcoin_hashes::{sha256d, Hash, hash160};
 use chrono::Utc;
-// use num_traits::{ToPrimitive, Zero}; // Removed unused imports
 use num_bigint::BigUint;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -68,7 +67,7 @@ pub struct VetoManager {
     pub blacklisted_blocks: HashSet<sha256d::Hash>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LddState {
     pub f_a_pow: Fixed,
     pub f_a_pos: Fixed,
@@ -86,7 +85,6 @@ pub struct LddState {
 
 impl Default for LddState {
     fn default() -> Self {
-        // Remediation Step 4: Operational Reset Safety Parameters
         Self {
             f_a_pow: Fixed::from_f64(0.01), 
             f_a_pos: Fixed::from_f64(0.05), 
@@ -96,12 +94,20 @@ impl Default for LddState {
             current_psi: 5,
             current_gamma: 50,
             current_target_block_time: 15,
-            current_adjustment_window: 3,
-            next_adjustment_height: 3,
+            current_adjustment_window: 5,
+            next_adjustment_height: 5,
             current_burn_rate: Fixed::from_f64(0.1),
             current_kappa: Fixed::from_f64(0.1),
         }
     }
+}
+
+/// A pure state encapsulation representing the variables derived 
+/// exclusively from block history at a specific hash.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlockState {
+    pub ldd: LddState,
+    pub dcs: DecentralizedConsensusService,
 }
 
 pub struct Blockchain {
@@ -162,10 +168,6 @@ impl Blockchain {
         let btc_txid_tree = db.open_tree("progonos_used_btc_txids")?;
         let meta_tree = db.open_tree("chain_metadata")?;
 
-        let mut ldd_state = LddState::default();
-        ldd_state.current_target_block_time = consensus_params.target_block_time;
-        ldd_state.current_burn_rate = Fixed::from_f64(fee_params.min_burn_rate);
-
         let mut bc = Blockchain {
             db, blocks_tree, headers_tree, header_meta_tree, utxo_tree, addr_utxo_tree, tx_index_tree, btc_txid_tree, meta_tree,
             tip: sha256d::Hash::all_zeros(),
@@ -173,7 +175,7 @@ impl Blockchain {
             best_header_tip: sha256d::Hash::all_zeros(),
             best_header_work: 0,
             mempool: HashMap::new(), beacon_mempool: Vec::new(),
-            ldd_state, consensus_params, fee_params: fee_params.clone(),
+            ldd_state: LddState::default(), consensus_params, fee_params: fee_params.clone(),
             governance_params, progonos_config, spv_state, total_staked: 0, governance: Governance::new(),
             db_config, headers: Vec::new(),
             utxo_cache: HashMap::with_capacity(MAX_UTXO_CACHE_SIZE),
@@ -194,10 +196,24 @@ impl Blockchain {
                 bc.consensus_params.genesis_address.clone(), bc.consensus_params.block_version,
                 bc.consensus_params.transaction_version,
             );
-            bc.calculate_synergistic_work(&mut genesis);
+            
+            let mut ldd = LddState::default();
+            ldd.current_target_block_time = bc.consensus_params.target_block_time;
+            ldd.current_burn_rate = Fixed::from_f64(bc.fee_params.min_burn_rate);
+            let dcs = DecentralizedConsensusService::new();
+            
+            let block_state = BlockState { ldd: ldd.clone(), dcs: dcs.clone() };
+            bc.ldd_state = ldd;
+            bc.dcs = dcs;
+            
+            bc.calculate_synergistic_work(&mut genesis, &bc.ldd_state);
             genesis.total_work = genesis.synergistic_work;
             let genesis_hash = genesis.header.hash();
             
+            let mut key = b"state_".to_vec();
+            key.extend_from_slice(genesis_hash.as_ref());
+            bc.meta_tree.insert(key, bincode::serialize(&block_state)?)?;
+
             bc.headers_tree.insert(genesis_hash.as_ref() as &[u8], bincode::serialize(&genesis.header)?)?;
             let meta = HeaderMetadata { height: 0, total_work: genesis.total_work, synergistic_work: genesis.synergistic_work };
             bc.header_meta_tree.insert(genesis_hash.as_ref() as &[u8], bincode::serialize(&meta)?)?;
@@ -214,6 +230,18 @@ impl Blockchain {
             bc.tip = sha256d::Hash::from_slice(&tip_bytes)?;
             if let Some(work_bytes) = bc.blocks_tree.get(&bc.db_config.total_work_key)? {
                 let mut arr = [0u8; 8]; arr.copy_from_slice(&work_bytes); bc.total_work = u64::from_be_bytes(arr);
+            }
+            
+            if let Some(state_bytes) = bc.meta_tree.get({
+                let mut k = b"state_".to_vec();
+                k.extend_from_slice(bc.tip.as_ref());
+                k
+            })? {
+                let state: BlockState = bincode::deserialize(&state_bytes)?;
+                bc.ldd_state = state.ldd;
+                bc.dcs = state.dcs;
+            } else {
+                warn!("BlockState not found for tip. Node state sync incomplete.");
             }
             
             let mut curr = bc.tip;
@@ -239,11 +267,6 @@ impl Blockchain {
             }
             bc.best_header_tip = best_tip;
             bc.best_header_work = best_work;
-
-            if let Some(height_bytes) = bc.meta_tree.get("next_adjustment_height")? {
-                let mut arr = [0u8; 4]; arr.copy_from_slice(&height_bytes);
-                bc.ldd_state.next_adjustment_height = u32::from_be_bytes(arr);
-            }
         }
         
         bc.sync_staking_totals();
@@ -264,37 +287,22 @@ impl Blockchain {
         let prev_hash = header.prev_blockhash;
         if prev_hash == sha256d::Hash::all_zeros() { return Ok(1); }
 
+        // Fetch to ensure parent header actually exists in our tree.
         let _prev_meta_bytes = self.header_meta_tree.get(prev_hash.as_ref() as &[u8])?
             .ok_or_else(|| anyhow!("Header parent missing: {}", prev_hash))?;
-        let prev_header_bytes = self.headers_tree.get(prev_hash.as_ref() as &[u8])?.unwrap();
-        let prev_header: BlockHeader = bincode::deserialize(&prev_header_bytes)?;
-
-        let delta = header.time.saturating_sub(prev_header.time);
-        
-        let height = self.headers.len() as u32;
-        if height > 64 && delta < self.ldd_state.current_psi {
-            bail!("Protocol Violation: Block found before Slot Gap elapsed (Delta: {}s, Psi: {}s)", delta, self.ldd_state.current_psi);
-        }
 
         if header.vrf_proof.is_none() {
             let hash_val = BigUint::from_bytes_be(header.hash().as_ref());
-            let ldd_target = self.get_next_pow_target(delta);
-            
-            if height > 64 && hash_val > ldd_target {
-                 bail!("Rejection: Block {} does not meet PoW target for delta {}s", header.hash(), delta);
-            }
-
             let target = BlockHeader::calculate_target(header.bits);
+            
+            // Header-only sync cannot strictly validate exact dynamic difficulty targets due to missing block bodies,
+            // so we fallback to verifying it matches the intrinsic bits claim for SPV filtering.
             if hash_val > target { bail!("Invalid PoW in header"); }
 
-            // AUDIT FIX: Use shared SynergisticWeight trait for validation return value
-            // We return 0 here because the actual cumulative work is calculated later using the full block context if needed
-            // But for validation we just need to pass. The work value returned here is used for best_header selection.
-            // Using the trait:
-            let burn_rate = Probability::from_num(self.ldd_state.current_burn_rate.to_f64());
+            let burn_rate = Probability::from_num(self.fee_params.min_burn_rate);
             return Ok(header.calculate_synergistic_weight(burn_rate));
         } else {
-            let burn_rate = Probability::from_num(self.ldd_state.current_burn_rate.to_f64());
+            let burn_rate = Probability::from_num(self.fee_params.min_burn_rate);
             return Ok(header.calculate_synergistic_weight(burn_rate));
         }
     }
@@ -532,10 +540,8 @@ impl Blockchain {
         }).sum()
     }
 
-    // AUDIT FIX: Dimensional Consistency for ASW
-    pub fn calculate_synergistic_work(&self, block: &mut Block) {
-        let burn_rate = Probability::from_num(self.ldd_state.current_burn_rate.to_f64());
-        // Delegate to the shared SynergisticWeight trait implementation
+    pub fn calculate_synergistic_work(&self, block: &mut Block, ldd: &LddState) {
+        let burn_rate = Probability::from_num(ldd.current_burn_rate.to_f64());
         block.synergistic_work = block.header.calculate_synergistic_weight(burn_rate);
     }
 
@@ -566,15 +572,15 @@ impl Blockchain {
         }
     }
 
-    pub fn adjust_ldd(&mut self) {
-        let total_window_blocks = self.ldd_state.recent_blocks.len();
+    pub fn adjust_ldd_pure(&self, ldd_state: &mut LddState, dcs: &mut DecentralizedConsensusService) {
+        let total_window_blocks = ldd_state.recent_blocks.len();
         if total_window_blocks < 2 { return; }
 
-        let n_pow = self.ldd_state.recent_blocks.iter().filter(|(_, is_pow)| *is_pow).count();
+        let n_pow = ldd_state.recent_blocks.iter().filter(|(_, is_pow)| *is_pow).count();
         let n_pos = total_window_blocks.saturating_sub(n_pow);
 
-        let start_time = self.ldd_state.recent_blocks.first().unwrap().0;
-        let end_time = self.ldd_state.recent_blocks.last().unwrap().0;
+        let start_time = ldd_state.recent_blocks.first().unwrap().0;
+        let end_time = ldd_state.recent_blocks.last().unwrap().0;
         let duration = end_time.saturating_sub(start_time);
         
         let observed_mu = if total_window_blocks > 1 {
@@ -583,15 +589,14 @@ impl Blockchain {
             SlotDuration(15)
         };
 
-        let network_state = self.dcs.get_consensus_state();
+        let network_state = dcs.get_consensus_state();
         let target_mu = SlotDuration(self.consensus_params.target_block_time);
 
-        // Construct parameters using bitwise conversion to ensure exact preservation
         let current_params = LddParams {
-            psi: SlotDuration(self.ldd_state.current_psi as u64),
-            gamma: SlotDuration(self.ldd_state.current_gamma as u64),
-            f_a_pow: Probability::from_bits(self.ldd_state.f_a_pow.to_bits()),
-            f_a_pos: Probability::from_bits(self.ldd_state.f_a_pos.to_bits()),
+            psi: SlotDuration(ldd_state.current_psi as u64),
+            gamma: SlotDuration(ldd_state.current_gamma as u64),
+            f_a_pow: Probability::from_bits(ldd_state.f_a_pow.to_bits()),
+            f_a_pos: Probability::from_bits(ldd_state.f_a_pos.to_bits()),
         };
 
         let new_params = calculate_next_difficulty(
@@ -603,15 +608,12 @@ impl Blockchain {
             total_window_blocks
         );
 
-        self.ldd_state.current_psi = new_params.psi.0 as u32;
-        self.ldd_state.current_gamma = new_params.gamma.0 as u32;
-        self.ldd_state.f_a_pow = Fixed::from_bits(new_params.f_a_pow.to_bits());
-        self.ldd_state.f_a_pos = Fixed::from_bits(new_params.f_a_pos.to_bits());
+        ldd_state.current_psi = new_params.psi.0 as u32;
+        ldd_state.current_gamma = new_params.gamma.0 as u32;
+        ldd_state.f_a_pow = Fixed::from_bits(new_params.f_a_pow.to_bits());
+        ldd_state.f_a_pos = Fixed::from_bits(new_params.f_a_pos.to_bits());
 
-        // Refresh fallbacks - STRICT DETERMINISTIC MATH
         let t_fallback = self.consensus_params.nakamoto_target_block_time;
-        
-        // b_total = 1 / t_fallback
         let t_fallback_fixed = Fixed::from_integer(t_fallback);
         let b_total = if t_fallback_fixed.0 > 0 {
             Fixed::one() / t_fallback_fixed
@@ -619,38 +621,34 @@ impl Blockchain {
             Fixed::from_integer(0) 
         };
 
-        let sum_a = self.ldd_state.f_a_pow + self.ldd_state.f_a_pos;
+        let sum_a = ldd_state.f_a_pow + ldd_state.f_a_pos;
         
         if sum_a.0 > 0 {
-            // f_b_pow_target = b_total * (f_a_pow / sum_a)
-            let ratio_pow = self.ldd_state.f_a_pow / sum_a;
+            let ratio_pow = ldd_state.f_a_pow / sum_a;
             let f_b_pow_target = b_total * ratio_pow;
             
-            let ratio_pos = self.ldd_state.f_a_pos / sum_a;
+            let ratio_pos = ldd_state.f_a_pos / sum_a;
             let f_b_pos_target = b_total * ratio_pos;
 
-            // Safety: f_b cannot be easier (larger) than f_a
-            self.ldd_state.f_b_pow = cmp::min(f_b_pow_target, self.ldd_state.f_a_pow);
-            self.ldd_state.f_b_pos = cmp::min(f_b_pos_target, self.ldd_state.f_a_pos);
+            ldd_state.f_b_pow = cmp::min(f_b_pow_target, ldd_state.f_a_pow);
+            ldd_state.f_b_pos = cmp::min(f_b_pos_target, ldd_state.f_a_pos);
         }
 
-        self.sync_staking_totals();
-
-        self.ldd_state.recent_blocks.clear();
-        self.dcs.reset_interval(); 
+        ldd_state.recent_blocks.clear();
+        dcs.reset_interval(); 
     }
 
-    pub fn get_next_pow_target(&self, delta: u32) -> BigUint {
-        let hazard = self.calculate_hazard(delta, self.ldd_state.f_a_pow, self.ldd_state.f_b_pow);
+    pub fn get_pow_target_from_state(&self, ldd: &LddState, delta: u32) -> BigUint {
+        let hazard = self.calculate_hazard_from_state(ldd, delta, ldd.f_a_pow, ldd.f_b_pow);
         let max_target = BigUint::from(1u32) << 256;
         (BigUint::from(hazard.0) * max_target) >> 64
     }
 
-    pub fn get_next_work_required(&self, pow: bool, delta: u32) -> u32 {
+    pub fn get_work_required_from_state(&self, ldd: &LddState, pow: bool, delta: u32) -> u32 {
         let hazard = if pow {
-            self.calculate_hazard(delta, self.ldd_state.f_a_pow, self.ldd_state.f_b_pow)
+            self.calculate_hazard_from_state(ldd, delta, ldd.f_a_pow, ldd.f_b_pow)
         } else {
-            self.calculate_hazard(delta, self.ldd_state.f_a_pos, self.ldd_state.f_b_pos)
+            self.calculate_hazard_from_state(ldd, delta, ldd.f_a_pos, ldd.f_b_pos)
         };
 
         if pow {
@@ -672,9 +670,9 @@ impl Blockchain {
         } else { 0x207fffff }
     }
 
-    fn calculate_hazard(&self, delta: u32, f_a: Fixed, f_b: Fixed) -> Fixed {
-        let psi = self.ldd_state.current_psi;
-        let gamma = self.ldd_state.current_gamma;
+    fn calculate_hazard_from_state(&self, ldd: &LddState, delta: u32, f_a: Fixed, f_b: Fixed) -> Fixed {
+        let psi = ldd.current_psi;
+        let gamma = ldd.current_gamma;
 
         if delta < psi {
             Fixed(0)
@@ -685,6 +683,14 @@ impl Blockchain {
         } else {
             f_b 
         }
+    }
+
+    pub fn get_next_pow_target(&self, delta: u32) -> BigUint {
+        self.get_pow_target_from_state(&self.ldd_state, delta)
+    }
+
+    pub fn get_next_work_required(&self, pow: bool, delta: u32) -> u32 {
+        self.get_work_required_from_state(&self.ldd_state, pow, delta)
     }
 
     pub fn get_mempool_txs(&mut self) -> Vec<Transaction> { 
@@ -727,6 +733,20 @@ impl Blockchain {
         Ok(block)
     }
 
+    fn verify_dcs_metadata_with_state(&self, block: &Block, dcs: &DecentralizedConsensusService) -> Result<()> {
+        if block.header.vrf_proof.is_some() { return Ok(()); }
+        let consensus_values = dcs.calculate_consensus();
+        if consensus_values.median_total_stake > 0 && self.total_staked > 0 {
+            let deviation = (self.total_staked as i128 - consensus_values.median_total_stake as i128).abs();
+            if deviation > (consensus_values.median_total_stake as i128 / 10) { bail!("DCS Stake Violation."); }
+        }
+        if consensus_values.median_time > 0 {
+            let time_drift = (block.header.time as i64 - consensus_values.median_time as i64).abs();
+            if time_drift > 600 { bail!("DTC Time Violation."); }
+        }
+        Ok(())
+    }
+
     pub fn add_block(&mut self, mut block: Block) -> Result<()> {
         let hash = block.header.hash();
         if self.blocks_tree.contains_key(hash.as_ref() as &[u8])? { return Ok(()); }
@@ -735,30 +755,57 @@ impl Blockchain {
             bail!("Rejection: Block {} has been vetoed.", hash); 
         }
 
-        let is_parallel_genesis = block.header.prev_blockhash == sha256d::Hash::all_zeros();
-        if !is_parallel_genesis && !self.headers_tree.contains_key(block.header.prev_blockhash.as_ref() as &[u8])? {
-            if self.orphan_blocks.len() < MAX_ORPHAN_BLOCKS {
-                self.orphan_blocks.insert(hash, block);
-                return Ok(());
-            } else { bail!("Orphan buffer full"); }
+        let prev_hash = block.header.prev_blockhash;
+        let is_parallel_genesis = prev_hash == sha256d::Hash::all_zeros();
+
+        if !is_parallel_genesis {
+            let mut parent_state_key = b"state_".to_vec();
+            parent_state_key.extend_from_slice(prev_hash.as_ref());
+            
+            if !self.meta_tree.contains_key(&parent_state_key)? {
+                if self.orphan_blocks.len() < MAX_ORPHAN_BLOCKS {
+                    self.orphan_blocks.insert(hash, block);
+                    return Ok(());
+                } else { 
+                    bail!("Orphan buffer full"); 
+                }
+            }
         }
 
-        if let Err(e) = self.verify_dcs_metadata(&block) { bail!("DCS telemetry failed: {}", e); }
+        let mut block_state = if is_parallel_genesis {
+            let mut ldd = LddState::default();
+            ldd.current_target_block_time = self.consensus_params.target_block_time;
+            ldd.current_burn_rate = Fixed::from_f64(self.fee_params.min_burn_rate);
+            BlockState { ldd, dcs: DecentralizedConsensusService::new() }
+        } else {
+            let prev_state_bytes = self.meta_tree.get({
+                let mut k = b"state_".to_vec();
+                k.extend_from_slice(prev_hash.as_ref());
+                k
+            })?.ok_or_else(|| anyhow!("Previous block state missing for block {}", hash))?;
+            bincode::deserialize(&prev_state_bytes)?
+        };
+
+        if let Err(e) = self.verify_dcs_metadata_with_state(&block, &block_state.dcs) { bail!("DCS telemetry failed: {}", e); }
 
         let is_pow = block.header.vrf_proof.is_none();
         let fees = self.calculate_total_fees(&block);
 
-        let prev_hash = block.header.prev_blockhash;
-        if prev_hash != sha256d::Hash::all_zeros() {
+        if !is_parallel_genesis {
             let prev_header_bytes = self.headers_tree.get(prev_hash.as_ref() as &[u8])?.unwrap();
             let prev_header: BlockHeader = bincode::deserialize(&prev_header_bytes)?;
             let delta = block.header.time.saturating_sub(prev_header.time);
             
             if block.height > 64 {
                 if is_pow {
-                    let target = self.get_next_pow_target(delta);
+                    let target = self.get_pow_target_from_state(&block_state.ldd, delta);
                     if BigUint::from_bytes_be(hash.as_ref()) > target {
                         bail!("Rejection: Block {} does not meet PoW target for delta {}s", hash, delta);
+                    }
+                    
+                    let expected_bits = self.get_work_required_from_state(&block_state.ldd, true, delta);
+                    if block.header.bits != expected_bits {
+                        bail!("Rejection: Block {} claimed bits {} but expected {}", hash, block.header.bits, expected_bits);
                     }
                 } else {
                     let vrf_proof = block.header.vrf_proof.as_ref().ok_or_else(|| anyhow!("PoS block missing VRF"))?;
@@ -775,14 +822,28 @@ impl Blockchain {
 
                     let committed_stake = block.header.committed_total_stake;
                     
-                    if !self.consensus_engine.check_pos_eligibility(&validator_addr, delta, vrf_hash.as_ref(), committed_stake) {
+                    if !self.consensus_engine.check_pos_eligibility_with_state(&block_state.ldd, &validator_addr, delta, vrf_hash.as_ref(), committed_stake) {
                         bail!("Rejection: Validator {} not eligible for PoS block at delta {}s", validator_addr, delta);
                     }
                 }
             }
         }
 
-        self.calculate_synergistic_work(&mut block);
+        // Advance block_state for this block
+        block_state.dcs.process_beacons(&block.beacons);
+        block_state.ldd.recent_blocks.push((block.header.time, is_pow));
+        
+        if block.height >= block_state.ldd.next_adjustment_height {
+            self.adjust_ldd_pure(&mut block_state.ldd, &mut block_state.dcs);
+            block_state.ldd.next_adjustment_height = block.height + block_state.ldd.current_adjustment_window as u32;
+        }
+
+        // Save block_state to DB
+        let mut key = b"state_".to_vec();
+        key.extend_from_slice(hash.as_ref());
+        self.meta_tree.insert(key, bincode::serialize(&block_state)?)?;
+
+        self.calculate_synergistic_work(&mut block, &block_state.ldd);
 
         let total_work = if is_parallel_genesis {
             block.synergistic_work
@@ -799,7 +860,7 @@ impl Blockchain {
 
         if !is_pow {
             let fees_fixed = Fixed::from_integer(fees);
-            let burn_rate_fixed = self.ldd_state.current_burn_rate;
+            let burn_rate_fixed = block_state.ldd.current_burn_rate;
             let required_burn = ((fees_fixed * burn_rate_fixed).0 >> 64) as u64;
             let claimed_burn = block.header.proven_burn;
             
@@ -832,22 +893,17 @@ impl Blockchain {
                 self.tip = hash; 
                 self.update_utxo_set(&block)?;
                 self.headers.push(block.header.clone());
+                
+                self.ldd_state = block_state.ldd;
+                self.dcs = block_state.dcs;
             }
             
             self.sync_staking_totals();
             for tx in &block.transactions { self.mempool.remove(&tx.id()); }
             self.total_work = block.total_work;
-            self.dcs.process_beacons(&block.beacons);
+            
             if self.burst_manager.check_and_activate(&block, fees) { self.finality_gadget.activate(hash, self.total_staked); }
             self.burst_manager.update_state(block.height);
-
-            self.ldd_state.recent_blocks.push((block.header.time, is_pow));
-            
-            if block.height >= self.ldd_state.next_adjustment_height { 
-                self.adjust_ldd(); 
-                self.ldd_state.next_adjustment_height = block.height + self.ldd_state.current_adjustment_window as u32;
-                self.meta_tree.insert("next_adjustment_height", self.ldd_state.next_adjustment_height.to_be_bytes().as_slice())?;
-            }
 
             self.update_and_execute_proposals();
             self.blocks_tree.insert(self.db_config.tip_key.as_str(), hash.as_ref() as &[u8])?;
@@ -865,20 +921,6 @@ impl Blockchain {
                 let _ = self.add_block(child_block);
             }
         }
-    }
-
-    fn verify_dcs_metadata(&self, block: &Block) -> Result<()> {
-        if block.header.vrf_proof.is_some() { return Ok(()); }
-        let consensus_values = self.dcs.calculate_consensus();
-        if consensus_values.median_total_stake > 0 && self.total_staked > 0 {
-            let deviation = (self.total_staked as i128 - consensus_values.median_total_stake as i128).abs();
-            if deviation > (consensus_values.median_total_stake as i128 / 10) { bail!("DCS Stake Violation."); }
-        }
-        if consensus_values.median_time > 0 {
-            let time_drift = (block.header.time as i64 - consensus_values.median_time as i64).abs();
-            if time_drift > 600 { bail!("DTC Time Violation."); }
-        }
-        Ok(())
     }
 
     pub fn handle_reorganization(&mut self, new_block_hash: sha256d::Hash) -> Result<()> {
@@ -905,6 +947,16 @@ impl Blockchain {
         for block in path.into_iter().rev() { self.update_utxo_set(&block)?; }
 
         self.tip = new_block_hash;
+        
+        let state_bytes = self.meta_tree.get({
+            let mut k = b"state_".to_vec();
+            k.extend_from_slice(new_block_hash.as_ref());
+            k
+        })?.ok_or_else(|| anyhow!("State missing for new tip {}", new_block_hash))?;
+        let new_state: BlockState = bincode::deserialize(&state_bytes)?;
+        self.ldd_state = new_state.ldd;
+        self.dcs = new_state.dcs;
+
         if let Some(idx) = self.headers.iter().position(|h| h.hash() == ancestor) {
             self.headers.truncate(idx + 1);
             let mut to_append = Vec::new();
