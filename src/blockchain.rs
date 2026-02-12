@@ -841,15 +841,14 @@ impl Blockchain {
             if self.burst_manager.check_and_activate(&block, fees) { self.finality_gadget.activate(hash, self.total_staked); }
             self.burst_manager.update_state(block.height);
 
-            if !self.is_syncing() {
-                self.ldd_state.recent_blocks.push((block.header.time, is_pow));
-                
-                if block.height >= self.ldd_state.next_adjustment_height { 
-                    self.adjust_ldd(); 
-                    self.ldd_state.next_adjustment_height = block.height + self.ldd_state.current_adjustment_window as u32;
-                    self.meta_tree.insert("next_adjustment_height", self.ldd_state.next_adjustment_height.to_be_bytes().as_slice())?;
-                }
+            self.ldd_state.recent_blocks.push((block.header.time, is_pow));
+            
+            if block.height >= self.ldd_state.next_adjustment_height { 
+                self.adjust_ldd(); 
+                self.ldd_state.next_adjustment_height = block.height + self.ldd_state.current_adjustment_window as u32;
+                self.meta_tree.insert("next_adjustment_height", self.ldd_state.next_adjustment_height.to_be_bytes().as_slice())?;
             }
+
             self.update_and_execute_proposals();
             self.blocks_tree.insert(self.db_config.tip_key.as_str(), hash.as_ref() as &[u8])?;
             self.process_orphans(hash);

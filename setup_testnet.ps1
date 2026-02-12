@@ -215,10 +215,6 @@ for ($i = 2; $i -le $maxCount; $i++) {
             Set-Location $d
             & $b --config $c start-node --mode staker 2>&1 | Out-File "node.log"
         } -ArgumentList $sDir, $sConf, $nodeBin
-
-        # We don't wait for RPC here to speed up launch, but we attempt stake blindly
-        # (It will fail until RPC is up, but user can manually stake later or script can be improved)
-        # For robustness, we just launch the process here.
     }
     
     Start-Sleep -Seconds 2
@@ -232,6 +228,8 @@ $startScriptContent = $startScriptContent -replace '__NUM_MINERS__', $numMiners
 $startScriptContent = $startScriptContent -replace '__NUM_STAKERS__', $numStakers
 Set-Content -Path (Join-Path -Path $projectRoot -ChildPath "start_testnet.ps1") -Value $startScriptContent
 
+# --- Generate Stop Script ---
+Write-Host "Generating stop_testnet.ps1..."
 $stopScriptContent = @'
 #!/usr/bin/env powershell
 Get-Job | Stop-Job -ErrorAction SilentlyContinue
@@ -240,4 +238,129 @@ Get-Process | Where-Object { ($_.ProcessName -eq "cargo") -or ($_.ProcessName -e
 Write-Host "Stopped all testnet nodes."
 '@
 Set-Content -Path (Join-Path -Path $projectRoot -ChildPath "stop_testnet.ps1") -Value $stopScriptContent
+
+# --- Generate Add Staker Script ---
+Write-Host "Generating add_staker.ps1..."
+$addStakerScriptContent = @'
+#!/usr/bin/env powershell
+param(
+    [int]$StakerId = 0
+)
+
+$projectRoot = $PSScriptRoot
+$testnetDir = Join-Path -Path $projectRoot -ChildPath "local_testnet"
+$nodeBin = "__BINARY_PATH__"
+$baseP2pPort = __BASE_P2P__
+$baseRpcPort = __BASE_RPC__
+$numMiners = __NUM_MINERS__
+
+# Determine next staker ID if not provided
+if ($StakerId -eq 0) {
+    $existingStakers = Get-ChildItem -Path $testnetDir -Filter "staker*" -Directory
+    $maxId = 0
+    foreach ($dir in $existingStakers) {
+        if ($dir.Name -match "staker(\d+)") {
+            $id = [int]$matches[1]
+            if ($id -gt $maxId) { $maxId = $id }
+        }
+    }
+    $StakerId = $maxId + 1
+}
+
+$nodeDir = Join-Path -Path $testnetDir -ChildPath "staker$StakerId"
+if (Test-Path $nodeDir) {
+    Write-Error "Staker directory $nodeDir already exists!"
+    exit 1
+}
+New-Item -Path $nodeDir -ItemType Directory | Out-Null
+
+$p2pPort = $baseP2pPort + $numMiners + $StakerId
+$rpcPort = $baseRpcPort + $numMiners + $StakerId
+$dbPath = ($nodeDir + "/staker.db").Replace('\', '/')
+$walletPath = ($nodeDir + "/wallet.dat").Replace('\', '/')
+
+$miner1P2p = "`"127.0.0.1:$($baseP2pPort + 1)`""
+$bootstrapNodesStr = "[$miner1P2p]"
+
+# Read staker.toml template
+$configContent = Get-Content -Path (Join-Path -Path $projectRoot -ChildPath "staker.toml") -Raw
+$configContent = $configContent -replace 'rpc_port = \d+', "rpc_port = $rpcPort"
+$configContent = $configContent -replace 'p2p_port = \d+', "p2p_port = $p2pPort"
+$configContent = $configContent -replace 'db_path = ".*"', "db_path = `"$dbPath`""
+$configContent = $configContent -replace 'wallet_file = ".*"', "wallet_file = `"$walletPath`""
+$configContent = $configContent -replace 'bootstrap_nodes =.*', "bootstrap_nodes = $bootstrapNodesStr"
+$configContent = $configContent -replace 'coinbase_maturity = \d+', 'coinbase_maturity = 1'
+$configContent = $configContent -replace 'reconnect_delay_secs = \d+', 'reconnect_delay_secs = 5'
+
+$nodeConfigFile = Join-Path -Path $nodeDir -ChildPath "config.toml"
+Set-Content -Path $nodeConfigFile -Value $configContent
+
+# Create Wallet
+Write-Host "Creating wallet for Staker $StakerId..."
+$walletInfo = & $nodeBin --config "$nodeConfigFile" create-wallet
+$capturedAddr = ($walletInfo | Select-String -Pattern "Address:").Line.Split(' ')[1]
+Set-Content (Join-Path -Path $nodeDir -ChildPath "address.txt") -Value $capturedAddr
+
+# Fund the new staker from Miner 1
+Write-Host "Funding Staker $StakerId ($capturedAddr) from Miner 1..."
+$m1Conf = Join-Path -Path $testnetDir -ChildPath "miner1\config.toml"
+$miner1RpcPort = $baseRpcPort + 1
+
+function Get-ChainHeight {
+    param($port)
+    try {
+        $body = @{ jsonrpc = "2.0"; method = "print_chain"; params = @(); id = 1 } | ConvertTo-Json -Depth 2
+        $res = Invoke-RestMethod -Uri "http://127.0.0.1:$port" -Method Post -Body $body -ContentType "application/json" -ErrorAction Stop
+        return $res.result.height
+    } catch { return -1 }
+}
+
+function Wait-For-Block {
+    param($port, $currentHeight)
+    while ((Get-ChainHeight -port $port) -le $currentHeight) {
+        Start-Sleep -Seconds 3
+    }
+}
+
+$h = Get-ChainHeight -port $miner1RpcPort
+if ($h -lt 0) {
+    Write-Error "Miner 1 is not reachable on port $miner1RpcPort. Is the testnet running?"
+    exit 1
+}
+
+$res = & $nodeBin --config "$m1Conf" send --to "$capturedAddr" --amount 100000 2>&1
+Write-Host "Sending funds... TXID/Output: $res"
+Wait-For-Block -port $miner1RpcPort -currentHeight $h
+
+# Start the Staker
+Write-Host "Starting Staker $StakerId..."
+$sCmd = "Set-Location '$nodeDir'; & '$nodeBin' --config '$nodeConfigFile' start-node --mode staker 2>&1 | Tee-Object -FilePath 'node.log'"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "$sCmd"
+
+# Wait for Staker RPC
+Write-Host "Waiting for Staker $StakerId RPC on port $rpcPort..."
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$rpcUp = $false
+while ($sw.Elapsed.TotalSeconds -lt 60) {
+    if ((Get-ChainHeight -port $rpcPort) -ge 0) { $rpcUp = $true; break }
+    Start-Sleep -Seconds 2
+}
+
+if ($rpcUp) {
+    Write-Host "Registering stake for Staker $StakerId..."
+    & $nodeBin --config "$nodeConfigFile" stake --asset SYN --amount 90000 | Out-Null
+    Write-Host "Staker $StakerId configured and stake broadcast." -ForegroundColor Green
+} else {
+    Write-Error "Timeout waiting for Staker $StakerId RPC."
+}
+'@
+
+$addStakerScriptContent = $addStakerScriptContent.Replace('__BINARY_PATH__', $binaryPath)
+$addStakerScriptContent = $addStakerScriptContent.Replace('__BASE_P2P__', $baseP2pPort.ToString())
+$addStakerScriptContent = $addStakerScriptContent.Replace('__BASE_RPC__', $baseRpcPort.ToString())
+$addStakerScriptContent = $addStakerScriptContent.Replace('__NUM_MINERS__', $numMiners.ToString())
+
+Set-Content -Path (Join-Path -Path $projectRoot -ChildPath "add_staker.ps1") -Value $addStakerScriptContent
+
 Write-Host "Done. Run '.\start_testnet.ps1' to begin interleaved bootstrap."
+Write-Host "Run '.\add_staker.ps1' while the network is running to dynamically add new stakers."
