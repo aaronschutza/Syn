@@ -1,4 +1,4 @@
-// src/blockchain.rs - State Isolation & LDD Persistence Remediation
+// src/blockchain.rs - Reorg Logic Audit & Fixes
 
 use crate::{
     block::{Block, BlockHeader, Beacon},
@@ -273,8 +273,12 @@ impl Blockchain {
         Ok(bc)
     }
 
+    pub fn chain_height(&self) -> u32 {
+        self.headers.len().saturating_sub(1) as u32
+    }
+
     pub fn is_syncing(&self) -> bool {
-        let current_height = self.headers.len() as u32;
+        let current_height = self.chain_height();
         if let Some(best_meta_bytes) = self.header_meta_tree.get(self.best_header_tip.as_ref() as &[u8]).ok().flatten() {
             if let Ok(best_meta) = bincode::deserialize::<HeaderMetadata>(&best_meta_bytes) {
                 return best_meta.height > current_height.saturating_add(5);
@@ -829,7 +833,13 @@ impl Blockchain {
             }
         }
 
-        // Advance block_state for this block
+        // REMEDIATION: CAUSALITY FIX
+        // We MUST calculate synergistic_work using the state *before* we potentially adjust it for the next epoch.
+        // This ensures the weight of Block N is derived from the difficulty parameters active at Height N.
+        
+        self.calculate_synergistic_work(&mut block, &block_state.ldd);
+
+        // Advance block_state for the *next* block generation
         block_state.dcs.process_beacons(&block.beacons);
         block_state.ldd.recent_blocks.push((block.header.time, is_pow));
         
@@ -843,8 +853,7 @@ impl Blockchain {
         key.extend_from_slice(hash.as_ref());
         self.meta_tree.insert(key, bincode::serialize(&block_state)?)?;
 
-        self.calculate_synergistic_work(&mut block, &block_state.ldd);
-
+        // Calculate Total Work using Previous Meta
         let total_work = if is_parallel_genesis {
             block.synergistic_work
         } else {
@@ -886,8 +895,24 @@ impl Blockchain {
 
         self.blocks_tree.insert(hash.as_ref() as &[u8], bincode::serialize(&block)?)?;
         
-        if block.total_work >= self.total_work {
-            if block.header.prev_blockhash != self.tip && !is_parallel_genesis { 
+        let current_height = self.chain_height();
+        
+        // REORG RULE 1: Reject lower block height (User Requirement)
+        // We reject blocks that are historically deep compared to our tip.
+        if block.height < current_height {
+            info!("[CONSENSUS] Ignoring block {} at height {} (Behind tip {})", hash, block.height, current_height);
+            return Ok(());
+        }
+
+        // REORG RULE 2: Strict ASW Superiority (Tie-Breaker / Main Rule)
+        // We switch if:
+        // 1. It is a reorg that has STRICTLY more work.
+        // 2. It is a direct extension of our current tip (Liveness).
+        
+        let is_extension = block.header.prev_blockhash == self.tip;
+        
+        if is_extension || block.total_work > self.total_work {
+            if !is_extension && !is_parallel_genesis { 
                 self.handle_reorganization(hash)?; 
             } else { 
                 self.tip = hash; 

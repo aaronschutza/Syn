@@ -99,21 +99,19 @@ pub fn calculate_next_difficulty(
         psi_new + SlotDuration(MIN_BLOCK_TIME_SECONDS)
     };
 
-    let tw = mu_calc_target - psi_new;
-    let tw_sq = U64F64::from_num(tw.0).checked_mul(U64F64::from_num(tw.0)).unwrap_or(U64F64::from_num(1));
-    let pi_over_2 = U64F64::PI / U64F64::from_num(2);
-    
-    // This is the Target Slope required to achieve Mu_target
-    // We calculate this for reference logging, but we drive adaptation via Beta.
-    let m_req = pi_over_2 / tw_sq; 
-
     // Resource Balancing (Beta & Kappa)
-    // Beta: Speed Correction. Observed / Target.
-    let beta = if observed_mu.0 == 0 {
+    // REMEDIATION: Quadratic Scaling for Rayleigh Distribution
+    // Beta = (Observed / Target)^2
+    // M ~ 1 / Mu^2, so to correct M, we scale by (Mu_obs / Mu_target)^2
+    
+    let ratio = if observed_mu.0 == 0 {
         U64F64::from_num(0.1) 
     } else {
         U64F64::from_num(observed_mu.0) / U64F64::from_num(mu_calc_target.0)
     };
+    
+    // Apply Quadratic scaling
+    let beta = ratio * ratio;
 
     let kappa = I64F64::from_num(0.1);
 
@@ -149,8 +147,8 @@ pub fn calculate_next_difficulty(
     };
 
     info!(
-        "[LDD ADJUST] Mu_target: {}s | M_req: {:.8} | Beta: {:.4} | fA_PoW: {:.8} -> {:.8} | fA_PoS: {:.8} -> {:.8}",
-        target_mu.0, m_req.to_num::<f64>(), beta.to_num::<f64>(),
+        "[LDD ADJUST] Mu_target: {}s | Ratio: {:.4} | Beta (Quad): {:.4} | fA_PoW: {:.8} -> {:.8} | fA_PoS: {:.8} -> {:.8}",
+        target_mu.0, ratio.to_num::<f64>(), beta.to_num::<f64>(),
         current_pow.to_num::<f64>(), f_a_pow_new.to_f64(), 
         current_pos.to_num::<f64>(), f_a_pos_new.to_f64()
     );
