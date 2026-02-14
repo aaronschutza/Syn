@@ -1,5 +1,3 @@
-// src/blockchain.rs - Reorg Logic Audit & Fixes
-
 use crate::{
     block::{Block, BlockHeader, Beacon},
     config::{ConsensusConfig, DatabaseConfig, FeeConfig, GovernanceConfig, ProgonosConfig},
@@ -27,7 +25,6 @@ use secp256k1::PublicKey;
 use sled::Batch;
 use serde::{Serialize, Deserialize};
 use log::{info, warn, error}; // Added error
-use std::cmp;
 
 const MAX_BEACONS_PER_BLOCK: usize = 16;
 const MAX_UTXO_CACHE_SIZE: usize = 100000;
@@ -699,27 +696,9 @@ impl Blockchain {
         ldd_state.current_gamma = new_params.gamma.0 as u32;
         ldd_state.f_a_pow = Fixed::from_bits(new_params.f_a_pow.to_bits());
         ldd_state.f_a_pos = Fixed::from_bits(new_params.f_a_pos.to_bits());
-
-        let t_fallback = self.consensus_params.nakamoto_target_block_time;
-        let t_fallback_fixed = Fixed::from_integer(t_fallback);
-        let b_total = if t_fallback_fixed.0 > 0 {
-            Fixed::one() / t_fallback_fixed
-        } else {
-            Fixed::from_integer(0) 
-        };
-
-        let sum_a = ldd_state.f_a_pow + ldd_state.f_a_pos;
+        ldd_state.f_b_pow = ldd_state.f_a_pow;
+        ldd_state.f_b_pos = ldd_state.f_a_pos;
         
-        if sum_a.0 > 0 {
-            let ratio_pow = ldd_state.f_a_pow / sum_a;
-            let f_b_pow_target = b_total * ratio_pow;
-            
-            let ratio_pos = ldd_state.f_a_pos / sum_a;
-            let f_b_pos_target = b_total * ratio_pos;
-
-            ldd_state.f_b_pow = cmp::min(f_b_pow_target, ldd_state.f_a_pow);
-            ldd_state.f_b_pos = cmp::min(f_b_pos_target, ldd_state.f_a_pos);
-        }
 
         ldd_state.recent_blocks.clear();
         dcs.reset_interval(); 
@@ -827,6 +806,9 @@ impl Blockchain {
         let mut inputs_spent_in_block: HashSet<(sha256d::Hash, u32)> = HashSet::new();
         // We also track outputs created in this block to allow chaining (unconfirmed parents)
         let mut outputs_created_in_block: HashSet<(sha256d::Hash, u32)> = HashSet::new();
+        
+        // Track invalid txs to remove from mempool
+        let mut invalid_txs = Vec::new();
 
         for tx in sorted {
             let txid = tx.id();
@@ -857,7 +839,6 @@ impl Blockchain {
 
                     if !in_chain && !in_mempool_chain {
                         // Input is invalid (already spent in chain or never existed).
-                        // We skip this tx. Ideally, we should also purge it from mempool.
                         is_conflict = true; 
                         break;
                     }
@@ -880,10 +861,15 @@ impl Blockchain {
                     outputs_created_in_block.insert((txid, i as u32));
                 }
             } else {
-                // Optional: Purge invalid transaction from mempool to free memory
-                // self.mempool.remove(&txid);
+                // Purge invalid transaction from mempool to free memory
+                invalid_txs.push(txid);
                 // debug!("Dropped conflicting/invalid tx from block template: {}", txid);
             }
+        }
+        
+        // AUDIT FIX: Remove accumulated invalid transactions
+        for txid in invalid_txs {
+            self.mempool.remove(&txid);
         }
         
         final_txs
@@ -1112,7 +1098,10 @@ impl Blockchain {
             }
             
             self.sync_staking_totals();
-            for tx in &block.transactions { self.mempool.remove(&tx.id()); }
+            
+            // AUDIT FIX: Remove mined transactions AND clean conflicting transactions from mempool
+            self.clean_mempool_after_block(&block);
+            
             self.total_work = block.total_work;
             
             if self.burst_manager.check_and_activate(&block, fees) { self.finality_gadget.activate(hash, self.total_staked); }
@@ -1123,6 +1112,40 @@ impl Blockchain {
             self.process_orphans(hash);
         }
         Ok(())
+    }
+
+    fn clean_mempool_after_block(&mut self, block: &Block) {
+        // 1. Remove exact transaction matches
+        for tx in &block.transactions {
+            self.mempool.remove(&tx.id());
+        }
+
+        // 2. Remove transactions that spend inputs consumed by this block (Conflict Resolution)
+        let mut spent_inputs = HashSet::new();
+        for tx in &block.transactions {
+            if !tx.is_coinbase() {
+                for vin in &tx.vin {
+                    spent_inputs.insert((vin.prev_txid, vin.prev_vout));
+                }
+            }
+        }
+
+        let mut conflicts = Vec::new();
+        for (txid, tx) in &self.mempool {
+            if !tx.is_coinbase() {
+                for vin in &tx.vin {
+                    if spent_inputs.contains(&(vin.prev_txid, vin.prev_vout)) {
+                        conflicts.push(*txid);
+                        break;
+                    }
+                }
+            }
+        }
+
+        for txid in conflicts {
+            self.mempool.remove(&txid);
+            // info!("Removed conflict from mempool: {}", txid);
+        }
     }
 
     fn process_orphans(&mut self, parent_hash: sha256d::Hash) {
