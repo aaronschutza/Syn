@@ -26,7 +26,7 @@ use std::sync::Arc;
 use secp256k1::PublicKey;
 use sled::Batch;
 use serde::{Serialize, Deserialize};
-use log::{info, warn};
+use log::{info, warn, debug, error}; // Added error
 use std::cmp;
 
 const MAX_BEACONS_PER_BLOCK: usize = 16;
@@ -369,6 +369,19 @@ impl Blockchain {
         let mut rolling_muhash = self.get_muhash_root()?;
         let pqc_enforced = block.height >= PQC_ENFORCEMENT_HEIGHT;
 
+        // FIX: Intra-block UTXO tracking. Key -> Serialized UtxoEntry
+        // IMPORTANT: We must store deserialized values or at least track existence efficiently
+        // to prevent parsing repeatedly. For simplicity in validation, we just store serialized bytes.
+        let mut intra_block_utxos: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        
+        // Track consumed intra-block UTXOs to prevent double-spending within the same block.
+        // We use the utxo_key (txid + vout) as the identifier.
+        let mut intra_block_spent: HashSet<Vec<u8>> = HashSet::new();
+        
+        // Track consumed DB-based UTXOs to prevent double-spending within the same block
+        // (e.g. two txs in the same block trying to spend the same old UTXO).
+        let mut db_spent_in_block: HashSet<Vec<u8>> = HashSet::new();
+
         let skip_verify = if let Some(finalized_hash) = self.last_finalized_checkpoint {
             if let Some(f_meta_bytes) = self.header_meta_tree.get(finalized_hash.as_ref() as &[u8]).ok().flatten() {
                 if let Ok(f_meta) = bincode::deserialize::<HeaderMetadata>(&f_meta_bytes) {
@@ -377,45 +390,105 @@ impl Blockchain {
             } else { false }
         } else { false };
 
-        for tx in &block.transactions {
-            let mut prev_txs = HashMap::new();
+        for (tx_idx, tx) in block.transactions.iter().enumerate() {
+            let txid = tx.id();
+            
+            // --- 1. Validation Logic ---
             if !tx.is_coinbase() && !skip_verify {
                 let is_bridge_mint = tx.vin.len() == 1 && tx.vin[0].prev_txid == sha256d::Hash::all_zeros() && tx.vin[0].script_sig.starts_with(b"{");
 
                 if is_bridge_mint {
                     self.validate_progonos_mint(tx, &mut btc_tx_batch)?;
                 } else {
+                    let mut prev_txs = HashMap::new();
+                    // We need to fetch previous transactions to verify scripts.
+                    // NOTE: verify_hybrid needs the *full* prev tx, which might be in this block or in DB.
+                    // Current verify_hybrid implementation relies on a map we pass in.
+                    
                     for vin in &tx.vin {
-                        let prev_tx = self.get_transaction(&vin.prev_txid)?.ok_or_else(|| anyhow!("Input tx missing"))?;
-                        prev_txs.insert(vin.prev_txid, prev_tx);
+                        // Check if parent is in this block (intra-block dependency)
+                        // We can scan the blocks' transaction list processed *so far*
+                        let intra_parent = block.transactions[0..tx_idx].iter().find(|t| t.id() == vin.prev_txid);
+                        
+                        if let Some(parent) = intra_parent {
+                             prev_txs.insert(vin.prev_txid, parent.clone());
+                        } else {
+                             // Check DB
+                             let prev_tx = self.get_transaction(&vin.prev_txid)?.ok_or_else(|| anyhow!("Input tx missing: {}", vin.prev_txid))?;
+                             prev_txs.insert(vin.prev_txid, prev_tx);
+                        }
                     }
-                    tx.verify_hybrid(&prev_txs, pqc_enforced)?;
+                    
+                    if let Err(e) = tx.verify_hybrid(&prev_txs, pqc_enforced) {
+                         error!("[CONSENSUS] Tx {} failed hybrid verification: {}", txid, e);
+                         bail!("Tx verification failed: {}", e);
+                    }
                 }
             }
 
-            let txid = tx.id();
+            // --- 2. Input Processing (Spending) ---
             if !tx.is_coinbase() && !tx.vin.is_empty() {
-                for vin in &tx.vin {
+                for (vin_idx, vin) in tx.vin.iter().enumerate() {
                     if vin.prev_txid == sha256d::Hash::all_zeros() { continue; } 
                     let mut utxo_key = Vec::with_capacity(36);
                     utxo_key.extend_from_slice(vin.prev_txid.as_ref());
                     utxo_key.extend_from_slice(&vin.prev_vout.to_be_bytes());
-                    if let Some(val) = self.utxo_tree.get(&utxo_key)? {
+
+                    // A. Check Intra-block UTXOs first
+                    if intra_block_utxos.contains_key(&utxo_key) {
+                        if intra_block_spent.contains(&utxo_key) {
+                            error!("[CONSENSUS] Double spend in block {} at tx {} input {}. Key (Intra): {:02x?}", block.header.hash(), txid, vin_idx, utxo_key);
+                            bail!("Double spend detected within block (intra)");
+                        }
+                        
+                        // Mark spent
+                        intra_block_spent.insert(utxo_key.clone());
+                        
+                        // Get value for MuHash update
+                        let val = intra_block_utxos.get(&utxo_key).unwrap();
+                        let entry_hash = BigUint::from_bytes_be(sha256d::Hash::hash(val).as_ref());
+                        rolling_muhash = self.muhash_div(rolling_muhash, entry_hash);
+
+                        // Since it was created AND spent in the same block, it's transient.
+                        // We remove it from the map so it doesn't get written to DB later.
+                        intra_block_utxos.remove(&utxo_key);
+                        
+                        // It might have been added to the batch in the previous iteration of this loop.
+                        // We must ensure it is NOT in the final batch insert.
+                        utxo_batch.remove(utxo_key.as_slice());
+                        
+                    } 
+                    // B. Check Database
+                    else if let Some(val) = self.utxo_tree.get(&utxo_key)? {
+                         if db_spent_in_block.contains(&utxo_key) {
+                            error!("[CONSENSUS] Double spend in block {} at tx {} input {}. Key (DB): {:02x?}", block.header.hash(), txid, vin_idx, utxo_key);
+                            bail!("Double spend detected within block (db)");
+                         }
+                         db_spent_in_block.insert(utxo_key.clone());
+                         
                         let entry_hash = BigUint::from_bytes_be(sha256d::Hash::hash(&val).as_ref());
                         rolling_muhash = self.muhash_div(rolling_muhash, entry_hash);
+                        
                         self.utxo_cache.remove(&(vin.prev_txid, vin.prev_vout));
                         utxo_batch.remove(utxo_key.as_slice());
+                        
+                        // Handle Address Index
                         let entry: UtxoEntry = bincode::deserialize(&val)?;
                         if !entry.output.script_pub_key.is_empty() {
                             let mut addr_key = entry.output.script_pub_key;
                             addr_key.extend_from_slice(&utxo_key);
                             addr_batch.remove(addr_key);
                         }
-                    } else { bail!("UTXO missing in tx {}.", txid); }
+                    } else { 
+                        error!("[CONSENSUS] UTXO missing for tx {} input {}. PrevOut: {}:{}", txid, vin_idx, vin.prev_txid, vin.prev_vout);
+                        bail!("UTXO missing in tx {}. Input: {}:{}", txid, vin.prev_txid, vin.prev_vout); 
+                    }
                 }
             }
 
+            // --- 3. Output Processing (Creation) ---
             for (i, vout) in tx.vout.iter().enumerate() {
+                // Staking logic check
                 if vout.script_pub_key.len() >= 27 && vout.script_pub_key[0] == 0x6a && vout.script_pub_key[1] == 0x05 && &vout.script_pub_key[2..7] == b"STAKE" {
                     let pubkey_hash_bytes = &vout.script_pub_key[8..28];
                     let pk_hash = hash160::Hash::from_slice(pubkey_hash_bytes)?;
@@ -431,17 +504,27 @@ impl Blockchain {
                 let mut utxo_key = Vec::with_capacity(36);
                 utxo_key.extend_from_slice(txid.as_ref());
                 utxo_key.extend_from_slice(&(i as u32).to_be_bytes());
+                
                 let serialized = bincode::serialize(&entry)?;
                 let entry_hash = BigUint::from_bytes_be(sha256d::Hash::hash(&serialized).as_ref());
                 rolling_muhash = self.muhash_mul(rolling_muhash, entry_hash);
+                
+                // Add to intra-block tracking so subsequent txs in this block can spend it
+                intra_block_utxos.insert(utxo_key.clone(), serialized.clone());
+                
+                // Queue for DB insertion
                 utxo_batch.insert(utxo_key.clone(), serialized);
+                
                 if self.utxo_cache.len() < MAX_UTXO_CACHE_SIZE { self.utxo_cache.insert((txid, i as u32), entry); }
                 if !vout.script_pub_key.is_empty() {
                     let mut addr_key = vout.script_pub_key.clone(); addr_key.extend_from_slice(&utxo_key); addr_batch.insert(addr_key, &[]);
                 }
             }
+            
+            // Index the transaction location
             index_batch.insert(txid.as_ref() as &[u8], block.header.hash().as_ref() as &[u8]);
         }
+        
         self.utxo_tree.apply_batch(utxo_batch)?; 
         self.addr_utxo_tree.apply_batch(addr_batch)?; 
         self.tx_index_tree.apply_batch(index_batch)?;
@@ -698,7 +781,52 @@ impl Blockchain {
     }
 
     pub fn get_mempool_txs(&mut self) -> Vec<Transaction> { 
-        self.mempool.values().cloned().collect()
+        // Remediation: Topologically sort transactions to ensure parents appear before children.
+        // This prevents "UTXO missing" errors when a block contains a chain of unconfirmed txs.
+        let source_txs: Vec<Transaction> = self.mempool.values().cloned().collect();
+        let mut tx_map: HashMap<sha256d::Hash, Transaction> = HashMap::new();
+        for tx in &source_txs {
+            tx_map.insert(tx.id(), tx.clone());
+        }
+
+        let mut visited = HashSet::new();
+        let mut sorted = Vec::with_capacity(source_txs.len());
+        let mut stack = Vec::new();
+
+        // Iterative DFS to topologically sort
+        for root_tx in &source_txs {
+            if visited.contains(&root_tx.id()) { continue; }
+            
+            // Stack stores (tx_id, state). State: 0 = visit children (parents in this context), 1 = add self.
+            stack.push((root_tx.id(), 0));
+            
+            while let Some((tx_id, state)) = stack.pop() {
+                if state == 1 {
+                     if let Some(tx) = tx_map.get(&tx_id) {
+                        if visited.insert(tx_id) {
+                            sorted.push(tx.clone());
+                        }
+                     }
+                     continue;
+                }
+
+                if visited.contains(&tx_id) { continue; }
+                
+                // Mark for post-processing (add self after dependencies)
+                stack.push((tx_id, 1));
+                
+                // Push dependencies (inputs that are in the mempool) to stack to be processed first
+                if let Some(tx) = tx_map.get(&tx_id) {
+                     for vin in &tx.vin {
+                         if tx_map.contains_key(&vin.prev_txid) && !visited.contains(&vin.prev_txid) {
+                             stack.push((vin.prev_txid, 0));
+                         }
+                     }
+                }
+            }
+        }
+        
+        sorted
     }
 
     pub fn create_block_template(&mut self, mut transactions: Vec<Transaction>, version: i32) -> Result<Block> {

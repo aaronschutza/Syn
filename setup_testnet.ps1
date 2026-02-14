@@ -239,6 +239,80 @@ Write-Host "Stopped all testnet nodes."
 '@
 Set-Content -Path (Join-Path -Path $projectRoot -ChildPath "stop_testnet.ps1") -Value $stopScriptContent
 
+# --- Generate Transaction Load Generator Script ---
+Write-Host "Generating start_tx_load.ps1..."
+$txLoadScriptContent = @'
+#!/usr/bin/env powershell
+$projectRoot = $PSScriptRoot
+$testnetDir = Join-Path -Path $projectRoot -ChildPath "local_testnet"
+$nodeBin = "__BINARY_PATH__"
+$numMiners = __NUM_MINERS__
+$numStakers = __NUM_STAKERS__
+
+# --- Helper: Get a Random Node Configuration and Address ---
+function Get-RandomNode {
+    # 0 = miner, 1 = staker
+    $type = Get-Random -Minimum 0 -Maximum 2
+    
+    if ($type -eq 0) {
+        $id = Get-Random -Minimum 1 -Maximum ($numMiners + 1)
+        $dir = Join-Path -Path $testnetDir -ChildPath "miner$id"
+    } else {
+        $id = Get-Random -Minimum 1 -Maximum ($numStakers + 1)
+        $dir = Join-Path -Path $testnetDir -ChildPath "staker$id"
+    }
+    
+    $conf = Join-Path -Path $dir -ChildPath "config.toml"
+    $addr = Get-Content -Path (Join-Path -Path $dir -ChildPath "address.txt")
+    
+    return @{ Config = $conf; Address = $addr; Id = $id; Type = if($type -eq 0){"Miner"}else{"Staker"} }
+}
+
+Write-Host "Starting Transaction Load Generator..."
+Write-Host "Press Ctrl+C to stop."
+
+while ($true) {
+    # 1. Pick a random Sender
+    $sender = Get-RandomNode
+    
+    # 2. Pick a random Receiver (ensure it's different if possible)
+    $receiver = Get-RandomNode
+    while ($receiver.Address -eq $sender.Address) {
+        $receiver = Get-RandomNode
+    }
+    
+    # 3. Random amount between 100 and 1000
+    $amount = Get-Random -Minimum 100 -Maximum 1001
+    
+    Write-Host "[$($sender.Type)$($sender.Id) -> $($receiver.Type)$($receiver.Id)] Sending $amount SYN..." -NoNewline
+    
+    # 4. Execute Send Command
+    # We suppress standard output but capture errors.
+    $output = & $nodeBin --config "$($sender.Config)" send --to "$($receiver.Address)" --amount $amount 2>&1
+    
+    # 5. Check result
+    if ($output -match "TXID") {
+        Write-Host " OK." -ForegroundColor Green
+    } else {
+        # This is expected if balances are low or mempool is full
+        if ($output -match "Insufficient funds") {
+            Write-Host " SKIPPED (Insufficient Funds)." -ForegroundColor Yellow
+        } else {
+            Write-Host " FAILED." -ForegroundColor Red
+            # Write-Host $output # Uncomment to debug errors
+        }
+    }
+    
+    # 6. Wait random interval (0.5s to 2s)
+    $sleepMs = Get-Random -Minimum 500 -Maximum 2000
+    Start-Sleep -Milliseconds $sleepMs
+}
+'@
+$txLoadScriptContent = $txLoadScriptContent -replace '__BINARY_PATH__', $binaryPath.Replace('\', '\\')
+$txLoadScriptContent = $txLoadScriptContent -replace '__NUM_MINERS__', $numMiners
+$txLoadScriptContent = $txLoadScriptContent -replace '__NUM_STAKERS__', $numStakers
+Set-Content -Path (Join-Path -Path $projectRoot -ChildPath "start_tx_load.ps1") -Value $txLoadScriptContent
+
 # --- Generate Add Staker Script ---
 Write-Host "Generating add_staker.ps1..."
 $addStakerScriptContent = @'
@@ -363,4 +437,5 @@ $addStakerScriptContent = $addStakerScriptContent.Replace('__NUM_MINERS__', $num
 Set-Content -Path (Join-Path -Path $projectRoot -ChildPath "add_staker.ps1") -Value $addStakerScriptContent
 
 Write-Host "Done. Run '.\start_testnet.ps1' to begin interleaved bootstrap."
+Write-Host "Run '.\start_tx_load.ps1' to begin generating random transactions."
 Write-Host "Run '.\add_staker.ps1' while the network is running to dynamically add new stakers."
