@@ -26,7 +26,7 @@ use std::sync::Arc;
 use secp256k1::PublicKey;
 use sled::Batch;
 use serde::{Serialize, Deserialize};
-use log::{info, warn, debug, error}; // Added error
+use log::{info, warn, error}; // Added error
 use std::cmp;
 
 const MAX_BEACONS_PER_BLOCK: usize = 16;
@@ -87,12 +87,12 @@ impl Default for LddState {
     fn default() -> Self {
         Self {
             f_a_pow: Fixed::from_f64(0.01), 
-            f_a_pos: Fixed::from_f64(0.05), 
-            f_b_pow: Fixed::from_f64(0.001),
-            f_b_pos: Fixed::from_f64(0.05),
+            f_a_pos: Fixed::from_f64(0.5), 
+            f_b_pow: Fixed::from_f64(0.01),
+            f_b_pos: Fixed::from_f64(0.5),
             recent_blocks: Vec::new(),
-            current_psi: 5,
-            current_gamma: 50,
+            current_psi: 3,
+            current_gamma: 30,
             current_target_block_time: 15,
             current_adjustment_window: 5,
             next_adjustment_height: 5,
@@ -781,8 +781,8 @@ impl Blockchain {
     }
 
     pub fn get_mempool_txs(&mut self) -> Vec<Transaction> { 
-        // Remediation: Topologically sort transactions to ensure parents appear before children.
-        // This prevents "UTXO missing" errors when a block contains a chain of unconfirmed txs.
+        // 1. Snapshot and Topological Sort
+        // We preserve the topological sort to ensure parents are processed before children.
         let source_txs: Vec<Transaction> = self.mempool.values().cloned().collect();
         let mut tx_map: HashMap<sha256d::Hash, Transaction> = HashMap::new();
         for tx in &source_txs {
@@ -793,11 +793,8 @@ impl Blockchain {
         let mut sorted = Vec::with_capacity(source_txs.len());
         let mut stack = Vec::new();
 
-        // Iterative DFS to topologically sort
         for root_tx in &source_txs {
             if visited.contains(&root_tx.id()) { continue; }
-            
-            // Stack stores (tx_id, state). State: 0 = visit children (parents in this context), 1 = add self.
             stack.push((root_tx.id(), 0));
             
             while let Some((tx_id, state)) = stack.pop() {
@@ -809,13 +806,8 @@ impl Blockchain {
                      }
                      continue;
                 }
-
                 if visited.contains(&tx_id) { continue; }
-                
-                // Mark for post-processing (add self after dependencies)
                 stack.push((tx_id, 1));
-                
-                // Push dependencies (inputs that are in the mempool) to stack to be processed first
                 if let Some(tx) = tx_map.get(&tx_id) {
                      for vin in &tx.vin {
                          if tx_map.contains_key(&vin.prev_txid) && !visited.contains(&vin.prev_txid) {
@@ -826,7 +818,75 @@ impl Blockchain {
             }
         }
         
-        sorted
+        // 2. Conflict Resolution & Validity Check
+        // We now iterate through the sorted list and greedily select transactions.
+        // If a transaction spends an input that was ALREADY spent by a previous transaction
+        // in this specific selection, we skip it.
+        
+        let mut final_txs = Vec::with_capacity(sorted.len());
+        let mut inputs_spent_in_block: HashSet<(sha256d::Hash, u32)> = HashSet::new();
+        // We also track outputs created in this block to allow chaining (unconfirmed parents)
+        let mut outputs_created_in_block: HashSet<(sha256d::Hash, u32)> = HashSet::new();
+
+        for tx in sorted {
+            let txid = tx.id();
+            let mut is_conflict = false;
+            let mut inputs_to_spend = Vec::new();
+
+            // Check inputs
+            if !tx.is_coinbase() {
+                for vin in &tx.vin {
+                    let input_key = (vin.prev_txid, vin.prev_vout);
+                    
+                    // CHECK A: Is this input already spent by a higher-priority tx in this block?
+                    if inputs_spent_in_block.contains(&input_key) {
+                        is_conflict = true;
+                        break;
+                    }
+
+                    // CHECK B: Does the UTXO exist?
+                    // It must either be in the main UTXO set OR be created by a parent in this block.
+                    let in_chain = self.utxo_tree.contains_key(&{
+                        let mut k = Vec::new();
+                        k.extend_from_slice(vin.prev_txid.as_ref());
+                        k.extend_from_slice(&vin.prev_vout.to_be_bytes());
+                        k
+                    }).unwrap_or(false);
+
+                    let in_mempool_chain = outputs_created_in_block.contains(&input_key);
+
+                    if !in_chain && !in_mempool_chain {
+                        // Input is invalid (already spent in chain or never existed).
+                        // We skip this tx. Ideally, we should also purge it from mempool.
+                        is_conflict = true; 
+                        break;
+                    }
+
+                    inputs_to_spend.push(input_key);
+                }
+            }
+
+            if !is_conflict {
+                // Transaction is valid for this block context
+                final_txs.push(tx.clone());
+                
+                // Mark inputs as spent
+                for input in inputs_to_spend {
+                    inputs_spent_in_block.insert(input);
+                }
+
+                // Register outputs for child transactions
+                for (i, _) in tx.vout.iter().enumerate() {
+                    outputs_created_in_block.insert((txid, i as u32));
+                }
+            } else {
+                // Optional: Purge invalid transaction from mempool to free memory
+                // self.mempool.remove(&txid);
+                // debug!("Dropped conflicting/invalid tx from block template: {}", txid);
+            }
+        }
+        
+        final_txs
     }
 
     pub fn create_block_template(&mut self, mut transactions: Vec<Transaction>, version: i32) -> Result<Block> {
