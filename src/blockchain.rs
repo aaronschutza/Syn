@@ -24,8 +24,7 @@ use std::sync::Arc;
 use secp256k1::PublicKey;
 use sled::Batch;
 use serde::{Serialize, Deserialize};
-use log::{info, warn, error, debug}; // Added debug
-use std::cmp;
+use log::{info, warn, error, debug};
 
 const MAX_BEACONS_PER_BLOCK: usize = 16;
 const MAX_UTXO_CACHE_SIZE: usize = 100000;
@@ -690,27 +689,9 @@ impl Blockchain {
         ldd_state.current_gamma = new_params.gamma.0 as u32;
         ldd_state.f_a_pow = Fixed::from_bits(new_params.f_a_pow.to_bits());
         ldd_state.f_a_pos = Fixed::from_bits(new_params.f_a_pos.to_bits());
-
-        let t_fallback = self.consensus_params.nakamoto_target_block_time;
-        let t_fallback_fixed = Fixed::from_integer(t_fallback);
-        let b_total = if t_fallback_fixed.0 > 0 {
-            Fixed::one() / t_fallback_fixed
-        } else {
-            Fixed::from_integer(0) 
-        };
-
-        let sum_a = ldd_state.f_a_pow + ldd_state.f_a_pos;
+        ldd_state.f_b_pow = ldd_state.f_a_pow;
+        ldd_state.f_b_pos = ldd_state.f_a_pos;
         
-        if sum_a.0 > 0 {
-            let ratio_pow = ldd_state.f_a_pow / sum_a;
-            let f_b_pow_target = b_total * ratio_pow;
-            
-            let ratio_pos = ldd_state.f_a_pos / sum_a;
-            let f_b_pos_target = b_total * ratio_pos;
-
-            ldd_state.f_b_pow = cmp::min(f_b_pow_target, ldd_state.f_a_pow);
-            ldd_state.f_b_pos = cmp::min(f_b_pos_target, ldd_state.f_a_pos);
-        }
 
         ldd_state.recent_blocks.clear();
         dcs.reset_interval(); 

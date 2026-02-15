@@ -119,15 +119,7 @@ pub fn calculate_next_difficulty(
     let current_pow = U64F64::from_bits(current_params.f_a_pow.to_bits());
     let current_pos = U64F64::from_bits(current_params.f_a_pos.to_bits());
 
-    let (f_a_pow_new, f_a_pos_new) = if pos_count == 0 && total_window_blocks > 0 {
-        // Bootstrap/Emergency Mode: PoS is missing.
-        // Increase PoS difficulty (easier) significantly to invite stakers.
-        // Decrease PoW difficulty (harder) if it's dominating too fast.
-        let pow_new = current_pow * beta;
-        let pos_new = (current_pos * U64F64::from_num(2.0)).min(U64F64::ONE);
-        (Probability(pow_new), Probability(pos_new))
-    } else {
-        // Normal Mode: Proportional Adjustment
+    let (f_a_pow_new, f_a_pos_new) = {
         let n_pow = total_window_blocks.saturating_sub(pos_count);
         let p_pow = I64F64::from_num(n_pow) / I64F64::from_num(total_window_blocks);
         let error_val = p_pow - I64F64::from_num(0.5);
@@ -136,12 +128,12 @@ pub fn calculate_next_difficulty(
         let pos_adj = I64F64::from_num(1.0) + kappa * error_val;
         
         // Multiplicative update: Old * Beta * BalanceAdj
-        let pow_val = current_pow * beta * U64F64::from_num(pow_adj.max(I64F64::from_num(0.01)));
-        let pos_val = current_pos * beta * U64F64::from_num(pos_adj.max(I64F64::from_num(0.01)));
+        let pow_val = current_pow * beta * U64F64::from_num(pow_adj);
+        let pos_val = current_pos * beta * U64F64::from_num(pos_adj);
         
         // Safety Clamps
-        let pow_final = pow_val.min(U64F64::ONE).max(U64F64::from_num(0.00000001));
-        let pos_final = pos_val.min(U64F64::ONE).max(U64F64::from_num(0.00000001));
+        let pow_final = pow_val.min(U64F64::ONE);
+        let pos_final = pos_val.min(U64F64::ONE);
 
         (Probability(pow_final), Probability(pos_final))
     };
