@@ -24,7 +24,8 @@ use std::sync::Arc;
 use secp256k1::PublicKey;
 use sled::Batch;
 use serde::{Serialize, Deserialize};
-use log::{info, warn, error}; // Added error
+use log::{info, warn, error, debug}; // Added debug
+use std::cmp;
 
 const MAX_BEACONS_PER_BLOCK: usize = 16;
 const MAX_UTXO_CACHE_SIZE: usize = 100000;
@@ -366,17 +367,13 @@ impl Blockchain {
         let mut rolling_muhash = self.get_muhash_root()?;
         let pqc_enforced = block.height >= PQC_ENFORCEMENT_HEIGHT;
 
-        // FIX: Intra-block UTXO tracking. Key -> Serialized UtxoEntry
-        // IMPORTANT: We must store deserialized values or at least track existence efficiently
-        // to prevent parsing repeatedly. For simplicity in validation, we just store serialized bytes.
+        // Intra-block UTXO tracking. Key -> Serialized UtxoEntry
         let mut intra_block_utxos: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         
-        // Track consumed intra-block UTXOs to prevent double-spending within the same block.
-        // We use the utxo_key (txid + vout) as the identifier.
+        // Track consumed intra-block UTXOs.
         let mut intra_block_spent: HashSet<Vec<u8>> = HashSet::new();
         
-        // Track consumed DB-based UTXOs to prevent double-spending within the same block
-        // (e.g. two txs in the same block trying to spend the same old UTXO).
+        // Track consumed DB-based UTXOs.
         let mut db_spent_in_block: HashSet<Vec<u8>> = HashSet::new();
 
         let skip_verify = if let Some(finalized_hash) = self.last_finalized_checkpoint {
@@ -398,13 +395,9 @@ impl Blockchain {
                     self.validate_progonos_mint(tx, &mut btc_tx_batch)?;
                 } else {
                     let mut prev_txs = HashMap::new();
-                    // We need to fetch previous transactions to verify scripts.
-                    // NOTE: verify_hybrid needs the *full* prev tx, which might be in this block or in DB.
-                    // Current verify_hybrid implementation relies on a map we pass in.
                     
                     for vin in &tx.vin {
                         // Check if parent is in this block (intra-block dependency)
-                        // We can scan the blocks' transaction list processed *so far*
                         let intra_parent = block.transactions[0..tx_idx].iter().find(|t| t.id() == vin.prev_txid);
                         
                         if let Some(parent) = intra_parent {
@@ -446,15 +439,16 @@ impl Blockchain {
                         let entry_hash = BigUint::from_bytes_be(sha256d::Hash::hash(val).as_ref());
                         rolling_muhash = self.muhash_div(rolling_muhash, entry_hash);
 
-                        // Since it was created AND spent in the same block, it's transient.
-                        // We remove it from the map so it doesn't get written to DB later.
-                        intra_block_utxos.remove(&utxo_key);
-                        
-                        // It might have been added to the batch in the previous iteration of this loop.
-                        // We must ensure it is NOT in the final batch insert.
+                        // NOTE: We do NOT remove from intra_block_utxos map here immediately if we want to support double-spend checks for later txs.
+                        // However, to keep it clean, we track spentness in intra_block_spent.
+                        // We MUST remove from the pending batch if it was destined for DB.
                         utxo_batch.remove(utxo_key.as_slice());
                         
-                    } 
+                    } else if intra_block_spent.contains(&utxo_key) {
+                        // It was in intra_block_utxos but consumed.
+                        error!("[CONSENSUS] Double spend in block {} at tx {} input {}. Key (Intra-Consumed): {:02x?}", block.header.hash(), txid, vin_idx, utxo_key);
+                        bail!("Double spend detected within block (intra-consumed)");
+                    }
                     // B. Check Database
                     else if let Some(val) = self.utxo_tree.get(&utxo_key)? {
                          if db_spent_in_block.contains(&utxo_key) {
@@ -696,9 +690,27 @@ impl Blockchain {
         ldd_state.current_gamma = new_params.gamma.0 as u32;
         ldd_state.f_a_pow = Fixed::from_bits(new_params.f_a_pow.to_bits());
         ldd_state.f_a_pos = Fixed::from_bits(new_params.f_a_pos.to_bits());
-        ldd_state.f_b_pow = ldd_state.f_a_pow;
-        ldd_state.f_b_pos = ldd_state.f_a_pos;
+
+        let t_fallback = self.consensus_params.nakamoto_target_block_time;
+        let t_fallback_fixed = Fixed::from_integer(t_fallback);
+        let b_total = if t_fallback_fixed.0 > 0 {
+            Fixed::one() / t_fallback_fixed
+        } else {
+            Fixed::from_integer(0) 
+        };
+
+        let sum_a = ldd_state.f_a_pow + ldd_state.f_a_pos;
         
+        if sum_a.0 > 0 {
+            let ratio_pow = ldd_state.f_a_pow / sum_a;
+            let f_b_pow_target = b_total * ratio_pow;
+            
+            let ratio_pos = ldd_state.f_a_pos / sum_a;
+            let f_b_pos_target = b_total * ratio_pos;
+
+            ldd_state.f_b_pow = cmp::min(f_b_pow_target, ldd_state.f_a_pow);
+            ldd_state.f_b_pos = cmp::min(f_b_pos_target, ldd_state.f_a_pos);
+        }
 
         ldd_state.recent_blocks.clear();
         dcs.reset_interval(); 
@@ -761,7 +773,6 @@ impl Blockchain {
 
     pub fn get_mempool_txs(&mut self) -> Vec<Transaction> { 
         // 1. Snapshot and Topological Sort
-        // We preserve the topological sort to ensure parents are processed before children.
         let source_txs: Vec<Transaction> = self.mempool.values().cloned().collect();
         let mut tx_map: HashMap<sha256d::Hash, Transaction> = HashMap::new();
         for tx in &source_txs {
@@ -798,16 +809,10 @@ impl Blockchain {
         }
         
         // 2. Conflict Resolution & Validity Check
-        // We now iterate through the sorted list and greedily select transactions.
-        // If a transaction spends an input that was ALREADY spent by a previous transaction
-        // in this specific selection, we skip it.
-        
         let mut final_txs = Vec::with_capacity(sorted.len());
         let mut inputs_spent_in_block: HashSet<(sha256d::Hash, u32)> = HashSet::new();
-        // We also track outputs created in this block to allow chaining (unconfirmed parents)
         let mut outputs_created_in_block: HashSet<(sha256d::Hash, u32)> = HashSet::new();
         
-        // Track invalid txs to remove from mempool
         let mut invalid_txs = Vec::new();
 
         for tx in sorted {
@@ -823,11 +828,13 @@ impl Blockchain {
                     // CHECK A: Is this input already spent by a higher-priority tx in this block?
                     if inputs_spent_in_block.contains(&input_key) {
                         is_conflict = true;
+                        // AUDIT FIX: This is a double spend attempt against a tx we already picked.
+                        // We should delete this conflicting transaction.
+                        invalid_txs.push(txid);
                         break;
                     }
 
                     // CHECK B: Does the UTXO exist?
-                    // It must either be in the main UTXO set OR be created by a parent in this block.
                     let in_chain = self.utxo_tree.contains_key(&{
                         let mut k = Vec::new();
                         k.extend_from_slice(vin.prev_txid.as_ref());
@@ -838,7 +845,23 @@ impl Blockchain {
                     let in_mempool_chain = outputs_created_in_block.contains(&input_key);
 
                     if !in_chain && !in_mempool_chain {
-                        // Input is invalid (already spent in chain or never existed).
+                        // Input is invalid or missing. 
+                        // AUDIT FIX: Distinguish between Orphan and Double Spend.
+                        // If parent tx exists in chain index but UTXO is gone -> Spent (Invalid).
+                        // If parent tx is missing from chain index -> Orphan (Maybe valid later).
+                        
+                        // FIX: Explicitly cast as_ref() result to &[u8] to satisfy trait bound
+                        let parent_exists_in_chain = self.tx_index_tree.contains_key(vin.prev_txid.as_ref() as &[u8]).unwrap_or(false);
+                        
+                        if parent_exists_in_chain {
+                            // Parent exists, so output must have been spent.
+                            invalid_txs.push(txid);
+                        } else {
+                            // Parent unknown. This is an orphan. 
+                            // We skip it for this block, but DO NOT delete from mempool.
+                            // debug!("Skipping orphan tx: {}", txid);
+                        }
+                        
                         is_conflict = true; 
                         break;
                     }
@@ -848,28 +871,18 @@ impl Blockchain {
             }
 
             if !is_conflict {
-                // Transaction is valid for this block context
                 final_txs.push(tx.clone());
-                
-                // Mark inputs as spent
-                for input in inputs_to_spend {
-                    inputs_spent_in_block.insert(input);
-                }
-
-                // Register outputs for child transactions
-                for (i, _) in tx.vout.iter().enumerate() {
-                    outputs_created_in_block.insert((txid, i as u32));
-                }
-            } else {
-                // Purge invalid transaction from mempool to free memory
-                invalid_txs.push(txid);
-                // debug!("Dropped conflicting/invalid tx from block template: {}", txid);
-            }
+                for input in inputs_to_spend { inputs_spent_in_block.insert(input); }
+                for (i, _) in tx.vout.iter().enumerate() { outputs_created_in_block.insert((txid, i as u32)); }
+            } 
         }
         
-        // AUDIT FIX: Remove accumulated invalid transactions
-        for txid in invalid_txs {
-            self.mempool.remove(&txid);
+        // Remove definitely invalid transactions
+        if !invalid_txs.is_empty() {
+            debug!("Cleaning {} invalid transactions from mempool.", invalid_txs.len());
+            for txid in invalid_txs {
+                self.mempool.remove(&txid);
+            }
         }
         
         final_txs
@@ -1007,10 +1020,6 @@ impl Blockchain {
             }
         }
 
-        // REMEDIATION: CAUSALITY FIX
-        // We MUST calculate synergistic_work using the state *before* we potentially adjust it for the next epoch.
-        // This ensures the weight of Block N is derived from the difficulty parameters active at Height N.
-        
         self.calculate_synergistic_work(&mut block, &block_state.ldd);
 
         // Advance block_state for the *next* block generation
@@ -1072,17 +1081,12 @@ impl Blockchain {
         let current_height = self.chain_height();
         
         // REORG RULE 1: Reject lower block height (User Requirement)
-        // We reject blocks that are historically deep compared to our tip.
         if block.height < current_height {
             info!("[CONSENSUS] Ignoring block {} at height {} (Behind tip {})", hash, block.height, current_height);
             return Ok(());
         }
 
         // REORG RULE 2: Strict ASW Superiority (Tie-Breaker / Main Rule)
-        // We switch if:
-        // 1. It is a reorg that has STRICTLY more work.
-        // 2. It is a direct extension of our current tip (Liveness).
-        
         let is_extension = block.header.prev_blockhash == self.tip;
         
         if is_extension || block.total_work > self.total_work {
@@ -1099,7 +1103,6 @@ impl Blockchain {
             
             self.sync_staking_totals();
             
-            // AUDIT FIX: Remove mined transactions AND clean conflicting transactions from mempool
             self.clean_mempool_after_block(&block);
             
             self.total_work = block.total_work;
@@ -1144,7 +1147,6 @@ impl Blockchain {
 
         for txid in conflicts {
             self.mempool.remove(&txid);
-            // info!("Removed conflict from mempool: {}", txid);
         }
     }
 
